@@ -31,4 +31,3 @@ jobs:
         run: |
           chmod +x ./scripts/build_dist.sh
           ./scripts/build_dist.sh
-
