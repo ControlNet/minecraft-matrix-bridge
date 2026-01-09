@@ -15,11 +15,13 @@ Bridges chat between a Minecraft server and **one Matrix room** (unencrypted onl
 - Matrix room must be **unencrypted** (no E2EE)
 
 ## Installation
-1. Download the jar or build the jar for your Minecraft major version (example: Forge 1.20.x):
-   - `GRADLE_USER_HOME=.gradle-user-home ./gradlew :forge-1.20:build`
-   - Output: `forge-1.20/build/libs/minecraftmatrixbridge-forge-1.20.x-0.1.0.jar`
+1. Download the jar or build the jar `./scripts/build_dist.sh` and you can find it in `dist/`.
 2. Drop the jar into your Forge server’s `mods/` folder.
 3. Start the server once to generate config.
+
+### Build all versions (creates `dist/`)
+To build jars for all supported Minecraft versions and collect them into `dist/`:
+- `./scripts/build_dist.sh`
 
 ## Configuration
 Edit `config/minecraftmatrixbridge.toml`:
