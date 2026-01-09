@@ -18,6 +18,8 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       channel: ${{ steps.version.outputs.channel }}
       mod_id: ${{ steps.version.outputs.mod_id }}
+      has_modrinth: ${{ steps.version.outputs.has_modrinth }}
+      has_curseforge: ${{ steps.version.outputs.has_curseforge }}
 
     steps:
       - name: Checkout
@@ -40,6 +42,11 @@ jobs:
       - name: Determine version + whether to release
         id: version
         shell: bash
+        env:
+          MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+          MODRINTH_PROJECT_ID: ${{ secrets.MODRINTH_PROJECT_ID }}
+          CURSEFORGE_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
+          CURSEFORGE_PROJECT_ID: ${{ secrets.CURSEFORGE_PROJECT_ID }}
         run: |
           MOD_ID="$(grep -E '^mod_id=' gradle.properties | head -n1 | cut -d= -f2- | tr -d '\r' | xargs)"
           if [[ -z "$MOD_ID" ]]; then
@@ -74,11 +81,23 @@ jobs:
             fi
           fi
 
+          HAS_MODRINTH="false"
+          if [[ -n "${MODRINTH_TOKEN:-}" && -n "${MODRINTH_PROJECT_ID:-}" ]]; then
+            HAS_MODRINTH="true"
+          fi
+
+          HAS_CURSEFORGE="false"
+          if [[ -n "${CURSEFORGE_TOKEN:-}" && -n "${CURSEFORGE_PROJECT_ID:-}" ]]; then
+            HAS_CURSEFORGE="true"
+          fi
+
           echo "mod_id=$MOD_ID" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
           echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
           echo "should_release=$SHOULD_RELEASE" >> "$GITHUB_OUTPUT"
+          echo "has_modrinth=$HAS_MODRINTH" >> "$GITHUB_OUTPUT"
+          echo "has_curseforge=$HAS_CURSEFORGE" >> "$GITHUB_OUTPUT"
 
           echo "MOD_ID=$MOD_ID" >> "$GITHUB_ENV"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
@@ -138,7 +157,7 @@ jobs:
     name: Publish to Modrinth
     needs: build-and-release
     runs-on: ubuntu-latest
-    if: ${{ needs.build-and-release.outputs.should_release == 'true' && env.MODRINTH_TOKEN != '' && env.MODRINTH_PROJECT_ID != '' }}
+    if: ${{ needs.build-and-release.outputs.should_release == 'true' && needs.build-and-release.outputs.has_modrinth == 'true' }}
     timeout-minutes: 20
     env:
       MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
@@ -177,7 +196,7 @@ jobs:
     name: Publish to CurseForge
     needs: build-and-release
     runs-on: ubuntu-latest
-    if: ${{ needs.build-and-release.outputs.should_release == 'true' && env.CURSEFORGE_TOKEN != '' && env.CURSEFORGE_PROJECT_ID != '' }}
+    if: ${{ needs.build-and-release.outputs.should_release == 'true' && needs.build-and-release.outputs.has_curseforge == 'true' }}
     timeout-minutes: 30
     env:
       CURSEFORGE_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
