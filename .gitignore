@@ -1,0 +1,40 @@
+### Gradle / Java build outputs
+.gradle/
+.gradle-user-home/
+**/build/
+out/
+bin/
+*.class
+
+### Forge/Minecraft run directories (generated at runtime)
+run/
+run*/
+**/run/
+**/run*/
+logs/
+crash-reports/
+
+### World / saves (generated)
+world/
+saves/
+
+### Common generated artifacts
+*.log
+*.hprof
+hs_err_pid*
+
+### IDEs
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+
+### OS / tooling
+.DS_Store
+Thumbs.db
+.cursor/
+.env
+
+dist/

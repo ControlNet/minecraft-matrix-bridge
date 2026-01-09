@@ -1,0 +1,102 @@
+plugins {
+    id 'eclipse'
+    id 'maven-publish'
+    id 'net.minecraftforge.gradle' version '[6.0,6.2)'
+}
+
+base {
+    archivesName = "${mod_id}-forge-1.19.x"
+}
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(17)
+}
+
+sourceSets {
+    main {
+        java {
+            srcDir rootProject.file('forge-shared/common/src/main/java')
+            srcDir rootProject.file('forge-shared/forge-1.19plus/src/main/java')
+        }
+        resources {
+            srcDir rootProject.file('forge-shared/common/src/main/resources')
+        }
+    }
+}
+
+ext {
+    minecraft_version = '1.19.2'
+    forge_version = '43.5.2'
+
+    mapping_channel = 'official'
+    mapping_version = '1.19.2'
+
+    pack_format = 9
+
+    minecraft_version_range = '[1.19,1.20)'
+    forge_version_range = '[43,)'
+    loader_version_range = '[43,)'
+}
+
+minecraft {
+    mappings channel: mapping_channel, version: mapping_version
+
+    runs {
+        server {
+            workingDirectory project.file('run-systemtest')
+            property 'forge.logging.console.level', 'info'
+            jvmArgs '-Djna.tmpdir=./jna'
+            args '--nogui'
+            mods {
+                "${mod_id}" {
+                    source sourceSets.main
+                }
+            }
+        }
+    }
+}
+
+dependencies {
+    minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+    compileOnly project(':core')
+}
+
+tasks.named('processResources', ProcessResources).configure {
+    var replaceProperties = [
+            minecraft_version      : minecraft_version,
+            minecraft_version_range: minecraft_version_range,
+            forge_version          : forge_version,
+            forge_version_range    : forge_version_range,
+            loader_version_range   : loader_version_range,
+            pack_format            : pack_format,
+            mod_id                 : mod_id,
+            mod_name               : mod_name,
+            mod_license            : mod_license,
+            mod_version            : mod_version,
+            mod_authors            : mod_authors,
+            mod_description        : mod_description
+    ]
+    inputs.properties replaceProperties
+
+    filesMatching(['META-INF/mods.toml', 'pack.mcmeta']) {
+        expand replaceProperties
+    }
+}
+
+tasks.named('jar', Jar).configure {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from(project(':core').sourceSets.main.output)
+}
+
+def copyCoreForRun = tasks.register('copyCoreForRun', Copy) {
+    dependsOn project(':core').tasks.named('classes')
+    from project(':core').sourceSets.main.output.classesDirs
+    into layout.buildDirectory.dir('classes/java/main')
+}
+
+tasks.withType(JavaExec).configureEach {
+    if (name == 'runServer') {
+        dependsOn(copyCoreForRun)
+        standardInput = System.in
+    }
+}

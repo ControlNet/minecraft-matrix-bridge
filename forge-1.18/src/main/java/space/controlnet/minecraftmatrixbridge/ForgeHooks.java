@@ -1,0 +1,319 @@
+package space.controlnet.minecraftmatrixbridge;
+
+import com.mojang.brigadier.builder.LiteralArgumentBuilder;
+import com.mojang.logging.LogUtils;
+import net.minecraft.Util;
+import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.commands.Commands;
+import net.minecraft.network.chat.ChatType;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.TextComponent;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.level.storage.LevelResource;
+import net.minecraftforge.event.RegisterCommandsEvent;
+import net.minecraftforge.event.ServerChatEvent;
+import net.minecraftforge.event.entity.player.PlayerEvent;
+import net.minecraftforge.event.server.ServerStartedEvent;
+import net.minecraftforge.event.server.ServerStoppingEvent;
+import net.minecraftforge.eventbus.api.SubscribeEvent;
+import org.slf4j.Logger;
+
+import java.lang.reflect.Method;
+import java.nio.file.Path;
+import java.time.Instant;
+
+public final class ForgeHooks {
+    private static final Logger LOGGER = LogUtils.getLogger();
+
+    private BridgeService bridgeService;
+    private McCallbacks callbacks;
+
+    @SubscribeEvent
+    public void onServerStarted(ServerStartedEvent event) {
+        MinecraftServer server = event.getServer();
+        Path worldRoot = server.getWorldPath(LevelResource.ROOT);
+
+        if (bridgeService != null) {
+            bridgeService.stop();
+        }
+        bridgeService = new BridgeService();
+        callbacks = new McCallbacks() {
+            @Override
+            public void broadcast(String text) {
+                MinecraftServer s = server;
+                if (s == null) {
+                    return;
+                }
+                s.execute(() -> s.getPlayerList().broadcastMessage(new TextComponent(text), ChatType.SYSTEM, Util.NIL_UUID));
+            }
+
+            @Override
+            public void announceMatrixConnected(String roomIdOrAlias) {
+                MinecraftServer s = server;
+                if (s == null) {
+                    return;
+                }
+                String room = (roomIdOrAlias == null || roomIdOrAlias.isBlank()) ? "<unknown>" : roomIdOrAlias;
+                s.execute(() -> {
+                    for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+                        String lang = getPlayerLanguage(p);
+                        String msg = localizeMatrixRoomConnected(lang, room);
+                        p.sendMessage(new TextComponent(msg), Util.NIL_UUID);
+                    }
+                });
+            }
+        };
+        bridgeService.start(loadSettings(), worldRoot, callbacks);
+
+        if (MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get() && MatrixBridgeConfig.ENABLE_SERVER_LIFECYCLE_TO_MATRIX.get()) {
+            String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "* Server started.";
+            bridgeService.enqueueMcMessage(formatted);
+        }
+    }
+
+    @SubscribeEvent
+    public void onServerStopping(ServerStoppingEvent event) {
+        BridgeService service = bridgeService;
+        bridgeService = null;
+        if (service != null) {
+            if (MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get() && MatrixBridgeConfig.ENABLE_SERVER_LIFECYCLE_TO_MATRIX.get()) {
+                String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "* Server stopping.";
+                service.enqueueMcMessage(formatted);
+                Thread t = new Thread(() -> {
+                    try {
+                        Thread.sleep(750);
+                    } catch (InterruptedException ignored) {
+                        Thread.currentThread().interrupt();
+                    }
+                    service.stop();
+                }, "MatrixBridge-Stopper");
+                t.start();
+            } else {
+                service.stop();
+            }
+        }
+        callbacks = null;
+    }
+
+    @SubscribeEvent
+    public void onServerChat(ServerChatEvent event) {
+        if (bridgeService == null || !bridgeService.isRunning()) {
+            return;
+        }
+        if (!MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get()) {
+            return;
+        }
+
+        String msg = event.getMessage();
+        if (msg == null || msg.isBlank()) {
+            return;
+        }
+
+        String playerName = event.getPlayer().getGameProfile().getName();
+        String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "<" + playerName + "> " + msg;
+        bridgeService.enqueueMcMessage(formatted);
+    }
+
+    @SubscribeEvent
+    public void onPlayerLoggedIn(PlayerEvent.PlayerLoggedInEvent event) {
+        BridgeService service = bridgeService;
+
+        if (service != null && service.isRunning()
+                && MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get()
+                && MatrixBridgeConfig.ENABLE_JOIN_LEAVE_TO_MATRIX.get()) {
+            String playerName = event.getPlayer().getGameProfile().getName();
+            String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "* " + playerName + " joined the game";
+            service.enqueueMcMessage(formatted);
+        }
+
+        if (service == null || !service.isReady()) {
+            return;
+        }
+        if (!MatrixBridgeConfig.ANNOUNCE_CONNECTED.get()) {
+            return;
+        }
+        String configured = MatrixBridgeConfig.ROOM_ID.get();
+        String roomId = (configured != null && configured.startsWith("#"))
+                ? configured
+                : service.getResolvedRoomId();
+        String room = (roomId == null || roomId.isBlank()) ? "<unknown>" : roomId;
+        String lang = getPlayerLanguage(event.getPlayer());
+        String msg = localizeMatrixRoomConnected(lang, room);
+        event.getPlayer().sendMessage(new TextComponent(msg), Util.NIL_UUID);
+    }
+
+    @SubscribeEvent
+    public void onPlayerLoggedOut(PlayerEvent.PlayerLoggedOutEvent event) {
+        BridgeService service = bridgeService;
+        if (service == null || !service.isRunning()) {
+            return;
+        }
+        if (!MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get()) {
+            return;
+        }
+        if (!MatrixBridgeConfig.ENABLE_JOIN_LEAVE_TO_MATRIX.get()) {
+            return;
+        }
+
+        String playerName = event.getPlayer().getGameProfile().getName();
+        String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "* " + playerName + " left the game";
+        service.enqueueMcMessage(formatted);
+    }
+
+    @SubscribeEvent
+    public void onRegisterCommands(RegisterCommandsEvent event) {
+        LiteralArgumentBuilder<CommandSourceStack> root = Commands.literal("matrix")
+                .requires(source -> source.hasPermission(2))
+                .then(Commands.literal("status").executes(ctx -> {
+                    if (bridgeService == null) {
+                        ctx.getSource().sendSuccess(new TextComponent("MatrixBridge: not initialized."), false);
+                        return 0;
+                    }
+                    String msg = "MatrixBridge: running=" + bridgeService.isRunning()
+                            + ", ready=" + bridgeService.isReady()
+                            + ", selfUserId=" + (bridgeService.getSelfUserId().isBlank() ? "<unknown>" : bridgeService.getSelfUserId())
+                            + ", queue=" + bridgeService.getQueueSize();
+                    ctx.getSource().sendSuccess(new TextComponent(msg), false);
+                    return 1;
+                }))
+                .then(Commands.literal("reload").executes(ctx -> {
+                    MinecraftServer server = ctx.getSource().getServer();
+                    Path worldRoot = server.getWorldPath(LevelResource.ROOT);
+
+                    if (bridgeService != null) {
+                        bridgeService.stop();
+                    }
+                    bridgeService = new BridgeService();
+                    callbacks = new McCallbacks() {
+                        @Override
+                        public void broadcast(String text) {
+                            MinecraftServer s = server;
+                            if (s == null) {
+                                return;
+                            }
+                            s.execute(() -> s.getPlayerList().broadcastMessage(new TextComponent(text), ChatType.SYSTEM, Util.NIL_UUID));
+                        }
+
+                        @Override
+                        public void announceMatrixConnected(String roomIdOrAlias) {
+                            MinecraftServer s = server;
+                            if (s == null) {
+                                return;
+                            }
+                            String room = (roomIdOrAlias == null || roomIdOrAlias.isBlank()) ? "<unknown>" : roomIdOrAlias;
+                            s.execute(() -> {
+                                for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+                                    String lang = getPlayerLanguage(p);
+                                    String msg = localizeMatrixRoomConnected(lang, room);
+                                    p.sendMessage(new TextComponent(msg), Util.NIL_UUID);
+                                }
+                            });
+                        }
+                    };
+                    bridgeService.start(loadSettings(), worldRoot, callbacks);
+                    ctx.getSource().sendSuccess(new TextComponent("MatrixBridge reload requested."), true);
+                    return 1;
+                }))
+                .then(Commands.literal("test").executes(ctx -> {
+                    if (bridgeService == null || !bridgeService.isRunning()) {
+                        ctx.getSource().sendFailure(new TextComponent("MatrixBridge is not running."));
+                        return 0;
+                    }
+                    if (!MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get()) {
+                        ctx.getSource().sendFailure(new TextComponent("MC -> Matrix is disabled (enableMcToMatrix=false)."));
+                        return 0;
+                    }
+                    String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "[TEST] " + Instant.now();
+                    boolean queued = bridgeService.enqueueMcMessage(formatted);
+                    if (queued) {
+                        ctx.getSource().sendSuccess(new TextComponent("Queued test message."), false);
+                        return 1;
+                    }
+                    ctx.getSource().sendFailure(new TextComponent("Failed to queue test message (queue full or bridge not ready)."));
+                    return 0;
+                }));
+
+        event.getDispatcher().register(root);
+        LOGGER.debug("Registered /matrix command.");
+    }
+
+    private static String getPlayerLanguage(Object player) {
+        if (player == null) {
+            return "en_us";
+        }
+        try {
+            Method m = player.getClass().getMethod("getLanguage");
+            Object res = m.invoke(player);
+            if (res instanceof String s && !s.isBlank()) {
+                return s;
+            }
+        } catch (Exception ignored) {
+        }
+        try {
+            Method m = player.getClass().getMethod("clientInformation");
+            Object info = m.invoke(player);
+            if (info != null) {
+                Method m2 = info.getClass().getMethod("language");
+                Object res = m2.invoke(info);
+                if (res instanceof String s && !s.isBlank()) {
+                    return s;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return "en_us";
+    }
+
+    private static String localizeMatrixRoomConnected(String language, String roomIdOrAlias) {
+        String lang = (language == null ? "en_us" : language).toLowerCase();
+        String room = (roomIdOrAlias == null || roomIdOrAlias.isBlank()) ? "<unknown>" : roomIdOrAlias;
+        switch (lang) {
+            case "zh_cn":
+                return "Matrix 房间已连接: " + room;
+            case "zh_tw":
+                return "Matrix 房間已連接: " + room;
+            case "ja_jp":
+                return "Matrix ルームに接続しました: " + room;
+            case "ko_kr":
+                return "Matrix 방에 연결됨: " + room;
+            case "fr_fr":
+                return "Salon Matrix connecté : " + room;
+            case "de_de":
+                return "Matrix-Raum verbunden: " + room;
+            case "es_es":
+                return "Sala Matrix conectada: " + room;
+            case "ru_ru":
+                return "Комната Matrix подключена: " + room;
+            case "pt_br":
+                return "Sala Matrix conectada: " + room;
+            default:
+                return "Matrix room connected: " + room;
+        }
+    }
+
+    private static BridgeSettings loadSettings() {
+        String homeserver = MatrixBridgeConfig.HOMESERVER.get();
+        String roomId = MatrixBridgeConfig.ROOM_ID.get();
+
+        String tokenFromEnv = System.getenv("MATRIX_ACCESS_TOKEN");
+        String accessToken = (tokenFromEnv != null && !tokenFromEnv.isBlank())
+                ? tokenFromEnv
+                : MatrixBridgeConfig.ACCESS_TOKEN.get();
+
+        return new BridgeSettings(
+                homeserver,
+                roomId,
+                accessToken,
+                MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get(),
+                MatrixBridgeConfig.ENABLE_MATRIX_TO_MC.get(),
+                MatrixBridgeConfig.ANNOUNCE_CONNECTED.get(),
+                MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get(),
+                MatrixBridgeConfig.MATRIX_TO_MC_PREFIX.get(),
+                MatrixBridgeConfig.SYNC_TIMEOUT_MS.get(),
+                MatrixBridgeConfig.TIMELINE_LIMIT.get(),
+                MatrixBridgeConfig.MAX_QUEUE_SIZE.get(),
+                MatrixBridgeConfig.DEDUP_SIZE.get()
+        );
+    }
+}

@@ -1,0 +1,112 @@
+plugins {
+    id 'eclipse'
+    id 'maven-publish'
+    id 'net.minecraftforge.gradle' version '[6.0,6.2)'
+}
+
+base {
+    archivesName = "${mod_id}-forge-1.21.x"
+}
+
+// Minecraft 1.21.x requires Java 21.
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(21)
+}
+
+// Forge 1.21 userdev runs are module-based; keep metadata and classes together for mod discovery.
+sourceSets {
+    main {
+        java {
+            srcDir rootProject.file('forge-shared/common/src/main/java')
+            srcDir rootProject.file('forge-shared/forge-1.19plus/src/main/java')
+        }
+        resources {
+            srcDir rootProject.file('forge-shared/common/src/main/resources')
+        }
+        output.resourcesDir = layout.buildDirectory.dir('classes/java/main').get().asFile
+    }
+}
+
+ext {
+    minecraft_version = '1.21.1'
+    forge_version = '52.1.8'
+
+    mapping_channel = 'official'
+    mapping_version = '1.21.1'
+
+    pack_format = 34
+
+    minecraft_version_range = '[1.21,1.22)'
+    forge_version_range = '[52,)'
+    loader_version_range = '[52,)'
+}
+
+minecraft {
+    mappings channel: mapping_channel, version: mapping_version
+    copyIdeResources = true
+
+    runs {
+        server {
+            workingDirectory project.file('run-systemtest')
+            property 'forge.logging.console.level', 'info'
+            jvmArgs '-Djna.tmpdir=./jna'
+            args '--nogui'
+            mods {
+                "${mod_id}" {
+                    source sourceSets.main
+                }
+            }
+        }
+    }
+}
+
+tasks.withType(JavaExec).configureEach {
+    javaLauncher = javaToolchains.launcherFor {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+dependencies {
+    minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+    compileOnly project(':core')
+}
+
+tasks.named('processResources', ProcessResources).configure {
+    var replaceProperties = [
+            minecraft_version      : minecraft_version,
+            minecraft_version_range: minecraft_version_range,
+            forge_version          : forge_version,
+            forge_version_range    : forge_version_range,
+            loader_version_range   : loader_version_range,
+            pack_format            : pack_format,
+            mod_id                 : mod_id,
+            mod_name               : mod_name,
+            mod_license            : mod_license,
+            mod_version            : mod_version,
+            mod_authors            : mod_authors,
+            mod_description        : mod_description
+    ]
+    inputs.properties replaceProperties
+
+    filesMatching(['META-INF/mods.toml', 'pack.mcmeta']) {
+        expand replaceProperties
+    }
+}
+
+tasks.named('jar', Jar).configure {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from(project(':core').sourceSets.main.output)
+}
+
+def copyCoreForRun = tasks.register('copyCoreForRun', Copy) {
+    dependsOn project(':core').tasks.named('classes')
+    from project(':core').sourceSets.main.output.classesDirs
+    into layout.buildDirectory.dir('classes/java/main')
+}
+
+tasks.withType(JavaExec).configureEach {
+    if (name == 'runServer') {
+        dependsOn(copyCoreForRun)
+        standardInput = System.in
+    }
+}
