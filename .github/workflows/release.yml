@@ -1,0 +1,234 @@
+name: Release
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      should_release: ${{ steps.version.outputs.should_release }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      channel: ${{ steps.version.outputs.channel }}
+      mod_id: ${{ steps.version.outputs.mod_id }}
+      has_modrinth: ${{ steps.version.outputs.has_modrinth }}
+      has_curseforge: ${{ steps.version.outputs.has_curseforge }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x ./gradlew
+
+      - name: Determine version + whether to release
+        id: version
+        shell: bash
+        env:
+          MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+          MODRINTH_PROJECT_ID: ${{ secrets.MODRINTH_PROJECT_ID }}
+          CURSEFORGE_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
+          CURSEFORGE_PROJECT_ID: ${{ secrets.CURSEFORGE_PROJECT_ID }}
+        run: |
+          MOD_ID="$(grep -E '^mod_id=' gradle.properties | head -n1 | cut -d= -f2- | tr -d '\r' | xargs)"
+          if [[ -z "$MOD_ID" ]]; then
+            echo "ERROR: mod_id not found in gradle.properties" >&2
+            exit 1
+          fi
+
+          VERSION="$(grep -E '^mod_version=' gradle.properties | head -n1 | cut -d= -f2- | tr -d '\r' | xargs)"
+          if [[ -z "$VERSION" ]]; then
+            echo "ERROR: mod_version not found in gradle.properties" >&2
+            exit 1
+          fi
+
+          CHANNEL="release"
+          if echo "$VERSION" | grep -qi 'alpha'; then
+            CHANNEL="alpha"
+          elif echo "$VERSION" | grep -Eqi 'beta|rc|pre'; then
+            CHANNEL="beta"
+          fi
+
+          git fetch --tags --force
+          LATEST_TAG="$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -n1 || true)"
+          LATEST_VER="${LATEST_TAG#v}"
+
+          SHOULD_RELEASE="false"
+          if [[ -z "$LATEST_TAG" ]]; then
+            SHOULD_RELEASE="true"
+          else
+            TOP="$(printf '%s\n' "$LATEST_VER" "$VERSION" | sort -V | tail -n1)"
+            if [[ "$TOP" == "$VERSION" && "$VERSION" != "$LATEST_VER" ]]; then
+              SHOULD_RELEASE="true"
+            fi
+          fi
+
+          HAS_MODRINTH="false"
+          if [[ -n "${MODRINTH_TOKEN:-}" && -n "${MODRINTH_PROJECT_ID:-}" ]]; then
+            HAS_MODRINTH="true"
+          fi
+
+          HAS_CURSEFORGE="false"
+          if [[ -n "${CURSEFORGE_TOKEN:-}" && -n "${CURSEFORGE_PROJECT_ID:-}" ]]; then
+            HAS_CURSEFORGE="true"
+          fi
+
+          echo "mod_id=$MOD_ID" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "should_release=$SHOULD_RELEASE" >> "$GITHUB_OUTPUT"
+          echo "has_modrinth=$HAS_MODRINTH" >> "$GITHUB_OUTPUT"
+          echo "has_curseforge=$HAS_CURSEFORGE" >> "$GITHUB_OUTPUT"
+
+          echo "MOD_ID=$MOD_ID" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "TAG=v$VERSION" >> "$GITHUB_ENV"
+          echo "CHANNEL=$CHANNEL" >> "$GITHUB_ENV"
+          echo "LATEST_TAG=$LATEST_TAG" >> "$GITHUB_ENV"
+          echo "SHOULD_RELEASE=$SHOULD_RELEASE" >> "$GITHUB_ENV"
+
+      - name: Skip (version not newer than latest tag)
+        if: ${{ steps.version.outputs.should_release != 'true' }}
+        run: |
+          echo "No release: mod_version=${{ steps.version.outputs.version }} is not newer than latest tag '${{ env.LATEST_TAG }}'."
+
+      - name: Build jars
+        if: ${{ steps.version.outputs.should_release == 'true' }}
+        run: |
+          chmod +x ./scripts/build_dist.sh
+          ./scripts/build_dist.sh
+
+      - name: Create tag
+        if: ${{ steps.version.outputs.should_release == 'true' }}
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git rev-parse "${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists locally; continuing."
+          else
+            git tag -a "${TAG}" -m "Release ${TAG}"
+          fi
+
+          git push origin "${TAG}"
+
+      - name: Publish GitHub Release (attach jars)
+        if: ${{ steps.version.outputs.should_release == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            dist/${{ env.MOD_ID }}-forge-1.18.x-${{ env.VERSION }}.jar
+            dist/${{ env.MOD_ID }}-forge-1.19.x-${{ env.VERSION }}.jar
+            dist/${{ env.MOD_ID }}-forge-1.20.x-${{ env.VERSION }}.jar
+            dist/${{ env.MOD_ID }}-forge-1.21.x-${{ env.VERSION }}.jar
+            dist/SHA256SUMS.txt
+
+      - name: Upload dist for publisher jobs
+        if: ${{ steps.version.outputs.should_release == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+
+  publish-modrinth:
+    name: Publish to Modrinth
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    if: ${{ needs.build-and-release.outputs.should_release == 'true' && needs.build-and-release.outputs.has_modrinth == 'true' }}
+    timeout-minutes: 20
+    env:
+      MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+      MODRINTH_PROJECT_ID: ${{ secrets.MODRINTH_PROJECT_ID }}
+    steps:
+      - name: Download dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Publish
+        uses: cloudnode-pro/modrinth-publish@v2
+        with:
+          token: ${{ env.MODRINTH_TOKEN }}
+          project: ${{ env.MODRINTH_PROJECT_ID }}
+          name: ${{ needs.build-and-release.outputs.tag }}
+          version: ${{ needs.build-and-release.outputs.version }}
+          channel: ${{ needs.build-and-release.outputs.channel }}
+          changelog: "Automated release ${{ needs.build-and-release.outputs.tag }}."
+          loaders: |-
+            forge
+          game-versions: |-
+            1.18.x
+            1.19.x
+            1.20.x
+            1.21.x
+          files: |-
+            dist/${{ needs.build-and-release.outputs.mod_id }}-forge-1.18.x-${{ needs.build-and-release.outputs.version }}.jar
+            dist/${{ needs.build-and-release.outputs.mod_id }}-forge-1.19.x-${{ needs.build-and-release.outputs.version }}.jar
+            dist/${{ needs.build-and-release.outputs.mod_id }}-forge-1.20.x-${{ needs.build-and-release.outputs.version }}.jar
+            dist/${{ needs.build-and-release.outputs.mod_id }}-forge-1.21.x-${{ needs.build-and-release.outputs.version }}.jar
+          primary-file: ${{ needs.build-and-release.outputs.mod_id }}-forge-1.20.x-${{ needs.build-and-release.outputs.version }}.jar
+
+  publish-curseforge:
+    name: Publish to CurseForge
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    if: ${{ needs.build-and-release.outputs.should_release == 'true' && needs.build-and-release.outputs.has_curseforge == 'true' }}
+    timeout-minutes: 30
+    env:
+      CURSEFORGE_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
+      CURSEFORGE_PROJECT_ID: ${{ secrets.CURSEFORGE_PROJECT_ID }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - jar_name: "${{ needs.build-and-release.outputs.mod_id }}-forge-1.18.x-${{ needs.build-and-release.outputs.version }}.jar"
+            game_versions: ${{ vars.CURSEFORGE_GAME_VERSIONS_118 || 'Minecraft 1.18:1.18.2,Java 17,Forge' }}
+          - jar_name: "${{ needs.build-and-release.outputs.mod_id }}-forge-1.19.x-${{ needs.build-and-release.outputs.version }}.jar"
+            game_versions: ${{ vars.CURSEFORGE_GAME_VERSIONS_119 || 'Minecraft 1.19:1.19.2,Java 17,Forge' }}
+          - jar_name: "${{ needs.build-and-release.outputs.mod_id }}-forge-1.20.x-${{ needs.build-and-release.outputs.version }}.jar"
+            game_versions: ${{ vars.CURSEFORGE_GAME_VERSIONS_120 || 'Minecraft 1.20:1.20.1,Java 17,Forge' }}
+          - jar_name: "${{ needs.build-and-release.outputs.mod_id }}-forge-1.21.x-${{ needs.build-and-release.outputs.version }}.jar"
+            game_versions: ${{ vars.CURSEFORGE_GAME_VERSIONS_121 || 'Minecraft 1.21:1.21.1,Java 21,Forge' }}
+
+    steps:
+      - name: Download dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Upload
+        uses: itsmeow/curseforge-upload@v3
+        with:
+          token: ${{ env.CURSEFORGE_TOKEN }}
+          project_id: ${{ env.CURSEFORGE_PROJECT_ID }}
+          game_endpoint: minecraft
+          file_path: dist/${{ matrix.jar_name }}
+          game_versions: ${{ matrix.game_versions }}
+          release_type: ${{ needs.build-and-release.outputs.channel }}
+          changelog: "Automated release ${{ needs.build-and-release.outputs.tag }}."
+          changelog_type: markdown

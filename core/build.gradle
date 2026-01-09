@@ -1,0 +1,26 @@
+plugins {
+    id 'java-library'
+}
+
+base {
+    archivesName = "${mod_id}-core"
+}
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(17)
+}
+
+dependencies {
+    // Compile against Gson, but do not bundle it; Forge/Minecraft provides it at runtime.
+    compileOnly 'com.google.code.gson:gson:2.10.1'
+
+    testImplementation platform('org.junit:junit-bom:5.10.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+
+    // Tests execute core code, so Gson must be present on the test runtime classpath.
+    testImplementation 'com.google.code.gson:gson:2.10.1'
+}
+
+tasks.named('test', Test).configure {
+    useJUnitPlatform()
+}

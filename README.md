@@ -11,7 +11,11 @@ Bridges chat between a Minecraft server and **one Matrix room** (unencrypted onl
 
 ## Requirements
 - Java 17 (Forge 1.18–1.20) or Java 21 (Forge 1.21+)
-- Minecraft Forge server matching one of the built jars (see below)
+- Minecraft Forge server matching the versions. I only manually test it in popular minor versions, and hopefully it works in other minor versions.
+    - 1.18.2
+    - 1.19.2
+    - 1.20.1
+    - 1.21.1
 - Matrix room must be **unencrypted** (no E2EE)
 
 ## Installation
