@@ -1,5 +1,18 @@
 # Minecraft Matrix Bridge (Forge, Server-Only)
 
+<div align="center">
+    <img src="https://img.shields.io/github/stars/ControlNet/minecraft-matrix-bridge?style=flat-square">
+    <img src="https://img.shields.io/github/forks/ControlNet/minecraft-matrix-bridge?style=flat-square">
+    <a href="https://github.com/ControlNet/minecraft-matrix-bridge/issues"><img src="https://img.shields.io/github/issues/ControlNet/minecraft-matrix-bridge?style=flat-square"></a>
+    <img src="https://img.shields.io/github/license/ControlNet/minecraft-matrix-bridge?style=flat-square">
+    <a href="https://modrinth.com/mod/mc-matrix-bridge">
+        <img src="https://img.shields.io/badge/Modrinth-mc--matrix--bridge-00AF5C?style=flat-square&logo=modrinth&logoColor=white">
+    </a>
+    <a href="https://www.curseforge.com/minecraft/mc-mods/mc-matrix-bridge">
+        <img src="https://img.shields.io/badge/CurseForge-mc--matrix--bridge-F16436?style=flat-square&logo=curseforge&logoColor=white">
+    </a>
+</div>
+
 Bridges chat between a Minecraft server and **one Matrix room** (unencrypted only).
 
 ## Features
@@ -7,6 +20,7 @@ Bridges chat between a Minecraft server and **one Matrix room** (unencrypted onl
 - **Matrix → MC**: forwards Matrix `m.text` room messages into Minecraft server chat.
 - **Server-only**: vanilla clients can join without installing anything (no client mod).
 - Sync state stored in the **world save** (prevents replay spam on restart).
+- The “Matrix room connected: …” notice is localized server-side based on each player’s reported client language (currently includes `en_us` and `zh_cn`).
 - If the bot is **invited** to the configured room but not joined yet, it will **auto-accept the invite** and join on startup.
 
 ## Requirements
