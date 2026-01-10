@@ -13,6 +13,7 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.storage.LevelResource;
 import net.minecraftforge.event.RegisterCommandsEvent;
 import net.minecraftforge.event.ServerChatEvent;
+import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.entity.player.PlayerEvent;
 import net.minecraftforge.event.server.ServerStartedEvent;
 import net.minecraftforge.event.server.ServerStoppingEvent;
@@ -22,16 +23,24 @@ import org.slf4j.Logger;
 import java.lang.reflect.Method;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 public final class ForgeHooks {
     private static final Logger LOGGER = LogUtils.getLogger();
+    private static final int CONNECTED_NOTICE_DELAY_TICKS = 20;
 
     private BridgeService bridgeService;
     private McCallbacks callbacks;
+    private volatile MinecraftServer runningServer;
+    private volatile String connectedRoomIdOrAlias = "";
+    private final ConcurrentHashMap<UUID, Integer> pendingConnectedNoticeTicks = new ConcurrentHashMap<>();
 
     @SubscribeEvent
     public void onServerStarted(ServerStartedEvent event) {
         MinecraftServer server = event.getServer();
+        this.runningServer = server;
         Path worldRoot = server.getWorldPath(LevelResource.ROOT);
 
         if (bridgeService != null) {
@@ -55,15 +64,14 @@ public final class ForgeHooks {
                     return;
                 }
                 String room = (roomIdOrAlias == null || roomIdOrAlias.isBlank()) ? "<unknown>" : roomIdOrAlias;
-                s.execute(() -> {
-                    for (ServerPlayer p : s.getPlayerList().getPlayers()) {
-                        String lang = getPlayerLanguage(p);
-                        String msg = localizeMatrixRoomConnected(lang, room);
-                        p.sendMessage(new TextComponent(msg), Util.NIL_UUID);
-                    }
-                });
-            }
-        };
+                connectedRoomIdOrAlias = room;
+                    s.execute(() -> {
+                        for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+                            scheduleConnectedNotice(p);
+                        }
+                    });
+                }
+            };
         bridgeService.start(loadSettings(), worldRoot, callbacks);
 
         if (MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get() && MatrixBridgeConfig.ENABLE_SERVER_LIFECYCLE_TO_MATRIX.get()) {
@@ -76,6 +84,9 @@ public final class ForgeHooks {
     public void onServerStopping(ServerStoppingEvent event) {
         BridgeService service = bridgeService;
         bridgeService = null;
+        runningServer = null;
+        connectedRoomIdOrAlias = "";
+        pendingConnectedNoticeTicks.clear();
         if (service != null) {
             if (MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get() && MatrixBridgeConfig.ENABLE_SERVER_LIFECYCLE_TO_MATRIX.get()) {
                 String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "* Server stopping.";
@@ -138,9 +149,51 @@ public final class ForgeHooks {
                 ? configured
                 : service.getResolvedRoomId();
         String room = (roomId == null || roomId.isBlank()) ? "<unknown>" : roomId;
-        String lang = getPlayerLanguage(event.getPlayer());
-        String msg = localizeMatrixRoomConnected(lang, room);
-        event.getPlayer().sendMessage(new TextComponent(msg), Util.NIL_UUID);
+        connectedRoomIdOrAlias = room;
+        scheduleConnectedNotice(event.getPlayer());
+    }
+
+    @SubscribeEvent
+    public void onServerTick(TickEvent.ServerTickEvent event) {
+        if (event.phase != TickEvent.Phase.END) {
+            return;
+        }
+        MinecraftServer s = runningServer;
+        if (s == null) {
+            return;
+        }
+        if (pendingConnectedNoticeTicks.isEmpty()) {
+            return;
+        }
+
+        String room = connectedRoomIdOrAlias;
+        if (room == null || room.isBlank()) {
+            room = "<unknown>";
+        }
+
+        for (Map.Entry<UUID, Integer> e : pendingConnectedNoticeTicks.entrySet()) {
+            UUID id = e.getKey();
+            int left = (e.getValue() == null ? 0 : e.getValue()) - 1;
+            if (left > 0) {
+                pendingConnectedNoticeTicks.put(id, left);
+                continue;
+            }
+            pendingConnectedNoticeTicks.remove(id);
+            ServerPlayer p = s.getPlayerList().getPlayer(id);
+            if (p == null) {
+                continue;
+            }
+            String lang = getPlayerLanguage(p);
+            String msg = Localizer.connected(lang, room);
+            p.sendMessage(new TextComponent(msg), Util.NIL_UUID);
+        }
+    }
+
+    private void scheduleConnectedNotice(Object player) {
+        if (!(player instanceof ServerPlayer p)) {
+            return;
+        }
+        pendingConnectedNoticeTicks.put(p.getUUID(), CONNECTED_NOTICE_DELAY_TICKS);
     }
 
     @SubscribeEvent
@@ -202,11 +255,10 @@ public final class ForgeHooks {
                                 return;
                             }
                             String room = (roomIdOrAlias == null || roomIdOrAlias.isBlank()) ? "<unknown>" : roomIdOrAlias;
+                            connectedRoomIdOrAlias = room;
                             s.execute(() -> {
                                 for (ServerPlayer p : s.getPlayerList().getPlayers()) {
-                                    String lang = getPlayerLanguage(p);
-                                    String msg = localizeMatrixRoomConnected(lang, room);
-                                    p.sendMessage(new TextComponent(msg), Util.NIL_UUID);
+                                    scheduleConnectedNotice(p);
                                 }
                             });
                         }
@@ -263,33 +315,6 @@ public final class ForgeHooks {
         } catch (Exception ignored) {
         }
         return "en_us";
-    }
-
-    private static String localizeMatrixRoomConnected(String language, String roomIdOrAlias) {
-        String lang = (language == null ? "en_us" : language).toLowerCase();
-        String room = (roomIdOrAlias == null || roomIdOrAlias.isBlank()) ? "<unknown>" : roomIdOrAlias;
-        switch (lang) {
-            case "zh_cn":
-                return "Matrix 房间已连接: " + room;
-            case "zh_tw":
-                return "Matrix 房間已連接: " + room;
-            case "ja_jp":
-                return "Matrix ルームに接続しました: " + room;
-            case "ko_kr":
-                return "Matrix 방에 연결됨: " + room;
-            case "fr_fr":
-                return "Salon Matrix connecté : " + room;
-            case "de_de":
-                return "Matrix-Raum verbunden: " + room;
-            case "es_es":
-                return "Sala Matrix conectada: " + room;
-            case "ru_ru":
-                return "Комната Matrix подключена: " + room;
-            case "pt_br":
-                return "Sala Matrix conectada: " + room;
-            default:
-                return "Matrix room connected: " + room;
-        }
     }
 
     private static BridgeSettings loadSettings() {

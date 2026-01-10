@@ -162,6 +162,34 @@ jobs:
     env:
       MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
       MODRINTH_PROJECT_ID: ${{ secrets.MODRINTH_PROJECT_ID }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mc: "1.18.x"
+            jar_suffix: "forge-1.18.x"
+            game_versions: |-
+              1.18.x
+            loader: "forge"
+          - mc: "1.19.x"
+            jar_suffix: "forge-1.19.x"
+            game_versions: |-
+              1.19.x
+            loader: "forge"
+          - mc: "1.20.x"
+            jar_suffix: "forge-1.20.x"
+            game_versions: |-
+              1.20
+              1.20.1
+              1.20.2
+              1.20.3
+              1.20.4
+            loader: "forge"
+          - mc: "1.21.x"
+            jar_suffix: "forge-1.21.x"
+            game_versions: |-
+              1.21.x
+            loader: "forge"
     steps:
       - name: Download dist
         uses: actions/download-artifact@v4
@@ -174,23 +202,12 @@ jobs:
         with:
           token: ${{ env.MODRINTH_TOKEN }}
           project: ${{ env.MODRINTH_PROJECT_ID }}
-          name: ${{ needs.build-and-release.outputs.tag }}
           version: ${{ needs.build-and-release.outputs.version }}
-          channel: ${{ needs.build-and-release.outputs.channel }}
-          changelog: "Automated release ${{ needs.build-and-release.outputs.tag }}."
+          changelog: "Automated release ${{ needs.build-and-release.outputs.tag }} (Forge ${{ matrix.mc }})."
           loaders: |-
-            forge
-          game-versions: |-
-            1.18.x
-            1.19.x
-            1.20.x
-            1.21.x
-          files: |-
-            dist/${{ needs.build-and-release.outputs.mod_id }}-forge-1.18.x-${{ needs.build-and-release.outputs.version }}.jar
-            dist/${{ needs.build-and-release.outputs.mod_id }}-forge-1.19.x-${{ needs.build-and-release.outputs.version }}.jar
-            dist/${{ needs.build-and-release.outputs.mod_id }}-forge-1.20.x-${{ needs.build-and-release.outputs.version }}.jar
-            dist/${{ needs.build-and-release.outputs.mod_id }}-forge-1.21.x-${{ needs.build-and-release.outputs.version }}.jar
-          primary-file: ${{ needs.build-and-release.outputs.mod_id }}-forge-1.20.x-${{ needs.build-and-release.outputs.version }}.jar
+            ${matrix.loader}
+          game-versions: ${{ matrix.game_versions }}
+          files: dist/${{ needs.build-and-release.outputs.mod_id }}-${{ matrix.jar_suffix }}-${{ needs.build-and-release.outputs.version }}.jar
 
   publish-curseforge:
     name: Publish to CurseForge
@@ -205,13 +222,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - jar_name: "${{ needs.build-and-release.outputs.mod_id }}-forge-1.18.x-${{ needs.build-and-release.outputs.version }}.jar"
+          - jar_suffix: "forge-1.18.x"
             game_versions: ${{ vars.CURSEFORGE_GAME_VERSIONS_118 || 'Minecraft 1.18:1.18.2,Java 17,Forge' }}
-          - jar_name: "${{ needs.build-and-release.outputs.mod_id }}-forge-1.19.x-${{ needs.build-and-release.outputs.version }}.jar"
+          - jar_suffix: "forge-1.19.x"
             game_versions: ${{ vars.CURSEFORGE_GAME_VERSIONS_119 || 'Minecraft 1.19:1.19.2,Java 17,Forge' }}
-          - jar_name: "${{ needs.build-and-release.outputs.mod_id }}-forge-1.20.x-${{ needs.build-and-release.outputs.version }}.jar"
+          - jar_suffix: "forge-1.20.x"
             game_versions: ${{ vars.CURSEFORGE_GAME_VERSIONS_120 || 'Minecraft 1.20:1.20.1,Java 17,Forge' }}
-          - jar_name: "${{ needs.build-and-release.outputs.mod_id }}-forge-1.21.x-${{ needs.build-and-release.outputs.version }}.jar"
+          - jar_suffix: "forge-1.21.x"
             game_versions: ${{ vars.CURSEFORGE_GAME_VERSIONS_121 || 'Minecraft 1.21:1.21.1,Java 21,Forge' }}
 
     steps:
@@ -227,7 +244,7 @@ jobs:
           token: ${{ env.CURSEFORGE_TOKEN }}
           project_id: ${{ env.CURSEFORGE_PROJECT_ID }}
           game_endpoint: minecraft
-          file_path: dist/${{ matrix.jar_name }}
+          file_path: dist/${{ needs.build-and-release.outputs.mod_id }}-${{ matrix.jar_suffix }}-${{ needs.build-and-release.outputs.version }}.jar
           game_versions: ${{ matrix.game_versions }}
           release_type: ${{ needs.build-and-release.outputs.channel }}
           changelog: "Automated release ${{ needs.build-and-release.outputs.tag }}."

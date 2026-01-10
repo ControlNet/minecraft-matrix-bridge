@@ -22,6 +22,8 @@ sourceSets {
         }
         resources {
             srcDir rootProject.file('forge-shared/common/src/main/resources')
+            // Include core resources (e.g., assets/* lang files) for dev runs and packaging.
+            srcDir project(':core').file('src/main/resources')
         }
         output.resourcesDir = layout.buildDirectory.dir('classes/java/main').get().asFile
     }
