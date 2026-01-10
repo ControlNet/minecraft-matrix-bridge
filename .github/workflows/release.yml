@@ -205,7 +205,7 @@ jobs:
           version: ${{ needs.build-and-release.outputs.version }}
           changelog: "Automated release ${{ needs.build-and-release.outputs.tag }} (Forge ${{ matrix.mc }})."
           loaders: |-
-            ${matrix.loader}
+            ${{ matrix.loader }}
           game-versions: ${{ matrix.game_versions }}
           files: dist/${{ needs.build-and-release.outputs.mod_id }}-${{ matrix.jar_suffix }}-${{ needs.build-and-release.outputs.version }}.jar
 
