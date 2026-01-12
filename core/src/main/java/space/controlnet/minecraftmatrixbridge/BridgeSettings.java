@@ -12,6 +12,7 @@ public final class BridgeSettings {
     public final boolean announceConnected;
     public final String mcToMatrixPrefix;
     public final String matrixToMcPrefix;
+    public final String matrixBotPrefix;
 
     public final int syncTimeoutMs;
     public final int timelineLimit;
@@ -27,6 +28,7 @@ public final class BridgeSettings {
             boolean announceConnected,
             String mcToMatrixPrefix,
             String matrixToMcPrefix,
+            String matrixBotPrefix,
             int syncTimeoutMs,
             int timelineLimit,
             int maxQueueSize,
@@ -41,6 +43,7 @@ public final class BridgeSettings {
         this.announceConnected = announceConnected;
         this.mcToMatrixPrefix = defaultIfBlankPreserveWhitespace(mcToMatrixPrefix, "[MC] ");
         this.matrixToMcPrefix = defaultIfBlankPreserveWhitespace(matrixToMcPrefix, "[Matrix] ");
+        this.matrixBotPrefix = normalizeMatrixBotPrefix(matrixBotPrefix);
 
         this.syncTimeoutMs = syncTimeoutMs;
         this.timelineLimit = timelineLimit;
@@ -70,6 +73,7 @@ public final class BridgeSettings {
                 ", announceConnected=" + announceConnected +
                 ", mcToMatrixPrefix='" + mcToMatrixPrefix + '\'' +
                 ", matrixToMcPrefix='" + matrixToMcPrefix + '\'' +
+                ", matrixBotPrefix='" + matrixBotPrefix + '\'' +
                 ", syncTimeoutMs=" + syncTimeoutMs +
                 ", timelineLimit=" + timelineLimit +
                 ", maxQueueSize=" + maxQueueSize +
@@ -100,6 +104,18 @@ public final class BridgeSettings {
         String s = trimToEmpty(homeserverRaw);
         while (s.endsWith("/")) {
             s = s.substring(0, s.length() - 1);
+        }
+        return s;
+    }
+
+    private static String normalizeMatrixBotPrefix(String raw) {
+        if (raw == null) {
+            return "!mc";
+        }
+        String s = raw.trim();
+        // Allow disabling by setting empty string in config.
+        if (s.isEmpty()) {
+            return "";
         }
         return s;
     }

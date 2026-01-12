@@ -8,13 +8,13 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.storage.LevelResource;
-import net.minecraftforge.event.RegisterCommandsEvent;
-import net.minecraftforge.event.ServerChatEvent;
-import net.minecraftforge.event.TickEvent;
-import net.minecraftforge.event.entity.player.PlayerEvent;
-import net.minecraftforge.event.server.ServerStartedEvent;
-import net.minecraftforge.event.server.ServerStoppingEvent;
-import net.minecraftforge.eventbus.api.SubscribeEvent;
+import net.neoforged.bus.api.SubscribeEvent;
+import net.neoforged.neoforge.event.RegisterCommandsEvent;
+import net.neoforged.neoforge.event.ServerChatEvent;
+import net.neoforged.neoforge.event.entity.player.PlayerEvent;
+import net.neoforged.neoforge.event.server.ServerStartedEvent;
+import net.neoforged.neoforge.event.server.ServerStoppingEvent;
+import net.neoforged.neoforge.event.tick.ServerTickEvent;
 import org.slf4j.Logger;
 
 import java.lang.reflect.Method;
@@ -28,7 +28,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 
-public final class ForgeHooks {
+public final class NeoForgeHooks {
     private static final Logger LOGGER = LogUtils.getLogger();
     private static final int CONNECTED_NOTICE_DELAY_TICKS = 20;
 
@@ -58,40 +58,40 @@ public final class ForgeHooks {
                 s.execute(() -> s.getPlayerList().broadcastSystemMessage(Component.literal(text), false));
             }
 
-                    @Override
-	                    public void announceMatrixConnected(String roomIdOrAlias) {
-	                        MinecraftServer s = server;
-	                        if (s == null) {
-	                            return;
-	                        }
-	                        String room = (roomIdOrAlias == null || roomIdOrAlias.isBlank()) ? "<unknown>" : roomIdOrAlias;
-	                        connectedRoomIdOrAlias = room;
-	                        s.execute(() -> {
-	                            for (ServerPlayer p : s.getPlayerList().getPlayers()) {
-	                                scheduleConnectedNotice(p);
-	                            }
-	                        });
-	                    }
+            @Override
+            public void announceMatrixConnected(String roomIdOrAlias) {
+                MinecraftServer s = server;
+                if (s == null) {
+                    return;
+                }
+                String room = (roomIdOrAlias == null || roomIdOrAlias.isBlank()) ? "<unknown>" : roomIdOrAlias;
+                connectedRoomIdOrAlias = room;
+                s.execute(() -> {
+                    for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+                        scheduleConnectedNotice(p);
+                    }
+                });
+            }
 
-                        @Override
-                        public CompletableFuture<List<String>> getOnlinePlayerNames() {
-                            CompletableFuture<List<String>> fut = new CompletableFuture<>();
-                            MinecraftServer s = server;
-                            if (s == null) {
-                                fut.complete(List.of());
-                                return fut;
-                            }
-                            s.execute(() -> {
-                                List<String> names = new ArrayList<>();
-                                for (ServerPlayer p : s.getPlayerList().getPlayers()) {
-                                    names.add(p.getGameProfile().getName());
-                                }
-                                Collections.sort(names);
-                                fut.complete(names);
-                            });
-                            return fut;
-                        }
-	                };
+            @Override
+            public CompletableFuture<List<String>> getOnlinePlayerNames() {
+                CompletableFuture<List<String>> fut = new CompletableFuture<>();
+                MinecraftServer s = server;
+                if (s == null) {
+                    fut.complete(List.of());
+                    return fut;
+                }
+                s.execute(() -> {
+                    List<String> names = new ArrayList<>();
+                    for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+                        names.add(p.getName().getString());
+                    }
+                    Collections.sort(names);
+                    fut.complete(names);
+                });
+                return fut;
+            }
+        };
         bridgeService.start(loadSettings(), worldRoot, callbacks);
 
         if (MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get() && MatrixBridgeConfig.ENABLE_SERVER_LIFECYCLE_TO_MATRIX.get()) {
@@ -141,7 +141,7 @@ public final class ForgeHooks {
             return;
         }
 
-        String playerName = event.getPlayer().getGameProfile().getName();
+        String playerName = event.getPlayer().getName().getString();
         String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "<" + playerName + "> " + msg;
         bridgeService.enqueueMcMessage(formatted);
     }
@@ -153,7 +153,7 @@ public final class ForgeHooks {
         if (service != null && service.isRunning()
                 && MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get()
                 && MatrixBridgeConfig.ENABLE_JOIN_LEAVE_TO_MATRIX.get()) {
-            String playerName = event.getEntity().getGameProfile().getName();
+            String playerName = event.getEntity().getName().getString();
             String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "* " + playerName + " joined the game";
             service.enqueueMcMessage(formatted);
         }
@@ -174,10 +174,7 @@ public final class ForgeHooks {
     }
 
     @SubscribeEvent
-    public void onServerTick(TickEvent.ServerTickEvent event) {
-        if (event.phase != TickEvent.Phase.END) {
-            return;
-        }
+    public void onServerTick(ServerTickEvent.Post event) {
         MinecraftServer s = runningServer;
         if (s == null) {
             return;
@@ -229,7 +226,7 @@ public final class ForgeHooks {
             return;
         }
 
-        String playerName = event.getEntity().getGameProfile().getName();
+        String playerName = event.getEntity().getName().getString();
         String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "* " + playerName + " left the game";
         service.enqueueMcMessage(formatted);
     }
@@ -240,14 +237,14 @@ public final class ForgeHooks {
                 .requires(source -> source.hasPermission(2))
                 .then(Commands.literal("status").executes(ctx -> {
                     if (bridgeService == null) {
-                        ForgeCommandCompat.sendSuccess(ctx.getSource(), Component.literal("MatrixBridge: not initialized."), false);
+                        ctx.getSource().sendSuccess(() -> Component.literal("MatrixBridge: not initialized."), false);
                         return 0;
                     }
                     String msg = "MatrixBridge: running=" + bridgeService.isRunning()
                             + ", ready=" + bridgeService.isReady()
                             + ", selfUserId=" + (bridgeService.getSelfUserId().isBlank() ? "<unknown>" : bridgeService.getSelfUserId())
                             + ", queue=" + bridgeService.getQueueSize();
-                    ForgeCommandCompat.sendSuccess(ctx.getSource(), Component.literal(msg), false);
+                    ctx.getSource().sendSuccess(() -> Component.literal(msg), false);
                     return 1;
                 }))
                 .then(Commands.literal("reload").executes(ctx -> {
@@ -294,7 +291,7 @@ public final class ForgeHooks {
                             s.execute(() -> {
                                 List<String> names = new ArrayList<>();
                                 for (ServerPlayer p : s.getPlayerList().getPlayers()) {
-                                    names.add(p.getGameProfile().getName());
+                                    names.add(p.getName().getString());
                                 }
                                 Collections.sort(names);
                                 fut.complete(names);
@@ -303,7 +300,7 @@ public final class ForgeHooks {
                         }
                     };
                     bridgeService.start(loadSettings(), worldRoot, callbacks);
-                    ForgeCommandCompat.sendSuccess(ctx.getSource(), Component.literal("MatrixBridge reload requested."), true);
+                    ctx.getSource().sendSuccess(() -> Component.literal("MatrixBridge reload requested."), true);
                     return 1;
                 }))
                 .then(Commands.literal("test").executes(ctx -> {
@@ -318,7 +315,7 @@ public final class ForgeHooks {
                     String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "[TEST] " + Instant.now();
                     boolean queued = bridgeService.enqueueMcMessage(formatted);
                     if (queued) {
-                        ForgeCommandCompat.sendSuccess(ctx.getSource(), Component.literal("Queued test message."), false);
+                        ctx.getSource().sendSuccess(() -> Component.literal("Queued test message."), false);
                         return 1;
                     }
                     ctx.getSource().sendFailure(Component.literal("Failed to queue test message (queue full or bridge not ready)."));

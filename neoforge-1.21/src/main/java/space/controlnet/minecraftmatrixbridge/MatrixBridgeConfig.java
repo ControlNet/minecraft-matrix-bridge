@@ -1,29 +1,29 @@
 package space.controlnet.minecraftmatrixbridge;
 
-import net.minecraftforge.common.ForgeConfigSpec;
+import net.neoforged.neoforge.common.ModConfigSpec;
 
 public final class MatrixBridgeConfig {
-    public static final ForgeConfigSpec SPEC;
+    public static final ModConfigSpec SPEC;
 
-    public static final ForgeConfigSpec.ConfigValue<String> HOMESERVER;
-    public static final ForgeConfigSpec.ConfigValue<String> ROOM_ID;
-    public static final ForgeConfigSpec.ConfigValue<String> ACCESS_TOKEN;
+    public static final ModConfigSpec.ConfigValue<String> HOMESERVER;
+    public static final ModConfigSpec.ConfigValue<String> ROOM_ID;
+    public static final ModConfigSpec.ConfigValue<String> ACCESS_TOKEN;
 
-    public static final ForgeConfigSpec.BooleanValue ENABLE_MC_TO_MATRIX;
-    public static final ForgeConfigSpec.BooleanValue ENABLE_MATRIX_TO_MC;
-    public static final ForgeConfigSpec.BooleanValue ANNOUNCE_CONNECTED;
-    public static final ForgeConfigSpec.BooleanValue ENABLE_JOIN_LEAVE_TO_MATRIX;
-    public static final ForgeConfigSpec.BooleanValue ENABLE_SERVER_LIFECYCLE_TO_MATRIX;
-    public static final ForgeConfigSpec.ConfigValue<String> MC_TO_MATRIX_PREFIX;
-    public static final ForgeConfigSpec.ConfigValue<String> MATRIX_TO_MC_PREFIX;
-    public static final ForgeConfigSpec.ConfigValue<String> MATRIX_BOT_PREFIX;
-    public static final ForgeConfigSpec.IntValue SYNC_TIMEOUT_MS;
-    public static final ForgeConfigSpec.IntValue TIMELINE_LIMIT;
-    public static final ForgeConfigSpec.IntValue MAX_QUEUE_SIZE;
-    public static final ForgeConfigSpec.IntValue DEDUP_SIZE;
+    public static final ModConfigSpec.BooleanValue ENABLE_MC_TO_MATRIX;
+    public static final ModConfigSpec.BooleanValue ENABLE_MATRIX_TO_MC;
+    public static final ModConfigSpec.BooleanValue ANNOUNCE_CONNECTED;
+    public static final ModConfigSpec.BooleanValue ENABLE_JOIN_LEAVE_TO_MATRIX;
+    public static final ModConfigSpec.BooleanValue ENABLE_SERVER_LIFECYCLE_TO_MATRIX;
+    public static final ModConfigSpec.ConfigValue<String> MC_TO_MATRIX_PREFIX;
+    public static final ModConfigSpec.ConfigValue<String> MATRIX_TO_MC_PREFIX;
+    public static final ModConfigSpec.ConfigValue<String> MATRIX_BOT_PREFIX;
+    public static final ModConfigSpec.IntValue SYNC_TIMEOUT_MS;
+    public static final ModConfigSpec.IntValue TIMELINE_LIMIT;
+    public static final ModConfigSpec.IntValue MAX_QUEUE_SIZE;
+    public static final ModConfigSpec.IntValue DEDUP_SIZE;
 
     static {
-        ForgeConfigSpec.Builder builder = new ForgeConfigSpec.Builder();
+        ModConfigSpec.Builder builder = new ModConfigSpec.Builder();
 
         builder.comment("Matrix connection settings").push("matrix");
         HOMESERVER = builder.define("homeserver", "");
@@ -58,3 +58,4 @@ public final class MatrixBridgeConfig {
     private MatrixBridgeConfig() {
     }
 }
+

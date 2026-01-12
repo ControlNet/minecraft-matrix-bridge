@@ -15,6 +15,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
@@ -62,6 +63,7 @@ public class BridgeServiceTest {
                     true,
                     "[MC] ",
                     "[Matrix] ",
+                    "!mc",
                     0,
                     20,
                     100,
@@ -104,6 +106,7 @@ public class BridgeServiceTest {
                     true,
                     "[MC] ",
                     "[Matrix] ",
+                    "!mc",
                     0,
                     20,
                     10,
@@ -139,6 +142,7 @@ public class BridgeServiceTest {
                     true,
                     "[MC] ",
                     "[Matrix] ",
+                    "!mc",
                     0,
                     20,
                     10,
@@ -155,6 +159,66 @@ public class BridgeServiceTest {
 
                 waitUntil(() -> server.sendCallCount() >= 2, Duration.ofSeconds(2));
                 assertTrue(server.getSendRequests().size() >= 2);
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void botCommandsAreNotForwardedAndListRepliesInMatrix() throws Exception {
+        String roomId = "!room:example.com";
+        String selfUserId = "@bot:example.com";
+
+        try (MockMatrixServer server = new MockMatrixServer("token", selfUserId)) {
+            server.setJoinedRooms(List.of(roomId));
+
+            // Initial catch-up sync to establish a since token.
+            server.enqueueSyncResponse(roomId, "s0", new JsonArray());
+
+            JsonArray events = new JsonArray();
+            events.add(matrixTextEvent("$cmd1", "@alice:example.com", "!mc list"));
+            server.enqueueSyncResponse(roomId, "s1", events);
+
+            List<String> received = Collections.synchronizedList(new ArrayList<>());
+            McCallbacks callbacks = new McCallbacks() {
+                @Override
+                public void broadcast(String text) {
+                    received.add(text);
+                }
+
+                @Override
+                public CompletableFuture<List<String>> getOnlinePlayerNames() {
+                    return CompletableFuture.completedFuture(List.of("Alex", "Steve"));
+                }
+            };
+
+            BridgeSettings settings = new BridgeSettings(
+                    server.homeserverUrl(),
+                    roomId,
+                    "token",
+                    false,
+                    true,
+                    true,
+                    "[MC] ",
+                    "[Matrix] ",
+                    "!mc",
+                    0,
+                    20,
+                    100,
+                    64
+            );
+
+            BridgeService service = new BridgeService();
+            try {
+                service.start(settings, worldRoot, callbacks);
+
+                waitUntil(() -> server.sendCallCount() >= 1, Duration.ofSeconds(2));
+                assertTrue(received.stream().noneMatch(s -> s.contains("!mc")), "should not forward bot command to Minecraft chat");
+
+                String bodyJson = server.getSendRequests().get(0).body();
+                JsonObject body = JsonParser.parseString(bodyJson).getAsJsonObject();
+                assertEquals("Online players (2): Alex, Steve", body.get("body").getAsString());
             } finally {
                 service.stop();
             }
@@ -197,6 +261,7 @@ public class BridgeServiceTest {
                     true,
                     "[MC] ",
                     "[Matrix] ",
+                    "!mc",
                     0,
                     20,
                     100,
@@ -247,6 +312,7 @@ public class BridgeServiceTest {
                     true,
                     "[MC] ",
                     "[Matrix] ",
+                    "!mc",
                     0,
                     20,
                     100,

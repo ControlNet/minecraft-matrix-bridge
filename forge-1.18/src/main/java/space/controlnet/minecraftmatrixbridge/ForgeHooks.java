@@ -23,8 +23,12 @@ import org.slf4j.Logger;
 import java.lang.reflect.Method;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 
 public final class ForgeHooks {
@@ -65,13 +69,32 @@ public final class ForgeHooks {
                 }
                 String room = (roomIdOrAlias == null || roomIdOrAlias.isBlank()) ? "<unknown>" : roomIdOrAlias;
                 connectedRoomIdOrAlias = room;
-                    s.execute(() -> {
-                        for (ServerPlayer p : s.getPlayerList().getPlayers()) {
-                            scheduleConnectedNotice(p);
-                        }
-                    });
+                s.execute(() -> {
+                    for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+                        scheduleConnectedNotice(p);
+                    }
+                });
+            }
+
+            @Override
+            public CompletableFuture<List<String>> getOnlinePlayerNames() {
+                CompletableFuture<List<String>> fut = new CompletableFuture<>();
+                MinecraftServer s = server;
+                if (s == null) {
+                    fut.complete(List.of());
+                    return fut;
                 }
-            };
+                s.execute(() -> {
+                    List<String> names = new ArrayList<>();
+                    for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+                        names.add(p.getGameProfile().getName());
+                    }
+                    Collections.sort(names);
+                    fut.complete(names);
+                });
+                return fut;
+            }
+        };
         bridgeService.start(loadSettings(), worldRoot, callbacks);
 
         if (MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get() && MatrixBridgeConfig.ENABLE_SERVER_LIFECYCLE_TO_MATRIX.get()) {
@@ -262,6 +285,25 @@ public final class ForgeHooks {
                                 }
                             });
                         }
+
+                        @Override
+                        public CompletableFuture<List<String>> getOnlinePlayerNames() {
+                            CompletableFuture<List<String>> fut = new CompletableFuture<>();
+                            MinecraftServer s = server;
+                            if (s == null) {
+                                fut.complete(List.of());
+                                return fut;
+                            }
+                            s.execute(() -> {
+                                List<String> names = new ArrayList<>();
+                                for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+                                    names.add(p.getGameProfile().getName());
+                                }
+                                Collections.sort(names);
+                                fut.complete(names);
+                            });
+                            return fut;
+                        }
                     };
                     bridgeService.start(loadSettings(), worldRoot, callbacks);
                     ctx.getSource().sendSuccess(new TextComponent("MatrixBridge reload requested."), true);
@@ -335,6 +377,7 @@ public final class ForgeHooks {
                 MatrixBridgeConfig.ANNOUNCE_CONNECTED.get(),
                 MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get(),
                 MatrixBridgeConfig.MATRIX_TO_MC_PREFIX.get(),
+                MatrixBridgeConfig.MATRIX_BOT_PREFIX.get(),
                 MatrixBridgeConfig.SYNC_TIMEOUT_MS.get(),
                 MatrixBridgeConfig.TIMELINE_LIMIT.get(),
                 MatrixBridgeConfig.MAX_QUEUE_SIZE.get(),

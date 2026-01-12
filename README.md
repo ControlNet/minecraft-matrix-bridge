@@ -1,4 +1,4 @@
-# Minecraft Matrix Bridge (Forge, Server-Only)
+# Minecraft Matrix Bridge (Forge/NeoForge, Server-Only)
 
 <div align="center">
     <img src="https://img.shields.io/github/stars/ControlNet/minecraft-matrix-bridge?style=flat-square">
@@ -24,8 +24,8 @@ Bridges chat between a Minecraft server and **one Matrix room** (unencrypted onl
 - If the bot is **invited** to the configured room but not joined yet, it will **auto-accept the invite** and join on startup.
 
 ## Requirements
-- Java 17 (Forge 1.18–1.20) or Java 21 (Forge 1.21+)
-- Minecraft Forge server matching the versions. I only manually test it in popular minor versions, and hopefully it works in other minor versions.
+- Java 17 (Forge 1.18–1.20) or Java 21 (Forge/NeoForge 1.21+)
+- Minecraft Forge/NeoForge server matching the versions. I only manually test it in popular minor versions, and hopefully it works in other minor versions.
     - 1.18.2
     - 1.19.2
     - 1.20.1
@@ -34,12 +34,14 @@ Bridges chat between a Minecraft server and **one Matrix room** (unencrypted onl
 
 ## Installation
 1. Download the jar or build the jar `./scripts/build_dist.sh` and you can find it in `dist/`.
-2. Drop the jar into your Forge server’s `mods/` folder.
+2. Drop the jar into your Forge/NeoForge server’s `mods/` folder (pick the jar matching your loader + Minecraft major).
 3. Start the server once to generate config.
 
 ### Build all versions (creates `dist/`)
 To build jars for all supported Minecraft versions and collect them into `dist/`:
 - `./scripts/build_dist.sh`
+
+`dist/` includes Forge jars for 1.18.x–1.21.x and a NeoForge jar for 1.21.x.
 
 ## Configuration
 Edit `config/minecraftmatrixbridge.toml`:
@@ -55,6 +57,7 @@ Optional:
 - `bridge.enableServerLifecycleToMatrix` (default `false`) sends `Server started/stopping` to Matrix
 - `bridge.mcToMatrixPrefix` (default `[MC] `)
 - `bridge.matrixToMcPrefix` (default `[Matrix] `)
+- `bridge.matrixBotPrefix` (default `!mc`) Matrix bot command prefix; messages starting with this prefix are treated as bot commands and are not forwarded to Minecraft chat
 - `bridge.syncTimeoutMs` (default `30000`)
 - `bridge.timelineLimit` (default `20`)
 - `bridge.maxQueueSize` (default `1000`)
@@ -69,6 +72,10 @@ OP-only:
 - `/matrix status`: show bridge status
 - `/matrix reload`: reload bridge config
 - `/matrix test`: send a test message to Matrix
+
+Matrix room bot commands (requires `bridge.enableMatrixToMc=true`):
+- `!mc help` (or replace `!mc` with `bridge.matrixBotPrefix`)
+- `!mc list` (replies with online player names; command messages are not forwarded into Minecraft chat)
 
 ## AI use declaration
 

@@ -144,6 +144,7 @@ jobs:
             dist/${{ env.MOD_ID }}-forge-1.19.x-${{ env.VERSION }}.jar
             dist/${{ env.MOD_ID }}-forge-1.20.x-${{ env.VERSION }}.jar
             dist/${{ env.MOD_ID }}-forge-1.21.x-${{ env.VERSION }}.jar
+            dist/${{ env.MOD_ID }}-neoforge-1.21.x-${{ env.VERSION }}.jar
             dist/SHA256SUMS.txt
 
       - name: Upload dist for publisher jobs
@@ -190,6 +191,11 @@ jobs:
             game_versions: |-
               1.21.x
             loader: "forge"
+          - mc: "1.21.x"
+            jar_suffix: "neoforge-1.21.x"
+            game_versions: |-
+              1.21.x
+            loader: "neoforge"
     steps:
       - name: Download dist
         uses: actions/download-artifact@v4
@@ -205,7 +211,7 @@ jobs:
           version: ${{ needs.build-and-release.outputs.version }}
           changelog: "Automated release ${{ needs.build-and-release.outputs.tag }} (Forge ${{ matrix.mc }})."
           loaders: |-
-            ${matrix.loader}
+            ${{ matrix.loader }}
           game-versions: ${{ matrix.game_versions }}
           files: dist/${{ needs.build-and-release.outputs.mod_id }}-${{ matrix.jar_suffix }}-${{ needs.build-and-release.outputs.version }}.jar
 
@@ -230,6 +236,8 @@ jobs:
             game_versions: ${{ vars.CURSEFORGE_GAME_VERSIONS_120 || 'Minecraft 1.20:1.20.1,Java 17,Forge' }}
           - jar_suffix: "forge-1.21.x"
             game_versions: ${{ vars.CURSEFORGE_GAME_VERSIONS_121 || 'Minecraft 1.21:1.21.1,Java 21,Forge' }}
+          - jar_suffix: "neoforge-1.21.x"
+            game_versions: ${{ vars.CURSEFORGE_GAME_VERSIONS_NEOFORGE_121 || 'Minecraft 1.21:1.21.1,Java 21,NeoForge' }}
 
     steps:
       - name: Download dist

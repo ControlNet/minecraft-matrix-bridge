@@ -1,5 +1,8 @@
 package space.controlnet.minecraftmatrixbridge;
 
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+
 /**
  * Loader-specific callbacks into the Minecraft server environment.
  *
@@ -18,5 +21,15 @@ public interface McCallbacks {
     default void announceMatrixConnected(String roomIdOrAlias) {
         String room = (roomIdOrAlias == null || roomIdOrAlias.isBlank()) ? "<unknown>" : roomIdOrAlias;
         broadcast("Matrix room connected: " + room);
+    }
+
+    /**
+     * Get the current online player names.
+     *
+     * <p>Implementations must be safe to call from background threads, and should schedule any server access onto
+     * the main thread and complete the returned future once done.</p>
+     */
+    default CompletableFuture<List<String>> getOnlinePlayerNames() {
+        return CompletableFuture.completedFuture(List.of());
     }
 }
