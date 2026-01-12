@@ -38,3 +38,7 @@ Thumbs.db
 .env
 
 dist/
+
+### Avoid committing extracted Gradle plugin metadata (not mod metadata)
+/META-INF/
+**/META-INF/gradle-plugins/

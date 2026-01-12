@@ -6,6 +6,10 @@ import com.google.gson.JsonObject;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.List;
+import java.util.Locale;
+import java.util.concurrent.CompletableFuture;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
@@ -573,6 +577,10 @@ public final class BridgeService {
                 continue;
             }
 
+            if (maybeHandleMatrixBotCommand(body)) {
+                continue;
+            }
+
             String displaySender = sender;
             MatrixClient client = matrixClient;
             if (client != null) {
@@ -589,6 +597,115 @@ public final class BridgeService {
             McCallbacks cb = callbacks;
             if (cb != null) {
                 cb.broadcast(line);
+            }
+        }
+    }
+
+    private boolean maybeHandleMatrixBotCommand(String body) {
+        if (body == null) {
+            return false;
+        }
+        String prefix = (settings == null) ? "" : settings.matrixBotPrefix;
+        if (prefix == null || prefix.isBlank()) {
+            return false;
+        }
+        String trimmed = body.trim();
+
+        // Accept "prefix" or "prefix ..." (case-insensitive).
+        if (!trimmed.regionMatches(true, 0, prefix, 0, prefix.length())) {
+            return false;
+        }
+        if (trimmed.length() != prefix.length()) {
+            if (trimmed.length() < prefix.length() + 1) {
+                return false;
+            }
+            char next = trimmed.charAt(prefix.length());
+            if (!Character.isWhitespace(next)) {
+                return false;
+            }
+        }
+
+        // Command messages should not be forwarded to Minecraft chat.
+        String rest = trimmed.substring(prefix.length()).trim();
+        String[] parts = rest.isEmpty() ? new String[0] : rest.split("\\s+");
+        String sub = (parts.length >= 1) ? parts[0].toLowerCase(Locale.ROOT) : "help";
+
+        if ("help".equals(sub)) {
+            sendMatrixBotReply("Commands: " + prefix + " help, " + prefix + " list");
+            return true;
+        }
+
+        if ("list".equals(sub)) {
+            sendMatrixBotReply(buildOnlinePlayersReply(Duration.ofSeconds(2)));
+            return true;
+        }
+
+        sendMatrixBotReply("Unknown command. Try: " + prefix + " help");
+        return true;
+    }
+
+    private String buildOnlinePlayersReply(Duration timeout) {
+        McCallbacks cb = callbacks;
+        if (cb == null) {
+            return "Online players: <unavailable>";
+        }
+
+        try {
+            CompletableFuture<List<String>> fut = cb.getOnlinePlayerNames();
+            if (fut == null) {
+                return "Online players: <unavailable>";
+            }
+            long ms = timeout == null ? 2_000 : Math.max(1, timeout.toMillis());
+            List<String> names = fut.get(ms, TimeUnit.MILLISECONDS);
+            if (names == null || names.isEmpty()) {
+                return "No players online.";
+            }
+            if (names.size() == 1) {
+                return "Online players (1): " + names.get(0);
+            }
+            return "Online players (" + names.size() + "): " + String.join(", ", names);
+        } catch (Exception ignored) {
+            return "Online players: <unavailable>";
+        }
+    }
+
+    private void sendMatrixBotReply(String text) {
+        if (text == null || text.isBlank()) {
+            return;
+        }
+        MatrixClient client = matrixClient;
+        if (client == null) {
+            return;
+        }
+        String roomId = resolvedRoomId;
+        if (roomId == null || roomId.isBlank()) {
+            return;
+        }
+
+        long backoffMs = 1_000;
+        for (int attempt = 0; running.get() && attempt < 3; attempt++) {
+            try {
+                client.sendText(roomId, text);
+                return;
+            } catch (MatrixClient.MatrixException e) {
+                if (e.statusCode == 429) {
+                    long sleepMs = e.retryAfterMs > 0 ? e.retryAfterMs : jitter(backoffMs);
+                    sleepMs(sleepMs);
+                    backoffMs = nextBackoff(backoffMs);
+                    continue;
+                }
+                LOGGER.warning("Matrix bot reply failed (" + e.getMessage() + "); dropping.");
+                return;
+            } catch (IOException e) {
+                long sleepMs = jitter(backoffMs);
+                sleepMs(sleepMs);
+                backoffMs = nextBackoff(backoffMs);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            } catch (Exception e) {
+                LOGGER.warning("Matrix bot reply unexpected error (" + e + "); dropping.");
+                return;
             }
         }
     }

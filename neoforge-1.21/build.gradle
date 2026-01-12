@@ -1,0 +1,103 @@
+plugins {
+    id 'eclipse'
+    id 'maven-publish'
+    id 'net.neoforged.moddev' version '2.0.139'
+}
+
+base {
+    archivesName = "${mod_id}-neoforge-1.21.x"
+}
+
+// Minecraft 1.21.x requires Java 21.
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(21)
+}
+
+sourceSets {
+    main {
+        resources {
+            // Include core resources (e.g., assets/* lang files) for dev runs and packaging.
+            srcDir project(':core').file('src/main/resources')
+        }
+    }
+}
+
+ext {
+    minecraft_version = '1.21.1'
+    // NeoForge 21.1.x targets Minecraft 1.21.1.
+    neo_version = '21.1.218'
+    neo_version_range = '[21.1,)'
+
+    pack_format = 34
+
+    // NeoForge uses javafml; current loader major is 2 (as per NeoForge MDK template).
+    loader_version_range = '[2,)'
+    minecraft_version_range = '[1.21,1.22)'
+}
+
+neoForge {
+    version = neo_version
+
+    runs {
+        server {
+            server()
+            gameDirectory = layout.projectDirectory.dir('run-systemtest')
+            programArgument '--nogui'
+            jvmArgument '-Djna.tmpdir=./jna'
+        }
+
+        configureEach {
+            logLevel = org.slf4j.event.Level.INFO
+        }
+    }
+
+    mods {
+        "${mod_id}" {
+            sourceSet(sourceSets.main)
+        }
+    }
+}
+
+dependencies {
+    compileOnly project(':core')
+}
+
+tasks.named('processResources', ProcessResources).configure {
+    var replaceProperties = [
+            minecraft_version      : minecraft_version,
+            minecraft_version_range: minecraft_version_range,
+            neo_version            : neo_version,
+            neo_version_range      : neo_version_range,
+            loader_version_range   : loader_version_range,
+            pack_format            : pack_format,
+            mod_id                 : mod_id,
+            mod_name               : mod_name,
+            mod_license            : mod_license,
+            mod_version            : mod_version,
+            mod_authors            : mod_authors,
+            mod_description        : mod_description
+    ]
+    inputs.properties replaceProperties
+
+    filesMatching(['META-INF/neoforge.mods.toml', 'pack.mcmeta']) {
+        expand replaceProperties
+    }
+}
+
+tasks.named('jar', Jar).configure {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from(project(':core').sourceSets.main.output)
+}
+
+def copyCoreForRun = tasks.register('copyCoreForRun', Copy) {
+    dependsOn project(':core').tasks.named('classes')
+    from project(':core').sourceSets.main.output.classesDirs
+    into layout.buildDirectory.dir('classes/java/main')
+}
+
+tasks.withType(JavaExec).configureEach {
+    if (name == 'runServer') {
+        dependsOn(copyCoreForRun)
+        standardInput = System.in
+    }
+}
