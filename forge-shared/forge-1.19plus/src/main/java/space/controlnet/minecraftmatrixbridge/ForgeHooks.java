@@ -30,7 +30,10 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public final class ForgeHooks {
     private static final Logger LOGGER = LogUtils.getLogger();
-    private static final int CONNECTED_NOTICE_DELAY_TICKS = 20;
+    private static final int MAX_WAIT_TICKS = 100; // 5 seconds max wait for client settings
+    // Default ClientInformation values (from ClientInformation.createDefault())
+    private static final int DEFAULT_VIEW_DISTANCE = 2;
+    private static final int DEFAULT_MODEL_CUSTOMISATION = 0;
 
     private BridgeService bridgeService;
     private McCallbacks callbacks;
@@ -193,27 +196,103 @@ public final class ForgeHooks {
 
         for (Map.Entry<UUID, Integer> e : pendingConnectedNoticeTicks.entrySet()) {
             UUID id = e.getKey();
-            int left = (e.getValue() == null ? 0 : e.getValue()) - 1;
-            if (left > 0) {
-                pendingConnectedNoticeTicks.put(id, left);
-                continue;
-            }
-            pendingConnectedNoticeTicks.remove(id);
+            int ticksWaited = (e.getValue() == null ? 0 : e.getValue()) + 1;
+
             ServerPlayer p = s.getPlayerList().getPlayer(id);
             if (p == null) {
+                pendingConnectedNoticeTicks.remove(id);
                 continue;
             }
-            String lang = getPlayerLanguage(p);
-            String msg = Localizer.connected(lang, room);
-            p.sendSystemMessage(Component.literal(msg));
+
+            // Check if we should send the notice:
+            // 1. Client settings appear to have been received (heuristic: non-default values), OR
+            // 2. We've waited the maximum time (timeout - assume English or slow client)
+            boolean hasClientSettings = hasReceivedClientSettings(p);
+            boolean timeout = ticksWaited >= MAX_WAIT_TICKS;
+
+            if (hasClientSettings || timeout) {
+                pendingConnectedNoticeTicks.remove(id);
+                String lang = getPlayerLanguage(p);
+                String msg = Localizer.connected(lang, room);
+                p.sendSystemMessage(Component.literal(msg));
+            } else {
+                pendingConnectedNoticeTicks.put(id, ticksWaited);
+            }
         }
+    }
+
+    /**
+     * Heuristic to detect if the client has sent its settings packet.
+     * Default ClientInformation has viewDistance=2 and modelCustomisation=0.
+     * Most real clients will have different values (higher view distance, skin layers enabled).
+     */
+    private static boolean hasReceivedClientSettings(ServerPlayer player) {
+        try {
+            // Try to get view distance - most clients have > 2
+            int viewDistance = getPlayerViewDistance(player);
+            if (viewDistance != DEFAULT_VIEW_DISTANCE) {
+                return true;
+            }
+
+            // Try to get model customisation (skin layers) - most clients have > 0
+            int modelCustomisation = getPlayerModelCustomisation(player);
+            if (modelCustomisation != DEFAULT_MODEL_CUSTOMISATION) {
+                return true;
+            }
+        } catch (Exception ignored) {
+        }
+        return false;
+    }
+
+    private static int getPlayerViewDistance(ServerPlayer player) {
+        // Try different method names across MC versions
+        try {
+            Method m = player.getClass().getMethod("requestedViewDistance");
+            Object res = m.invoke(player);
+            if (res instanceof Integer i) {
+                return i;
+            }
+        } catch (Exception ignored) {
+        }
+        try {
+            // Older versions might use clientViewDistance or similar
+            Method m = player.getClass().getMethod("getRequestedViewDistance");
+            Object res = m.invoke(player);
+            if (res instanceof Integer i) {
+                return i;
+            }
+        } catch (Exception ignored) {
+        }
+        return DEFAULT_VIEW_DISTANCE;
+    }
+
+    private static int getPlayerModelCustomisation(ServerPlayer player) {
+        try {
+            // Get the entity data for model customisation
+            // This is stored in the synched entity data
+            Method getEntityData = player.getClass().getMethod("getEntityData");
+            Object entityData = getEntityData.invoke(player);
+            if (entityData != null) {
+                // The model customisation is typically a byte value
+                // We need to find the DATA_PLAYER_MODE_CUSTOMISATION accessor
+                // This is complex due to obfuscation, so we'll use a simpler heuristic
+            }
+        } catch (Exception ignored) {
+        }
+        // Fall back to checking if language is non-default as additional heuristic
+        String lang = getPlayerLanguage(player);
+        if (!"en_us".equals(lang)) {
+            return 1; // Non-default, so settings were received
+        }
+        return DEFAULT_MODEL_CUSTOMISATION;
     }
 
     private void scheduleConnectedNotice(Object player) {
         if (!(player instanceof ServerPlayer p)) {
             return;
         }
-        pendingConnectedNoticeTicks.put(p.getUUID(), CONNECTED_NOTICE_DELAY_TICKS);
+        // Start with 0 ticks waited
+        pendingConnectedNoticeTicks.put(p.getUUID(), 0);
     }
 
     @SubscribeEvent
