@@ -17,7 +17,6 @@ import net.neoforged.neoforge.event.server.ServerStoppingEvent;
 import net.neoforged.neoforge.event.tick.ServerTickEvent;
 import org.slf4j.Logger;
 
-import java.lang.reflect.Method;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -30,7 +29,9 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public final class NeoForgeHooks {
     private static final Logger LOGGER = LogUtils.getLogger();
-    private static final int CONNECTED_NOTICE_DELAY_TICKS = 20;
+    private static final int MAX_WAIT_TICKS = 100; // 5 seconds max wait for client settings
+    // Default ClientInformation values (from ClientInformation.createDefault())
+    private static final int DEFAULT_VIEW_DISTANCE = 2;
 
     private BridgeService bridgeService;
     private McCallbacks callbacks;
@@ -190,31 +191,65 @@ public final class NeoForgeHooks {
 
         for (Map.Entry<UUID, Integer> e : pendingConnectedNoticeTicks.entrySet()) {
             UUID id = e.getKey();
-            int left = (e.getValue() == null ? 0 : e.getValue()) - 1;
-            if (left > 0) {
-                pendingConnectedNoticeTicks.put(id, left);
-                continue;
-            }
-            pendingConnectedNoticeTicks.remove(id);
+            int ticksWaited = (e.getValue() == null ? 0 : e.getValue()) + 1;
+
             ServerPlayer p = s.getPlayerList().getPlayer(id);
             if (p == null) {
+                pendingConnectedNoticeTicks.remove(id);
                 continue;
             }
-            String lang = getPlayerLanguage(p);
-            String msg = Localizer.connected(lang, room);
-            p.sendSystemMessage(Component.literal(msg));
+
+            // Check if we should send the notice:
+            // 1. Client settings appear to have been received (heuristic: non-default values), OR
+            // 2. We've waited the maximum time (timeout - assume English or slow client)
+            boolean hasClientSettings = hasReceivedClientSettings(p);
+            boolean timeout = ticksWaited >= MAX_WAIT_TICKS;
+
+            if (hasClientSettings || timeout) {
+                pendingConnectedNoticeTicks.remove(id);
+                String lang = p.getLanguage();
+                String msg = Localizer.connected(lang, room);
+                p.sendSystemMessage(Component.literal(msg));
+            } else {
+                pendingConnectedNoticeTicks.put(id, ticksWaited);
+            }
         }
+    }
+
+    /**
+     * Heuristic to detect if the client has sent its settings packet.
+     * Default ClientInformation has viewDistance=2 and language="en_us".
+     * Most real clients will have different values (higher view distance or non-English language).
+     */
+    private static boolean hasReceivedClientSettings(ServerPlayer player) {
+        // Check view distance - most clients have > 2
+        int viewDistance = player.requestedViewDistance();
+        if (viewDistance != DEFAULT_VIEW_DISTANCE) {
+            return true;
+        }
+
+        // Check if language is non-default
+        String lang = player.getLanguage();
+        if (!"en_us".equals(lang)) {
+            return true;
+        }
+
+        return false;
     }
 
     private void scheduleConnectedNotice(Object player) {
         if (!(player instanceof ServerPlayer p)) {
             return;
         }
-        pendingConnectedNoticeTicks.put(p.getUUID(), CONNECTED_NOTICE_DELAY_TICKS);
+        // Start with 0 ticks waited
+        pendingConnectedNoticeTicks.put(p.getUUID(), 0);
     }
 
     @SubscribeEvent
     public void onPlayerLoggedOut(PlayerEvent.PlayerLoggedOutEvent event) {
+        // Clean up pending notice if player disconnects before receiving it
+        pendingConnectedNoticeTicks.remove(event.getEntity().getUUID());
+
         BridgeService service = bridgeService;
         if (service == null || !service.isRunning()) {
             return;
@@ -324,34 +359,6 @@ public final class NeoForgeHooks {
 
         event.getDispatcher().register(root);
         LOGGER.debug("Registered /matrix command.");
-    }
-
-    private static String getPlayerLanguage(Object player) {
-        if (player == null) {
-            return "en_us";
-        }
-        // Try a few known shapes across MC versions; fall back to en_us.
-        try {
-            Method m = player.getClass().getMethod("getLanguage");
-            Object res = m.invoke(player);
-            if (res instanceof String s && !s.isBlank()) {
-                return s;
-            }
-        } catch (Exception ignored) {
-        }
-        try {
-            Method m = player.getClass().getMethod("clientInformation");
-            Object info = m.invoke(player);
-            if (info != null) {
-                Method m2 = info.getClass().getMethod("language");
-                Object res = m2.invoke(info);
-                if (res instanceof String s && !s.isBlank()) {
-                    return s;
-                }
-            }
-        } catch (Exception ignored) {
-        }
-        return "en_us";
     }
 
     private static BridgeSettings loadSettings() {
