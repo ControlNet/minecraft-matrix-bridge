@@ -22,6 +22,10 @@ public final class MatrixBridgeConfig {
     public static final ForgeConfigSpec.IntValue MAX_QUEUE_SIZE;
     public static final ForgeConfigSpec.IntValue DEDUP_SIZE;
 
+    public static final ForgeConfigSpec.IntValue MAX_ACTIVE_EVENT_TAPS;
+    public static final ForgeConfigSpec.IntValue DEFAULT_EVENT_THROTTLE_MS;
+    public static final ForgeConfigSpec.IntValue EVENT_COMMAND_MIN_POWER_LEVEL;
+
     static {
         ForgeConfigSpec.Builder builder = new ForgeConfigSpec.Builder();
 
@@ -50,6 +54,14 @@ public final class MatrixBridgeConfig {
         TIMELINE_LIMIT = builder.defineInRange("timelineLimit", 20, 1, 1_000);
         MAX_QUEUE_SIZE = builder.defineInRange("maxQueueSize", 1_000, 1, 100_000);
         DEDUP_SIZE = builder.defineInRange("dedupSize", 512, 1, 100_000);
+
+        MAX_ACTIVE_EVENT_TAPS = builder.comment("Maximum number of active event tap subscriptions.")
+                .defineInRange("maxActiveEventTaps", 10, 1, 100);
+        DEFAULT_EVENT_THROTTLE_MS = builder.comment("Default throttle interval in ms between forwarded events.")
+                .defineInRange("defaultEventThrottleMs", 1000, 100, 60_000);
+        EVENT_COMMAND_MIN_POWER_LEVEL = builder.comment("Minimum Matrix power level required to use event commands from Matrix.",
+                        "Default 50 (moderator). Set to 0 to allow all room members.")
+                .defineInRange("eventCommandMinPowerLevel", 50, 0, 100);
         builder.pop();
 
         SPEC = builder.build();

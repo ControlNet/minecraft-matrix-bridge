@@ -15,7 +15,10 @@ import net.minecraftforge.event.entity.player.PlayerEvent;
 import net.minecraftforge.event.server.ServerStartedEvent;
 import net.minecraftforge.event.server.ServerStoppingEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
+import net.minecraftforge.common.MinecraftForge;
 import org.slf4j.Logger;
+
+import com.mojang.brigadier.arguments.StringArgumentType;
 
 import java.lang.reflect.Method;
 import java.nio.file.Path;
@@ -37,6 +40,7 @@ public final class ForgeHooks {
 
     private BridgeService bridgeService;
     private McCallbacks callbacks;
+    private EventTapManager eventTapManager;
     private volatile MinecraftServer runningServer;
     private volatile String connectedRoomIdOrAlias = "";
     private final ConcurrentHashMap<UUID, Integer> pendingConnectedNoticeTicks = new ConcurrentHashMap<>();
@@ -94,8 +98,40 @@ public final class ForgeHooks {
                             });
                             return fut;
                         }
+
+                        @Override
+                        public CompletableFuture<String> handleEventTapCommand(String senderMxid, String[] args) {
+                            CompletableFuture<String> fut = new CompletableFuture<>();
+                            EventTapManager mgr = eventTapManager;
+                            if (mgr == null) {
+                                fut.complete("Event tap manager is not initialized.");
+                                return fut;
+                            }
+                            MinecraftServer s = server;
+                            if (s == null) {
+                                fut.complete("Server is not available.");
+                                return fut;
+                            }
+                            s.execute(() -> {
+                                try {
+                                    String result = mgr.handleCommand(args);
+                                    fut.complete(result);
+                                } catch (Exception e) {
+                                    fut.complete("Error: " + e.getMessage());
+                                }
+                            });
+                            return fut;
+                        }
 	                };
         bridgeService.start(loadSettings(), worldRoot, callbacks);
+
+        BridgeSettings settings = loadSettings();
+        eventTapManager = new EventTapManager(
+                bridgeService,
+                MinecraftForge.EVENT_BUS,
+                settings.maxActiveEventTaps,
+                settings.defaultEventThrottleMs
+        );
 
         if (MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get() && MatrixBridgeConfig.ENABLE_SERVER_LIFECYCLE_TO_MATRIX.get()) {
             String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "* Server started.";
@@ -107,6 +143,7 @@ public final class ForgeHooks {
     public void onServerStopping(ServerStoppingEvent event) {
         BridgeService service = bridgeService;
         bridgeService = null;
+        eventTapManager = null;
         runningServer = null;
         connectedRoomIdOrAlias = "";
         pendingConnectedNoticeTicks.clear();
@@ -402,7 +439,25 @@ public final class ForgeHooks {
                     }
                     ctx.getSource().sendFailure(Component.literal("Failed to queue test message (queue full or bridge not ready)."));
                     return 0;
-                }));
+                }))
+                .then(Commands.literal("event")
+                    .then(Commands.literal("on")
+                        .then(Commands.argument("eventName", StringArgumentType.string())
+                            .executes(ctx -> eventOn(ctx.getSource(), StringArgumentType.getString(ctx, "eventName"), "", "once"))
+                            .then(Commands.argument("filter", StringArgumentType.string())
+                                .executes(ctx -> eventOn(ctx.getSource(), StringArgumentType.getString(ctx, "eventName"), StringArgumentType.getString(ctx, "filter"), "once"))
+                                .then(Commands.argument("duration", StringArgumentType.string())
+                                    .executes(ctx -> eventOn(ctx.getSource(), StringArgumentType.getString(ctx, "eventName"), StringArgumentType.getString(ctx, "filter"), StringArgumentType.getString(ctx, "duration")))))))
+                    .then(Commands.literal("off")
+                        .then(Commands.argument("eventName", StringArgumentType.string())
+                            .executes(ctx -> eventOff(ctx.getSource(), StringArgumentType.getString(ctx, "eventName")))))
+                    .then(Commands.literal("list")
+                        .executes(ctx -> eventList(ctx.getSource())))
+                    .then(Commands.literal("search")
+                        .then(Commands.argument("query", StringArgumentType.string())
+                            .executes(ctx -> eventSearch(ctx.getSource(), StringArgumentType.getString(ctx, "query")))))
+                    .then(Commands.literal("help")
+                        .executes(ctx -> eventHelp(ctx.getSource()))));
 
         event.getDispatcher().register(root);
         LOGGER.debug("Registered /matrix command.");
@@ -458,7 +513,70 @@ public final class ForgeHooks {
                 MatrixBridgeConfig.SYNC_TIMEOUT_MS.get(),
                 MatrixBridgeConfig.TIMELINE_LIMIT.get(),
                 MatrixBridgeConfig.MAX_QUEUE_SIZE.get(),
-                MatrixBridgeConfig.DEDUP_SIZE.get()
+                MatrixBridgeConfig.DEDUP_SIZE.get(),
+                MatrixBridgeConfig.MAX_ACTIVE_EVENT_TAPS.get(),
+                MatrixBridgeConfig.DEFAULT_EVENT_THROTTLE_MS.get(),
+                MatrixBridgeConfig.EVENT_COMMAND_MIN_POWER_LEVEL.get()
         );
+    }
+
+    private int eventOn(CommandSourceStack source, String eventName, String filter, String duration) {
+        EventTapManager mgr = eventTapManager;
+        if (mgr == null) {
+            source.sendFailure(Component.literal("Event tap manager is not initialized."));
+            return 0;
+        }
+        String[] args = {"on", eventName, filter, duration};
+        String result = mgr.handleCommand(args);
+        ForgeCommandCompat.sendSuccess(source, Component.literal(result), false);
+        return 1;
+    }
+
+    private int eventOff(CommandSourceStack source, String eventName) {
+        EventTapManager mgr = eventTapManager;
+        if (mgr == null) {
+            source.sendFailure(Component.literal("Event tap manager is not initialized."));
+            return 0;
+        }
+        String[] args = {"off", eventName};
+        String result = mgr.handleCommand(args);
+        ForgeCommandCompat.sendSuccess(source, Component.literal(result), false);
+        return 1;
+    }
+
+    private int eventList(CommandSourceStack source) {
+        EventTapManager mgr = eventTapManager;
+        if (mgr == null) {
+            source.sendFailure(Component.literal("Event tap manager is not initialized."));
+            return 0;
+        }
+        String[] args = {"list"};
+        String result = mgr.handleCommand(args);
+        ForgeCommandCompat.sendSuccess(source, Component.literal(result), false);
+        return 1;
+    }
+
+    private int eventSearch(CommandSourceStack source, String query) {
+        EventTapManager mgr = eventTapManager;
+        if (mgr == null) {
+            source.sendFailure(Component.literal("Event tap manager is not initialized."));
+            return 0;
+        }
+        String[] args = {"search", query};
+        String result = mgr.handleCommand(args);
+        ForgeCommandCompat.sendSuccess(source, Component.literal(result), false);
+        return 1;
+    }
+
+    private int eventHelp(CommandSourceStack source) {
+        EventTapManager mgr = eventTapManager;
+        if (mgr == null) {
+            source.sendFailure(Component.literal("Event tap manager is not initialized."));
+            return 0;
+        }
+        String[] args = {"help"};
+        String result = mgr.handleCommand(args);
+        ForgeCommandCompat.sendSuccess(source, Component.literal(result), false);
+        return 1;
     }
 }

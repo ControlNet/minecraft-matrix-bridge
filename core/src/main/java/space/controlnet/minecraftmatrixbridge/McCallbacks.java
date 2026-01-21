@@ -32,4 +32,21 @@ public interface McCallbacks {
     default CompletableFuture<List<String>> getOnlinePlayerNames() {
         return CompletableFuture.completedFuture(List.of());
     }
+
+    /**
+     * Handles an event tap command from Matrix.
+     *
+     * <p>This callback is invoked when a Matrix message starts with the bot prefix followed by "event".
+     * The loader glue implementation should delegate to the EventTapManager.
+     *
+     * <p>Implementations must be safe to call from background threads. If any Minecraft API access is needed,
+     * it should be scheduled onto the main server thread.
+     *
+     * @param senderMxid the Matrix user ID of the sender
+     * @param args       the command arguments (e.g., ["on", "ServerChatEvent", "filter", "30s"])
+     * @return a future that completes with the response text to send back to Matrix
+     */
+    default CompletableFuture<String> handleEventTapCommand(String senderMxid, String[] args) {
+        return CompletableFuture.completedFuture("Event tap commands are not supported in this version.");
+    }
 }

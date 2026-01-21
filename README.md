@@ -77,6 +77,62 @@ Matrix room bot commands (requires `bridge.enableMatrixToMc=true`):
 - `!mc help` (or replace `!mc` with `bridge.matrixBotPrefix`)
 - `!mc list` (replies with online player names; command messages are not forwarded into Minecraft chat)
 
+## Event Taps (Advanced)
+
+Event taps allow server operators to subscribe to Forge/NeoForge events at runtime and forward them to the Matrix room. This is useful for debugging and monitoring.
+
+### Minecraft Commands (OP-only)
+
+- `/matrix event on <eventName> [filter] [duration]` - Enable event tap
+  - `eventName`: Simple class name (e.g., `ServerChatEvent`) or fully-qualified class name
+  - `filter`: Optional substring filter (case-insensitive)
+  - `duration`: `once` (default), `permanent`, or time-based (`30s`, `10m`, `2h`, `1d`)
+- `/matrix event off <eventName>` - Disable event tap
+- `/matrix event list` - List active event taps
+- `/matrix event search <query>` - Search available events
+- `/matrix event help` - Show help
+
+### Matrix Bot Commands
+
+Same commands available via Matrix (requires `bridge.enableMatrixToMc=true`):
+- `!mc event on <eventName> [filter] [duration]`
+- `!mc event off <eventName>`
+- `!mc event list`
+- `!mc event search <query>`
+- `!mc event help`
+
+### Event Tap Configuration
+
+Safety Features
+- Maximum 10 concurrent event taps (configurable)
+- Default 1-second throttle between forwarded events
+- Tick events automatically enforce minimum 1-second throttle
+- Event output truncated to 2048 characters
+- Client-only events are rejected on dedicated servers
+
+Optional settings in `config/minecraftmatrixbridge.toml`:
+- `bridge.maxActiveEventTaps` (default `10`) - Maximum concurrent event subscriptions
+- `bridge.defaultEventThrottleMs` (default `1000`) - Minimum interval between forwarded events (prevents spam)
+- `bridge.eventCommandMinPowerLevel` (default `50`) - Minimum Matrix power level required to use event commands from Matrix (0=default user, 50=moderator, 100=admin)
+
+### Examples
+
+```
+# Monitor all chat events (fire once)
+/matrix event on ServerChatEvent
+
+# Monitor player logins for 10 minutes
+/matrix event on PlayerLoggedInEvent "" 10m
+
+# Monitor block breaks with "diamond" in the event data, permanently
+/matrix event on BlockEvent diamond permanent
+
+# From Matrix
+!mc event on ServerChatEvent
+!mc event list
+!mc event off ServerChatEvent
+```
+
 ## AI use declaration
 
 Codex and cursor are used to develop this project.

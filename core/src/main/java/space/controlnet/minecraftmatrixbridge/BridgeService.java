@@ -577,7 +577,7 @@ public final class BridgeService {
                 continue;
             }
 
-            if (maybeHandleMatrixBotCommand(body)) {
+            if (maybeHandleMatrixBotCommand(sender, body)) {
                 continue;
             }
 
@@ -601,7 +601,7 @@ public final class BridgeService {
         }
     }
 
-    private boolean maybeHandleMatrixBotCommand(String body) {
+    private boolean maybeHandleMatrixBotCommand(String senderMxid, String body) {
         if (body == null) {
             return false;
         }
@@ -611,7 +611,6 @@ public final class BridgeService {
         }
         String trimmed = body.trim();
 
-        // Accept "prefix" or "prefix ..." (case-insensitive).
         if (!trimmed.regionMatches(true, 0, prefix, 0, prefix.length())) {
             return false;
         }
@@ -625,13 +624,12 @@ public final class BridgeService {
             }
         }
 
-        // Command messages should not be forwarded to Minecraft chat.
         String rest = trimmed.substring(prefix.length()).trim();
         String[] parts = rest.isEmpty() ? new String[0] : rest.split("\\s+");
         String sub = (parts.length >= 1) ? parts[0].toLowerCase(Locale.ROOT) : "help";
 
         if ("help".equals(sub)) {
-            sendMatrixBotReply("Commands: " + prefix + " help, " + prefix + " list");
+            sendMatrixBotReply("Commands: " + prefix + " help, " + prefix + " list, " + prefix + " event");
             return true;
         }
 
@@ -640,8 +638,58 @@ public final class BridgeService {
             return true;
         }
 
+        if ("event".equals(sub)) {
+            handleEventCommand(senderMxid, parts);
+            return true;
+        }
+
         sendMatrixBotReply("Unknown command. Try: " + prefix + " help");
         return true;
+    }
+
+    private void handleEventCommand(String senderMxid, String[] parts) {
+        if (!settings.enableMatrixToMc) {
+            sendMatrixBotReply("Event tap commands require Matrix→MC sync to be enabled.");
+            return;
+        }
+
+        int minPowerLevel = settings.eventCommandMinPowerLevel;
+        int userPowerLevel = 0;
+        try {
+            userPowerLevel = matrixClient.getUserPowerLevel(resolvedRoomId, senderMxid);
+        } catch (Exception e) {
+            LOGGER.warning("Failed to get power level for " + senderMxid + ": " + e.getMessage());
+            sendMatrixBotReply("Failed to verify permissions. Please try again.");
+            return;
+        }
+
+        if (userPowerLevel < minPowerLevel) {
+            sendMatrixBotReply("You need power level " + minPowerLevel + " or higher to use event commands (you have " + userPowerLevel + ").");
+            return;
+        }
+
+        String[] eventArgs = parts.length > 1 ? java.util.Arrays.copyOfRange(parts, 1, parts.length) : new String[0];
+
+        McCallbacks cb = callbacks;
+        if (cb == null) {
+            sendMatrixBotReply("Event tap commands are not available.");
+            return;
+        }
+
+        try {
+            CompletableFuture<String> fut = cb.handleEventTapCommand(senderMxid, eventArgs);
+            if (fut == null) {
+                sendMatrixBotReply("Event tap commands are not supported.");
+                return;
+            }
+            String reply = fut.get(5, TimeUnit.SECONDS);
+            sendMatrixBotReply(reply != null ? reply : "No response from event handler.");
+        } catch (java.util.concurrent.TimeoutException e) {
+            sendMatrixBotReply("Event command timed out.");
+        } catch (Exception e) {
+            LOGGER.warning("Event command failed: " + e);
+            sendMatrixBotReply("Event command failed: " + e.getMessage());
+        }
     }
 
     private String buildOnlinePlayersReply(Duration timeout) {
