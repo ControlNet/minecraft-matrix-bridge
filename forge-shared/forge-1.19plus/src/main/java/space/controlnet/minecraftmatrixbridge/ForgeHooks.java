@@ -126,12 +126,14 @@ public final class ForgeHooks {
         bridgeService.start(loadSettings(), worldRoot, callbacks);
 
         BridgeSettings settings = loadSettings();
-        eventTapManager = new EventTapManager(
-                bridgeService,
-                MinecraftForge.EVENT_BUS,
-                settings.maxActiveEventTaps,
-                settings.defaultEventThrottleMs
-        );
+        if (settings.enableEventTaps) {
+            eventTapManager = new EventTapManager(
+                    bridgeService,
+                    MinecraftForge.EVENT_BUS,
+                    settings.maxActiveEventTaps,
+                    settings.defaultEventThrottleMs
+            );
+        }
 
         if (MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get() && MatrixBridgeConfig.ENABLE_SERVER_LIFECYCLE_TO_MATRIX.get()) {
             String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "* Server started.";
@@ -514,6 +516,7 @@ public final class ForgeHooks {
                 MatrixBridgeConfig.TIMELINE_LIMIT.get(),
                 MatrixBridgeConfig.MAX_QUEUE_SIZE.get(),
                 MatrixBridgeConfig.DEDUP_SIZE.get(),
+                MatrixBridgeConfig.ENABLE_EVENT_TAPS.get(),
                 MatrixBridgeConfig.MAX_ACTIVE_EVENT_TAPS.get(),
                 MatrixBridgeConfig.DEFAULT_EVENT_THROTTLE_MS.get(),
                 MatrixBridgeConfig.EVENT_COMMAND_MIN_POWER_LEVEL.get()
@@ -523,7 +526,7 @@ public final class ForgeHooks {
     private int eventOn(CommandSourceStack source, String eventName, String filter, String duration) {
         EventTapManager mgr = eventTapManager;
         if (mgr == null) {
-            source.sendFailure(Component.literal("Event tap manager is not initialized."));
+            source.sendFailure(Component.literal("Event taps are disabled in configuration."));
             return 0;
         }
         String[] args = {"on", eventName, filter, duration};
@@ -535,7 +538,7 @@ public final class ForgeHooks {
     private int eventOff(CommandSourceStack source, String eventName) {
         EventTapManager mgr = eventTapManager;
         if (mgr == null) {
-            source.sendFailure(Component.literal("Event tap manager is not initialized."));
+            source.sendFailure(Component.literal("Event taps are disabled in configuration."));
             return 0;
         }
         String[] args = {"off", eventName};
@@ -547,7 +550,7 @@ public final class ForgeHooks {
     private int eventList(CommandSourceStack source) {
         EventTapManager mgr = eventTapManager;
         if (mgr == null) {
-            source.sendFailure(Component.literal("Event tap manager is not initialized."));
+            source.sendFailure(Component.literal("Event taps are disabled in configuration."));
             return 0;
         }
         String[] args = {"list"};
@@ -559,7 +562,7 @@ public final class ForgeHooks {
     private int eventSearch(CommandSourceStack source, String query) {
         EventTapManager mgr = eventTapManager;
         if (mgr == null) {
-            source.sendFailure(Component.literal("Event tap manager is not initialized."));
+            source.sendFailure(Component.literal("Event taps are disabled in configuration."));
             return 0;
         }
         String[] args = {"search", query};
@@ -571,7 +574,7 @@ public final class ForgeHooks {
     private int eventHelp(CommandSourceStack source) {
         EventTapManager mgr = eventTapManager;
         if (mgr == null) {
-            source.sendFailure(Component.literal("Event tap manager is not initialized."));
+            source.sendFailure(Component.literal("Event taps are disabled in configuration."));
             return 0;
         }
         String[] args = {"help"};

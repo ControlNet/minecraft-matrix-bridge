@@ -653,6 +653,11 @@ public final class BridgeService {
             return;
         }
 
+        if (!settings.enableEventTaps) {
+            sendMatrixBotReply("Event taps are disabled in configuration.");
+            return;
+        }
+
         int minPowerLevel = settings.eventCommandMinPowerLevel;
         int userPowerLevel = 0;
         try {
