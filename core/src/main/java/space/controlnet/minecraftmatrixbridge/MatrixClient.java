@@ -154,7 +154,7 @@ public final class MatrixClient {
             return 0;
         }
 
-        String uri = homeserver + "/_matrix/client/v3/rooms/" + urlEncodePath(rid) + "/state/m.room.power_levels";
+        String uri = homeserver + "/_matrix/client/v3/rooms/" + urlEncodePath(rid) + "/state/m.room.power_levels/";
 
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(uri))

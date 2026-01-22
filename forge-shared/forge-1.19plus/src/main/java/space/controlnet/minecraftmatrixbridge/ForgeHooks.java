@@ -123,9 +123,9 @@ public final class ForgeHooks {
                             return fut;
                         }
 	                };
-        bridgeService.start(loadSettings(), worldRoot, callbacks);
-
         BridgeSettings settings = loadSettings();
+        bridgeService.start(settings, worldRoot, callbacks);
+
         if (settings.enableEventTaps) {
             eventTapManager = new EventTapManager(
                     bridgeService,
@@ -375,6 +375,7 @@ public final class ForgeHooks {
                     if (bridgeService != null) {
                         bridgeService.stop();
                     }
+                    eventTapManager = null; // Clear old event tap manager
                     bridgeService = new BridgeService();
                     callbacks = new McCallbacks() {
                         @Override
@@ -419,8 +420,44 @@ public final class ForgeHooks {
                             });
                             return fut;
                         }
+
+                        @Override
+                        public CompletableFuture<String> handleEventTapCommand(String senderMxid, String[] args) {
+                            CompletableFuture<String> fut = new CompletableFuture<>();
+                            EventTapManager mgr = eventTapManager;
+                            if (mgr == null) {
+                                fut.complete("Event tap manager is not initialized.");
+                                return fut;
+                            }
+                            MinecraftServer s = server;
+                            if (s == null) {
+                                fut.complete("Server is not available.");
+                                return fut;
+                            }
+                            s.execute(() -> {
+                                try {
+                                    String result = mgr.handleCommand(args);
+                                    fut.complete(result);
+                                } catch (Exception e) {
+                                    fut.complete("Error: " + e.getMessage());
+                                }
+                            });
+                            return fut;
+                        }
                     };
                     bridgeService.start(loadSettings(), worldRoot, callbacks);
+
+                    // Recreate event tap manager if enabled
+                    BridgeSettings settings = loadSettings();
+                    if (settings.enableEventTaps) {
+                        eventTapManager = new EventTapManager(
+                                bridgeService,
+                                MinecraftForge.EVENT_BUS,
+                                settings.maxActiveEventTaps,
+                                settings.defaultEventThrottleMs
+                        );
+                    }
+
                     ForgeCommandCompat.sendSuccess(ctx.getSource(), Component.literal("MatrixBridge reload requested."), true);
                     return 1;
                 }))

@@ -28,7 +28,9 @@ class MatrixCounters:
 
 
 class MockMatrix:
-    def __init__(self, token: str, self_user_id: str, room_id: str, room_alias: str) -> None:
+    def __init__(
+        self, token: str, self_user_id: str, room_id: str, room_alias: str
+    ) -> None:
         self._token = token
         self._self_user_id = self_user_id
         self._room_id = room_id
@@ -90,7 +92,9 @@ class MockMatrix:
                         self.send_response(404)
                         self.end_headers()
                         return
-                    self._send_json(200, {"room_id": room_id, "servers": ["example.com"]})
+                    self._send_json(
+                        200, {"room_id": room_id, "servers": ["example.com"]}
+                    )
                     return
 
                 if parsed.path == "/_matrix/client/v3/sync":
@@ -116,7 +120,10 @@ class MockMatrix:
                                                 "type": "m.room.message",
                                                 "event_id": f"$e{outer._sync_next_batch}",
                                                 "sender": "@alice:example.com",
-                                                "content": {"msgtype": "m.text", "body": "hello from mock"},
+                                                "content": {
+                                                    "msgtype": "m.text",
+                                                    "body": "hello from mock",
+                                                },
                                             }
                                         ]
                                     }
@@ -132,7 +139,9 @@ class MockMatrix:
 
             def do_PUT(self) -> None:  # noqa: N802
                 parsed = urlparse(self.path)
-                if "/send/m.room.message/" in parsed.path and parsed.path.startswith("/_matrix/client/v3/rooms/"):
+                if "/send/m.room.message/" in parsed.path and parsed.path.startswith(
+                    "/_matrix/client/v3/rooms/"
+                ):
                     counters.send_calls += 1
                     if not self._auth_ok():
                         self.send_response(401)
@@ -149,7 +158,9 @@ class MockMatrix:
 
         self._server = HTTPServer(("127.0.0.1", 0), Handler)
         port = self._server.server_address[1]
-        self._thread = threading.Thread(target=self._server.serve_forever, name="MockMatrix", daemon=True)
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, name="MockMatrix", daemon=True
+        )
         self._thread.start()
         return f"http://127.0.0.1:{port}"
 
@@ -160,7 +171,9 @@ class MockMatrix:
             self._server = None
 
 
-def write_systemtest_config(run_dir: Path, homeserver: str, room_id_or_alias: str) -> None:
+def write_systemtest_config(
+    run_dir: Path, homeserver: str, room_id_or_alias: str
+) -> None:
     config_dir = run_dir / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
     cfg = config_dir / "minecraftmatrixbridge.toml"
@@ -252,7 +265,9 @@ def run_one(module: str, timeout_s: int) -> None:
     room_alias = "#room:example.com"
     self_user_id = "@bot:example.com"
 
-    mock = MockMatrix(token=token, self_user_id=self_user_id, room_id=room_id, room_alias=room_alias)
+    mock = MockMatrix(
+        token=token, self_user_id=self_user_id, room_id=room_id, room_alias=room_alias
+    )
     homeserver = mock.start()
     try:
         write_systemtest_config(run_dir, homeserver, room_alias)
@@ -292,13 +307,15 @@ def run_one(module: str, timeout_s: int) -> None:
             if line.startswith("Downloading: "):
                 continue
             sys.stdout.write(f"[{module}] {line}")
-            if "Done (" in line or "For help, type \"help\"" in line:
+            if "Done (" in line or 'For help, type "help"' in line:
                 started = True
                 break
 
         if not started:
             proc.terminate()
-            raise RuntimeError(f"{module}: server did not reach 'Done' before timeout; exit={proc.poll()}")
+            raise RuntimeError(
+                f"{module}: server did not reach 'Done' before timeout; exit={proc.poll()}"
+            )
 
         # Trigger MC -> Matrix via the built-in command.
         proc.stdin.write("matrix test\n")
@@ -314,23 +331,37 @@ def run_one(module: str, timeout_s: int) -> None:
             raise RuntimeError(f"{module}: server did not stop after command timeout")
 
         if proc.returncode != 0:
-            raise RuntimeError(f"{module}: run task failed with exit code {proc.returncode}")
+            raise RuntimeError(
+                f"{module}: run task failed with exit code {proc.returncode}"
+            )
 
         counters = mock.counters
         if counters.whoami_calls < 1:
-            raise RuntimeError(f"{module}: expected whoami call(s), got {counters.whoami_calls}")
+            raise RuntimeError(
+                f"{module}: expected whoami call(s), got {counters.whoami_calls}"
+            )
         if counters.resolve_calls < 1:
-            raise RuntimeError(f"{module}: expected resolveRoomAlias call(s), got {counters.resolve_calls}")
+            raise RuntimeError(
+                f"{module}: expected resolveRoomAlias call(s), got {counters.resolve_calls}"
+            )
         if counters.sync_calls < 1:
-            raise RuntimeError(f"{module}: expected sync call(s), got {counters.sync_calls}")
+            raise RuntimeError(
+                f"{module}: expected sync call(s), got {counters.sync_calls}"
+            )
         if counters.send_calls < 1:
-            raise RuntimeError(f"{module}: expected send call(s) from /matrix test, got {counters.send_calls}")
+            raise RuntimeError(
+                f"{module}: expected send call(s) from /matrix test, got {counters.send_calls}"
+            )
 
         state = find_state_file(run_dir)
         if state is None:
-            raise RuntimeError(f"{module}: expected state.json in world save under {run_dir}")
+            raise RuntimeError(
+                f"{module}: expected state.json in world save under {run_dir}"
+            )
 
-        print(f"[{module}] OK: whoami={counters.whoami_calls} resolve={counters.resolve_calls} sync={counters.sync_calls} send={counters.send_calls} state={state}")
+        print(
+            f"[{module}] OK: whoami={counters.whoami_calls} resolve={counters.resolve_calls} sync={counters.sync_calls} send={counters.send_calls} state={state}"
+        )
     finally:
         mock.stop()
 
@@ -340,10 +371,21 @@ def main() -> int:
     parser.add_argument(
         "--modules",
         nargs="*",
-        default=["forge-1.18", "forge-1.19", "forge-1.20", "forge-1.21"],
+        default=[
+            "forge-1.18",
+            "forge-1.19",
+            "forge-1.20",
+            "forge-1.21",
+            "neoforge-1.21",
+        ],
         help="Gradle subprojects to system-test",
     )
-    parser.add_argument("--timeout-s", type=int, default=600, help="Per-module startup timeout in seconds")
+    parser.add_argument(
+        "--timeout-s",
+        type=int,
+        default=600,
+        help="Per-module startup timeout in seconds",
+    )
     args = parser.parse_args()
 
     for module in args.modules:

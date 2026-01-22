@@ -38,15 +38,7 @@ public final class EventIndex {
             "net/neoforged/bus/api/Event"
     );
 
-    /** Package prefixes to scan for events (internal format with /) */
-    private static final List<String> EVENT_PACKAGE_PREFIXES = List.of(
-            "net/minecraftforge/event/",
-            "net/minecraftforge/fml/event/",
-            "net/minecraftforge/client/event/",
-            "net/neoforged/neoforge/event/",
-            "net/neoforged/fml/event/",
-            "net/neoforged/neoforge/client/event/"
-    );
+
 
     private final Map<String, List<String>> bySimpleName;
     private final Map<String, List<String>> byAlias;
@@ -167,7 +159,7 @@ public final class EventIndex {
         int eventCount = 0;
 
         for (String className : classToSuper.keySet()) {
-            if (isInEventPackage(className) && isEventSubtype(className, classToSuper)) {
+            if (isEventSubtype(className, classToSuper)) {
                 String fqcn = className.replace('/', '.');
                 String simpleName = extractSimpleName(fqcn);
                 eventCount++;
@@ -331,15 +323,6 @@ public final class EventIndex {
         }
 
         return new ClassInfo(thisClassName, superClassName);
-    }
-
-    private static boolean isInEventPackage(String className) {
-        for (String prefix : EVENT_PACKAGE_PREFIXES) {
-            if (className.startsWith(prefix)) {
-                return true;
-            }
-        }
-        return false;
     }
 
     private static boolean isEventSubtype(String className, Map<String, String> classToSuper) {

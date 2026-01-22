@@ -9,8 +9,10 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.logging.Logger;
 
@@ -24,7 +26,8 @@ public final class EventTapManager {
 
     private final BridgeService bridgeService;
     private final IEventBus eventBus;
-    private final EventIndex eventIndex;
+    private final AtomicReference<EventIndex> eventIndexRef = new AtomicReference<>(null);
+    private final CompletableFuture<EventIndex> eventIndexFuture;
 
     private final int maxActiveTaps;
     private final long defaultThrottleMs;
@@ -37,7 +40,19 @@ public final class EventTapManager {
         this.eventBus = eventBus;
         this.maxActiveTaps = maxActiveTaps > 0 ? maxActiveTaps : DEFAULT_MAX_TAPS;
         this.defaultThrottleMs = defaultThrottleMs > 0 ? defaultThrottleMs : DEFAULT_THROTTLE_MS;
-        this.eventIndex = EventIndex.scanClasspath(EventTapManager.class.getClassLoader(), "neoforge-1.21");
+        this.eventIndexFuture = CompletableFuture.supplyAsync(() -> {
+            EventIndex index = EventIndex.scanClasspath(EventTapManager.class.getClassLoader(), "neoforge-1.21");
+            eventIndexRef.set(index);
+            return index;
+        });
+    }
+
+    public boolean isIndexReady() {
+        return eventIndexRef.get() != null;
+    }
+
+    private EventIndex getEventIndex() {
+        return eventIndexRef.get();
     }
 
     public String handleCommand(String[] args) {
@@ -61,11 +76,16 @@ public final class EventTapManager {
             return "Usage: event on <eventName> [filter] [duration]";
         }
 
+        EventIndex index = getEventIndex();
+        if (index == null) {
+            return "Event index is still building. Please try again in a few seconds.";
+        }
+
         String eventInput = args[1];
         String filter = args.length > 2 ? args[2] : "";
         String durationStr = args.length > 3 ? args[3] : "once";
 
-        ResolveResult resolved = eventIndex.resolve(eventInput);
+        ResolveResult resolved = index.resolve(eventInput);
         if (resolved instanceof ResolveResult.NotFound) {
             Class<?> directClass = tryLoadClass(eventInput);
             if (directClass == null) {
@@ -143,8 +163,9 @@ public final class EventTapManager {
             return "Usage: event off <eventName>";
         }
 
+        EventIndex index = getEventIndex();
         String eventInput = args[1];
-        ResolveResult resolved = eventIndex.resolve(eventInput);
+        ResolveResult resolved = index != null ? index.resolve(eventInput) : ResolveResult.notFound();
 
         String fqcn;
         if (resolved instanceof ResolveResult.Success success) {
@@ -209,8 +230,14 @@ public final class EventTapManager {
         if (args.length < 2) {
             return "Usage: event search <query>";
         }
+
+        EventIndex index = getEventIndex();
+        if (index == null) {
+            return "Event index is still building. Please try again in a few seconds.";
+        }
+
         String query = args[1];
-        List<String> results = eventIndex.search(query, 10);
+        List<String> results = index.search(query, 10);
         if (results.isEmpty()) {
             return "No events found matching: " + query;
         }

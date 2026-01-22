@@ -302,6 +302,44 @@ public final class BridgeService {
         return null;
     }
 
+    private String joinRoomWithRetry(String roomIdOrAlias) {
+        long backoffMs = 1_000;
+        while (running.get()) {
+            try {
+                return matrixClient.joinRoom(roomIdOrAlias);
+            } catch (MatrixClient.MatrixException e) {
+                if (e.statusCode == 401 || e.statusCode == 403) {
+                    logAuthErrorOnce("Matrix joinRoom failed (HTTP " + e.statusCode + "). Check access token / permissions; bridge will not run.");
+                    running.set(false);
+                    return null;
+                }
+                if (e.statusCode >= 400 && e.statusCode < 500 && e.statusCode != 429) {
+                    LOGGER.severe("Matrix joinRoom failed (HTTP " + e.statusCode + "). Not invited or cannot join room " + roomIdOrAlias);
+                    running.set(false);
+                    return null;
+                }
+                long sleepMs = (e.statusCode == 429 && e.retryAfterMs > 0) ? e.retryAfterMs : jitter(backoffMs);
+                LOGGER.warning("Matrix joinRoom failed (" + e.getMessage() + "); retrying in " + sleepMs + " ms.");
+                sleepMs(sleepMs);
+                backoffMs = nextBackoff(backoffMs);
+            } catch (IOException e) {
+                long sleepMs = jitter(backoffMs);
+                LOGGER.warning("Matrix joinRoom network error (" + e + "); retrying in " + sleepMs + " ms.");
+                sleepMs(sleepMs);
+                backoffMs = nextBackoff(backoffMs);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return null;
+            } catch (Exception e) {
+                long sleepMs = jitter(backoffMs);
+                LOGGER.warning("Matrix joinRoom unexpected error (" + e + "); retrying in " + sleepMs + " ms.");
+                sleepMs(sleepMs);
+                backoffMs = nextBackoff(backoffMs);
+            }
+        }
+        return null;
+    }
+
     private boolean verifyJoinedRoomWithRetry(String roomId) {
         long backoffMs = 1_000;
         boolean attemptedJoin = false;
@@ -317,13 +355,14 @@ public final class BridgeService {
                     attemptedJoin = true;
                     String joinTarget = roomId;
                     LOGGER.info("MatrixBridge: user is not joined to " + roomId + "; attempting to join (accept invite)...");
-                    String joinedRoomId = matrixClient.joinRoom(joinTarget);
-                    if (joinedRoomId != null && !joinedRoomId.isBlank() && !joinedRoomId.equals(roomId)) {
-                        // Be defensive: if server returns a different room_id, follow it.
+                    String joinedRoomId = joinRoomWithRetry(joinTarget);
+                    if (joinedRoomId == null) {
+                        return false;
+                    }
+                    if (!joinedRoomId.isBlank() && !joinedRoomId.equals(roomId)) {
                         resolvedRoomId = joinedRoomId;
                         roomId = joinedRoomId;
                     }
-                    // Loop back and re-check joined_rooms.
                     continue;
                 }
 

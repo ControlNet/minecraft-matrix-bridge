@@ -46,7 +46,7 @@ public final class Localizer {
         if (s.isEmpty()) {
             return DEFAULT_LANGUAGE;
         }
-        return s.toLowerCase(Locale.ROOT);
+        return s.toLowerCase(Locale.ROOT).replace('-', '_');
     }
 
     private static String lookup(String language, String key) {
