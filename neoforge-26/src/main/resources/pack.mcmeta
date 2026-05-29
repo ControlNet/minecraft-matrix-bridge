@@ -1,0 +1,13 @@
+{
+  "pack": {
+    "description": "MC Matrix Bridge resources",
+    "max_format": [
+      101,
+      1
+    ],
+    "min_format": [
+      101,
+      1
+    ]
+  }
+}
