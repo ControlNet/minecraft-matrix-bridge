@@ -25,10 +25,39 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Make Gradle wrapper executable
-        run: chmod +x ./gradlew
+      - name: Make Gradle wrappers executable
+        run: chmod +x ./gradlew ./gradlew-26
 
       - name: Build dist (all jars)
         run: |
           chmod +x ./scripts/build_dist.sh
           ./scripts/build_dist.sh
+
+  test-and-build-26:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make Gradle wrappers executable
+        run: chmod +x ./gradlew ./gradlew-26 ./scripts/build_dist_26.sh
+
+      - name: Build 26.x dist
+        run: ./scripts/build_dist_26.sh
+
+      - name: Upload 26.x dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-26
+          path: dist/*
