@@ -1,0 +1,98 @@
+plugins {
+    id 'eclipse'
+    id 'maven-publish'
+    id 'net.neoforged.moddev' version '2.0.141'
+}
+
+base {
+    archivesName = "${mod_id}-neoforge-26.x"
+}
+
+// Minecraft 26.1.2 requires Java 25.
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(25)
+}
+
+sourceSets {
+    main {
+        resources {
+            srcDir project(':core').file('src/main/resources')
+        }
+    }
+}
+
+ext {
+    minecraft_version = '26.1.2'
+    neo_version = '26.1.2.67-beta'
+    neo_version_range = '[26.1.2,)'
+    loader_version_range = '[3,)'
+    pack_format = 101
+    minecraft_version_range = '[26.1.2,26.2)'
+}
+
+neoForge {
+    version = neo_version
+
+    runs {
+        server {
+            server()
+            gameDirectory = layout.projectDirectory.dir('run-systemtest')
+            programArgument '--nogui'
+            jvmArgument '-Djna.tmpdir=./jna'
+        }
+
+        configureEach {
+            logLevel = org.slf4j.event.Level.INFO
+        }
+    }
+
+    mods {
+        "${mod_id}" {
+            sourceSet(sourceSets.main)
+        }
+    }
+}
+
+dependencies {
+    compileOnly project(':core')
+}
+
+tasks.named('processResources', ProcessResources).configure {
+    var replaceProperties = [
+            minecraft_version      : minecraft_version,
+            minecraft_version_range: minecraft_version_range,
+            neo_version            : neo_version,
+            neo_version_range      : neo_version_range,
+            loader_version_range   : loader_version_range,
+            pack_format            : pack_format,
+            mod_id                 : mod_id,
+            mod_name               : mod_name,
+            mod_license            : mod_license,
+            mod_version            : mod_version,
+            mod_authors            : mod_authors,
+            mod_description        : mod_description
+    ]
+    inputs.properties replaceProperties
+
+    filesMatching(['META-INF/neoforge.mods.toml', 'pack.mcmeta']) {
+        expand replaceProperties
+    }
+}
+
+tasks.named('jar', Jar).configure {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from(project(':core').sourceSets.main.output)
+}
+
+def copyCoreForRun = tasks.register('copyCoreForRun', Copy) {
+    dependsOn project(':core').tasks.named('classes')
+    from project(':core').sourceSets.main.output.classesDirs
+    into layout.buildDirectory.dir('classes/java/main')
+}
+
+tasks.withType(JavaExec).configureEach {
+    if (name == 'runServer') {
+        dependsOn(copyCoreForRun)
+        standardInput = System.in
+    }
+}
