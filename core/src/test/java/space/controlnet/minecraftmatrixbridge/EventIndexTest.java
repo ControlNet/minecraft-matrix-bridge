@@ -21,11 +21,11 @@ public class EventIndexTest {
                 "net.minecraftforge.event.level.BlockEvent",
                 "net.minecraftforge.event.world.BlockEvent"
         ));
-        bySimpleName.put("ServerTickEvent", List.of("net.minecraftforge.event.TickEvent$ServerTickEvent"));
+        bySimpleName.put("Post", List.of("net.minecraftforge.event.TickEvent$ServerTickEvent$Post"));
 
         Map<String, List<String>> byAlias = new HashMap<>();
-        byAlias.put("TickEvent$ServerTickEvent", List.of("net.minecraftforge.event.TickEvent$ServerTickEvent"));
-        byAlias.put("TickEvent.ServerTickEvent", List.of("net.minecraftforge.event.TickEvent$ServerTickEvent"));
+        byAlias.put("TickEvent$ServerTickEvent$Post", List.of("net.minecraftforge.event.TickEvent$ServerTickEvent$Post"));
+        byAlias.put("TickEvent.ServerTickEvent.Post", List.of("net.minecraftforge.event.TickEvent$ServerTickEvent$Post"));
         byAlias.put("PlayerEvent$PlayerLoggedInEvent", List.of("net.minecraftforge.event.entity.player.PlayerEvent$PlayerLoggedInEvent"));
 
         eventIndex = EventIndex.fromMaps(bySimpleName, byAlias, "forge-1.20");
@@ -72,16 +72,16 @@ public class EventIndexTest {
 
     @Test
     void resolveAliasDollarNotation() {
-        ResolveResult result = eventIndex.resolve("TickEvent$ServerTickEvent");
+        ResolveResult result = eventIndex.resolve("TickEvent$ServerTickEvent$Post");
         assertTrue(result.isSuccess());
-        assertEquals("net.minecraftforge.event.TickEvent$ServerTickEvent", result.getFqcn());
+        assertEquals("net.minecraftforge.event.TickEvent$ServerTickEvent$Post", result.getFqcn());
     }
 
     @Test
     void resolveAliasDotNotation() {
-        ResolveResult result = eventIndex.resolve("TickEvent.ServerTickEvent");
+        ResolveResult result = eventIndex.resolve("TickEvent.ServerTickEvent.Post");
         assertTrue(result.isSuccess());
-        assertEquals("net.minecraftforge.event.TickEvent$ServerTickEvent", result.getFqcn());
+        assertEquals("net.minecraftforge.event.TickEvent$ServerTickEvent$Post", result.getFqcn());
     }
 
     @Test

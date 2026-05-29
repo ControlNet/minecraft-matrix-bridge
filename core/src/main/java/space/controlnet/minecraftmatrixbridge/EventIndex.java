@@ -35,6 +35,7 @@ public final class EventIndex {
     /** Known event base types (internal format with /) */
     private static final Set<String> KNOWN_EVENT_BASES = Set.of(
             "net/minecraftforge/eventbus/api/Event",
+            "net/minecraftforge/eventbus/internal/Event",
             "net/neoforged/bus/api/Event"
     );
 
@@ -102,7 +103,7 @@ public final class EventIndex {
         long startMs = System.currentTimeMillis();
         LOGGER.info("Starting runtime event index scan...");
 
-        Map<String, String> classToSuper = new HashMap<>();
+        Map<String, ClassInfo> classInfoMap = new HashMap<>();
         Set<String> scannedJars = new HashSet<>();
         int jarCount = 0;
         int classCount = 0;
@@ -123,7 +124,7 @@ public final class EventIndex {
                             scannedJars.add(jarPath);
                             File jarFile = new File(jarPath);
                             if (jarFile.exists() && jarFile.isFile()) {
-                                int scanned = scanJarFile(jarFile, classToSuper);
+                                int scanned = scanJarFile(jarFile, classInfoMap);
                                 if (scanned > 0) {
                                     jarCount++;
                                     classCount += scanned;
@@ -141,7 +142,7 @@ public final class EventIndex {
                     scannedJars.add(path);
                     File jarFile = new File(path);
                     if (jarFile.exists() && jarFile.isFile()) {
-                        int scanned = scanJarFile(jarFile, classToSuper);
+                        int scanned = scanJarFile(jarFile, classInfoMap);
                         if (scanned > 0) {
                             jarCount++;
                             classCount += scanned;
@@ -158,8 +159,8 @@ public final class EventIndex {
         Map<String, List<String>> byAlias = new HashMap<>();
         int eventCount = 0;
 
-        for (String className : classToSuper.keySet()) {
-            if (isEventSubtype(className, classToSuper)) {
+        for (String className : classInfoMap.keySet()) {
+            if (isEventSubtype(className, classInfoMap)) {
                 String fqcn = className.replace('/', '.');
                 String simpleName = extractSimpleName(fqcn);
                 eventCount++;
@@ -196,7 +197,7 @@ public final class EventIndex {
      *
      * @return the number of classes successfully scanned
      */
-    private static int scanJarFile(File jarFile, Map<String, String> classToSuper) {
+    private static int scanJarFile(File jarFile, Map<String, ClassInfo> classInfoMap) {
         int classCount = 0;
         try (JarFile jf = new JarFile(jarFile)) {
             Enumeration<JarEntry> entries = jf.entries();
@@ -207,7 +208,7 @@ public final class EventIndex {
                     try (InputStream is = jf.getInputStream(entry)) {
                         ClassInfo info = parseClassHeader(is);
                         if (info != null && info.className != null) {
-                            classToSuper.put(info.className, info.superName);
+                            classInfoMap.put(info.className, info);
                             classCount++;
                         }
                     } catch (Exception e) {
@@ -221,10 +222,6 @@ public final class EventIndex {
         return classCount;
     }
 
-    /**
-     * Parses a class file header to extract class name and superclass name.
-     * This is a minimal parser that only reads the constant pool and class indices.
-     */
     private static ClassInfo parseClassHeader(InputStream is) throws IOException {
         DataInputStream dis = new DataInputStream(is);
 
@@ -322,20 +319,47 @@ public final class EventIndex {
             }
         }
 
-        return new ClassInfo(thisClassName, superClassName);
+        int interfaceCount = dis.readUnsignedShort();
+        List<String> interfaceNames = new ArrayList<>(interfaceCount);
+        for (int i = 0; i < interfaceCount; i++) {
+            int interfaceIndex = dis.readUnsignedShort();
+            Object interfaceInfo = constantPool[interfaceIndex];
+            if (interfaceInfo instanceof int[] && ((int[]) interfaceInfo)[0] == 7) {
+                int interfaceNameIndex = ((int[]) interfaceInfo)[1];
+                Object interfaceName = constantPool[interfaceNameIndex];
+                if (interfaceName instanceof String name && !name.isBlank()) {
+                    interfaceNames.add(name);
+                }
+            }
+        }
+
+        return new ClassInfo(thisClassName, superClassName, interfaceNames);
     }
 
-    private static boolean isEventSubtype(String className, Map<String, String> classToSuper) {
-        String current = className;
+    private static boolean isEventSubtype(String className, Map<String, ClassInfo> classInfoMap) {
+        List<String> toVisit = new ArrayList<>();
         Set<String> visited = new HashSet<>();
+        toVisit.add(className);
 
-        while (current != null && !"java/lang/Object".equals(current) && !visited.contains(current)) {
-            visited.add(current);
+        while (!toVisit.isEmpty()) {
+            String current = toVisit.remove(toVisit.size() - 1);
+            if (current == null || "java/lang/Object".equals(current) || !visited.add(current)) {
+                continue;
+            }
             if (KNOWN_EVENT_BASES.contains(current)) {
                 return true;
             }
-            current = classToSuper.get(current);
+
+            ClassInfo info = classInfoMap.get(current);
+            if (info == null) {
+                continue;
+            }
+            if (info.superName != null && !info.superName.isBlank()) {
+                toVisit.add(info.superName);
+            }
+            toVisit.addAll(info.interfaceNames);
         }
+
         return false;
     }
 
@@ -522,10 +546,12 @@ public final class EventIndex {
     private static final class ClassInfo {
         final String className;
         final String superName;
+        final List<String> interfaceNames;
 
-        ClassInfo(String className, String superName) {
+        ClassInfo(String className, String superName, List<String> interfaceNames) {
             this.className = className;
             this.superName = superName;
+            this.interfaceNames = interfaceNames == null ? List.of() : List.copyOf(interfaceNames);
         }
     }
 }
