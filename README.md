@@ -25,16 +25,17 @@ Bridges chat between a Minecraft server and **one Matrix room** (unencrypted onl
 - **Event Taps**: dynamically subscribe to Forge/NeoForge events and forward them to Matrix for debugging/monitoring.
 
 ## Requirements
-- Java 17 (Forge 1.18–1.20) or Java 21 (Forge/NeoForge 1.21+)
+- Java 17 (Forge 1.18–1.20), Java 21 (Forge/NeoForge 1.21.x), or Java 25 (Forge/NeoForge 26.1)
 - Minecraft Forge/NeoForge server matching the versions. I only manually test it in popular minor versions, and hopefully it works in other minor versions.
     - 1.18.2
     - 1.19.2
     - 1.20.1
     - 1.21.1
+    - 26.1
 - Matrix room must be **unencrypted** (no E2EE)
 
 ## Installation
-1. Download the jar or build the jar `./scripts/build_dist.sh` and you can find it in `dist/`.
+1. Download the jar or build it locally with `./scripts/build_dist.sh` (all supported versions) or `./scripts/build_dist_26.sh` (26.x only). The generated jars are written to `dist/`.
 2. Drop the jar into your Forge/NeoForge server's `mods/` folder (pick the jar matching your loader + Minecraft major).
 3. Start the server once to generate config.
 
@@ -42,7 +43,20 @@ Bridges chat between a Minecraft server and **one Matrix room** (unencrypted onl
 To build jars for all supported Minecraft versions and collect them into `dist/`:
 - `./scripts/build_dist.sh`
 
-`dist/` includes Forge jars for 1.18.x–1.21.x and a NeoForge jar for 1.21.x.
+`dist/` includes Forge jars for 1.18.x–1.21.x and 26.x, plus NeoForge jars for 1.21.x and 26.x.
+
+### Build only the 26.x line
+The 26.x projects use the dedicated Gradle 9 wrapper and are conditionally included by `settings.gradle`.
+
+- Build and collect both 26.x jars into `dist/`: `./scripts/build_dist_26.sh`
+- Build Forge 26 only: `./gradlew-26 -Pomx_modern_26=true :forge-26:build`
+- Build NeoForge 26 only: `./gradlew-26 -Pomx_modern_26=true :neoforge-26:build`
+- On Windows, use `gradlew-26.bat` instead of `./gradlew-26`
+
+`./scripts/build_dist_26.sh` produces:
+- `dist/minecraftmatrixbridge-forge-26.x-<version>.jar`
+- `dist/minecraftmatrixbridge-neoforge-26.x-<version>.jar`
+- `dist/SHA256SUMS.txt`
 
 ## Configuration
 Edit `config/minecraftmatrixbridge.toml`:
