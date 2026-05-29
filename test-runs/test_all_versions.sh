@@ -6,7 +6,7 @@ set -e
 
 cd "$(dirname "$0")/.."
 
-VERSIONS=("forge-1.18" "forge-1.19" "forge-1.20" "forge-1.21" "neoforge-1.21")
+VERSIONS=("forge-1.18" "forge-1.19" "forge-1.20" "forge-1.21" "forge-26" "neoforge-1.21" "neoforge-26")
 LOG_DIR="test-runs/logs"
 TIMEOUT=180  # 3 minutes max per server
 
@@ -30,7 +30,15 @@ for VERSION in "${VERSIONS[@]}"; do
     LOG_FILE="$LOG_DIR/${VERSION}.log"
     
     # Accept EULA
-    RUN_DIR="${VERSION}/run"
+    if [[ "$VERSION" == "forge-26" || "$VERSION" == "neoforge-26" ]]; then
+        RUN_DIR="${VERSION}/run-systemtest"
+        GRADLEW="./gradlew-26"
+        GRADLE_ARGS=("-Pomx_modern_26=true")
+    else
+        RUN_DIR="${VERSION}/run"
+        GRADLEW="./gradlew"
+        GRADLE_ARGS=()
+    fi
     mkdir -p "$RUN_DIR"
     echo "eula=true" > "$RUN_DIR/eula.txt"
     
@@ -62,7 +70,7 @@ EOF
     echo "Starting $VERSION server..."
     
     # Run server with timeout, capturing output
-    timeout $TIMEOUT ./gradlew :${VERSION}:runServer --no-daemon 2>&1 | tee "$LOG_FILE" &
+    timeout $TIMEOUT "$GRADLEW" "${GRADLE_ARGS[@]}" :${VERSION}:runServer --no-daemon 2>&1 | tee "$LOG_FILE" &
     SERVER_PID=$!
     
     # Wait for server to fully start or fail

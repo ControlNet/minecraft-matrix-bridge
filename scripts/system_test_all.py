@@ -109,29 +109,33 @@ class MockMatrix:
                     outer._sync_next_batch += 1
                     next_batch = f"s{outer._sync_next_batch}"
 
+                    events = []
+                    if outer._sync_next_batch == 1:
+                        events = [
+                            {
+                                "type": "m.room.message",
+                                "event_id": f"$e{outer._sync_next_batch}",
+                                "sender": "@alice:example.com",
+                                "content": {
+                                    "msgtype": "m.text",
+                                    "body": "hello from mock",
+                                },
+                            }
+                        ]
+
                     resp = {
                         "next_batch": next_batch,
-                        "rooms": {
-                            "join": {
-                                room_id: {
-                                    "timeline": {
-                                        "events": [
-                                            {
-                                                "type": "m.room.message",
-                                                "event_id": f"$e{outer._sync_next_batch}",
-                                                "sender": "@alice:example.com",
-                                                "content": {
-                                                    "msgtype": "m.text",
-                                                    "body": "hello from mock",
-                                                },
-                                            }
-                                        ]
-                                    }
-                                }
-                            }
-                        },
+                        "rooms": {"join": {room_id: {"timeline": {"events": events}}}},
                     }
                     self._send_json(200, resp)
+                    return
+
+                if parsed.path == "/_matrix/client/v3/joined_rooms":
+                    if not self._auth_ok():
+                        self.send_response(401)
+                        self.end_headers()
+                        return
+                    self._send_json(200, {"joined_rooms": [room_id]})
                     return
 
                 self.send_response(404)
@@ -151,6 +155,14 @@ class MockMatrix:
                     body = self.rfile.read(length).decode("utf-8", errors="replace")
                     counters.last_send_body = body
                     self._send_json(200, {"event_id": "$mock"})
+                    return
+
+                if parsed.path.startswith("/_matrix/client/v3/join/"):
+                    if not self._auth_ok():
+                        self.send_response(401)
+                        self.end_headers()
+                        return
+                    self._send_json(200, {"room_id": room_id})
                     return
 
                 self.send_response(404)
@@ -241,6 +253,108 @@ def find_state_file(run_dir: Path) -> Optional[Path]:
     return None
 
 
+def wait_for_bridge_ready(
+    module: str,
+    run_dir: Path,
+    mock: MockMatrix,
+    proc: subprocess.Popen[str],
+    out_queue: "queue.Queue[str]",
+    timeout_s: int,
+) -> Path:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            while True:
+                line = out_queue.get_nowait()
+                if not line.startswith("Downloading: "):
+                    sys.stdout.write(f"[{module}] {line}")
+        except queue.Empty:
+            pass
+
+        state = find_state_file(run_dir)
+        counters = mock.counters
+        if (
+            counters.whoami_calls >= 1
+            and counters.resolve_calls >= 1
+            and counters.sync_calls >= 1
+            and state is not None
+        ):
+            return state
+
+        if proc.poll() is not None:
+            break
+        time.sleep(0.2)
+
+    counters = mock.counters
+    state = find_state_file(run_dir)
+    raise RuntimeError(
+        f"{module}: bridge did not become ready before timeout; "
+        f"whoami={counters.whoami_calls} resolve={counters.resolve_calls} "
+        f"sync={counters.sync_calls} state={state}"
+    )
+
+
+def event_tap_alias_for_module(module: str) -> str:
+    if module == "forge-26":
+        return "TickEvent.ServerTickEvent.Post"
+    if module == "neoforge-26":
+        return "ServerTickEvent.Post"
+    raise ValueError(f"No event tap probe configured for module: {module}")
+
+
+def wait_for_send_count(
+    module: str,
+    mock: MockMatrix,
+    proc: subprocess.Popen[str],
+    out_queue: "queue.Queue[str]",
+    expected_count: int,
+    timeout_s: int,
+) -> None:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            while True:
+                line = out_queue.get_nowait()
+                if not line.startswith("Downloading: "):
+                    sys.stdout.write(f"[{module}] {line}")
+        except queue.Empty:
+            pass
+
+        if mock.counters.send_calls >= expected_count:
+            return
+
+        if proc.poll() is not None:
+            break
+        time.sleep(0.2)
+
+    raise RuntimeError(
+        f"{module}: expected at least {expected_count} Matrix send(s), got {mock.counters.send_calls}"
+    )
+
+
+def wait_for_event_index_ready(
+    module: str,
+    proc: subprocess.Popen[str],
+    out_queue: "queue.Queue[str]",
+    timeout_s: int,
+) -> None:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            line = out_queue.get(timeout=0.5)
+        except queue.Empty:
+            if proc.poll() is not None:
+                break
+            continue
+
+        if not line.startswith("Downloading: "):
+            sys.stdout.write(f"[{module}] {line}")
+        if "Event index built in" in line:
+            return
+
+    raise RuntimeError(f"{module}: event index did not finish building before timeout")
+
+
 def _reader_thread(stream, out_queue: "queue.Queue[str]") -> None:
     for line in iter(stream.readline, ""):
         out_queue.put(line)
@@ -249,7 +363,14 @@ def _reader_thread(stream, out_queue: "queue.Queue[str]") -> None:
 
 def run_one(module: str, timeout_s: int) -> None:
     root = Path(__file__).resolve().parents[1]
-    gradlew = root / ("gradlew.bat" if os.name == "nt" else "gradlew")
+    # ForgeGradle 6.x (legacy lines) and the 26.x line require different Gradle
+    # launchers, so pick the wrapper that matches the module under test.
+    modern_26 = module in {"forge-26", "neoforge-26"}
+    if os.name == "nt":
+        gradlew_name = "gradlew-26.bat" if modern_26 else "gradlew.bat"
+    else:
+        gradlew_name = "gradlew-26" if modern_26 else "gradlew"
+    gradlew = root / gradlew_name
 
     run_dir = root / module / "run-systemtest"
 
@@ -277,6 +398,8 @@ def run_one(module: str, timeout_s: int) -> None:
         env["GRADLE_USER_HOME"] = str(root / ".gradle-user-home")
 
         cmd = [str(gradlew), f":{module}:runServer", "--console=plain"]
+        if modern_26:
+            cmd.insert(1, "-Pomx_modern_26=true")
         proc = subprocess.Popen(
             cmd,
             cwd=str(root),
@@ -317,10 +440,28 @@ def run_one(module: str, timeout_s: int) -> None:
                 f"{module}: server did not reach 'Done' before timeout; exit={proc.poll()}"
             )
 
+        state = wait_for_bridge_ready(module, run_dir, mock, proc, q, timeout_s=30)
+
+        if module in {"forge-26", "neoforge-26"}:
+            wait_for_event_index_ready(module, proc, q, timeout_s=30)
+            event_alias = event_tap_alias_for_module(module)
+            proc.stdin.write(f"matrix event on {event_alias}\n")
+            proc.stdin.flush()
+            wait_for_send_count(module, mock, proc, q, expected_count=1, timeout_s=15)
+            proc.stdin.write(f"matrix event off {event_alias}\n")
+            proc.stdin.flush()
+
         # Trigger MC -> Matrix via the built-in command.
         proc.stdin.write("matrix test\n")
         proc.stdin.flush()
-        time.sleep(1.0)
+        wait_for_send_count(
+            module,
+            mock,
+            proc,
+            q,
+            expected_count=2 if module in {"forge-26", "neoforge-26"} else 1,
+            timeout_s=15,
+        )
         proc.stdin.write("stop\n")
         proc.stdin.flush()
 
@@ -353,12 +494,6 @@ def run_one(module: str, timeout_s: int) -> None:
                 f"{module}: expected send call(s) from /matrix test, got {counters.send_calls}"
             )
 
-        state = find_state_file(run_dir)
-        if state is None:
-            raise RuntimeError(
-                f"{module}: expected state.json in world save under {run_dir}"
-            )
-
         print(
             f"[{module}] OK: whoami={counters.whoami_calls} resolve={counters.resolve_calls} sync={counters.sync_calls} send={counters.send_calls} state={state}"
         )
@@ -376,7 +511,9 @@ def main() -> int:
             "forge-1.19",
             "forge-1.20",
             "forge-1.21",
+            "forge-26",
             "neoforge-1.21",
+            "neoforge-26",
         ],
         help="Gradle subprojects to system-test",
     )
