@@ -16,7 +16,7 @@ public final class EventTapManager extends AbstractEventTapManager<Event> {
 
     @Override
     protected String getLoaderName() {
-        return "neoforge-1.21";
+        return "neoforge";
     }
 
     @Override
