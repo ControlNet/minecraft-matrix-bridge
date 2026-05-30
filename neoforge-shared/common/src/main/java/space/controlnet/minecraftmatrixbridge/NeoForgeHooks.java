@@ -308,7 +308,7 @@ public final class NeoForgeHooks {
     @SubscribeEvent
     public void onRegisterCommands(RegisterCommandsEvent event) {
         LiteralArgumentBuilder<CommandSourceStack> root = Commands.literal("matrix")
-                .requires(Commands.hasPermission(Commands.LEVEL_GAMEMASTERS))
+                .requires(NeoForgeCommandCompat.requiresGameMaster())
                 .then(Commands.literal("status").executes(ctx -> {
                     if (bridgeService == null) {
                         ctx.getSource().sendSuccess(() -> Component.literal("MatrixBridge: not initialized."), false);
