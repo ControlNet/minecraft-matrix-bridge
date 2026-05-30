@@ -259,7 +259,7 @@ jobs:
           token: ${{ env.MODRINTH_TOKEN }}
           project: ${{ env.MODRINTH_PROJECT_ID }}
           version: ${{ needs.build-and-release.outputs.version }}
-          changelog: "Automated release ${{ needs.build-and-release.outputs.tag }} (Forge ${{ matrix.mc }})."
+          changelog: "Automated release ${{ needs.build-and-release.outputs.tag }} (${{ matrix.loader }} ${{ matrix.mc }})."
           loaders: |-
             ${{ matrix.loader }}
           game-versions: ${{ matrix.game_versions }}

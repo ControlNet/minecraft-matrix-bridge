@@ -36,6 +36,26 @@ hs_err_pid*
 Thumbs.db
 .cursor/
 .env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+credentials.json
+token.json
+*.secret
+secrets.yml
+secrets.yaml
+id_rsa
+id_ed25519
+kubeconfig
+.htpasswd
+.netrc
+.pgpass
+.boto
+.s3cfg
 
 dist/
 
