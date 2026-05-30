@@ -56,6 +56,9 @@ jobs:
       - name: Build 26.x dist
         run: ./scripts/build_dist_26.sh
 
+      - name: System test 26.x servers
+        run: python3 scripts/system_test_all.py --modules forge-26 neoforge-26 --timeout-s 600
+
       - name: Upload 26.x dist
         uses: actions/upload-artifact@v4
         with:
