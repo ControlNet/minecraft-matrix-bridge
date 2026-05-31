@@ -46,6 +46,12 @@ public final class MockMatrixServer implements AutoCloseable {
     private volatile long whoamiRetryAfterMs = 0;
     private volatile int send429Remaining = 0;
     private volatile long sendRetryAfterMs = 0;
+    private volatile int joinedRooms429Remaining = 0;
+    private volatile long joinedRoomsRetryAfterMs = 0;
+    private volatile int join429Remaining = 0;
+    private volatile long joinRetryAfterMs = 0;
+    private volatile int sync429Remaining = 0;
+    private volatile long syncRetryAfterMs = 0;
 
     private volatile String roomAlias = "";
     private volatile String roomIdForAlias = "";
@@ -103,6 +109,21 @@ public final class MockMatrixServer implements AutoCloseable {
     public void setSendRateLimit(int times, long retryAfterMs) {
         send429Remaining = Math.max(0, times);
         sendRetryAfterMs = Math.max(0, retryAfterMs);
+    }
+
+    public void setJoinedRoomsRateLimit(int times, long retryAfterMs) {
+        joinedRooms429Remaining = Math.max(0, times);
+        joinedRoomsRetryAfterMs = Math.max(0, retryAfterMs);
+    }
+
+    public void setJoinRateLimit(int times, long retryAfterMs) {
+        join429Remaining = Math.max(0, times);
+        joinRetryAfterMs = Math.max(0, retryAfterMs);
+    }
+
+    public void setSyncRateLimit(int times, long retryAfterMs) {
+        sync429Remaining = Math.max(0, times);
+        syncRetryAfterMs = Math.max(0, retryAfterMs);
     }
 
     public int whoamiCallCount() {
@@ -236,6 +257,19 @@ public final class MockMatrixServer implements AutoCloseable {
                 ""
         ));
 
+        if (joinedRooms429Remaining > 0) {
+            joinedRooms429Remaining--;
+            JsonObject body = new JsonObject();
+            body.addProperty("errcode", "M_LIMIT_EXCEEDED");
+            body.addProperty("error", "rate limited");
+            body.addProperty("retry_after_ms", joinedRoomsRetryAfterMs);
+            if (joinedRoomsRetryAfterMs > 0) {
+                exchange.getResponseHeaders().set("Retry-After", Long.toString(joinedRoomsRetryAfterMs / 1000));
+            }
+            respondJson(exchange, 429, body);
+            return;
+        }
+
         JsonObject body = new JsonObject();
         JsonArray arr = new JsonArray();
         for (String r : joinedRooms) {
@@ -265,6 +299,19 @@ public final class MockMatrixServer implements AutoCloseable {
                 ""
         ));
 
+        if (join429Remaining > 0) {
+            join429Remaining--;
+            JsonObject body = new JsonObject();
+            body.addProperty("errcode", "M_LIMIT_EXCEEDED");
+            body.addProperty("error", "rate limited");
+            body.addProperty("retry_after_ms", joinRetryAfterMs);
+            if (joinRetryAfterMs > 0) {
+                exchange.getResponseHeaders().set("Retry-After", Long.toString(joinRetryAfterMs / 1000));
+            }
+            respondJson(exchange, 429, body);
+            return;
+        }
+
         String prefix = "/_matrix/client/v3/join/";
         if (path == null || !path.startsWith(prefix)) {
             respondPlain(exchange, 404, "");
@@ -274,7 +321,6 @@ public final class MockMatrixServer implements AutoCloseable {
         String rawRoom = path.substring(prefix.length());
         String room = URLDecoder.decode(rawRoom, StandardCharsets.UTF_8);
 
-        // Accept invite if present, otherwise reject.
         if (invitedRooms.contains(room)) {
             invitedRooms.remove(room);
             joinedRooms.add(room);
@@ -342,6 +388,19 @@ public final class MockMatrixServer implements AutoCloseable {
         }
         if (!checkAuth(exchange.getRequestHeaders())) {
             respondPlain(exchange, 401, "");
+            return;
+        }
+
+        if (sync429Remaining > 0) {
+            sync429Remaining--;
+            JsonObject body = new JsonObject();
+            body.addProperty("errcode", "M_LIMIT_EXCEEDED");
+            body.addProperty("error", "rate limited");
+            body.addProperty("retry_after_ms", syncRetryAfterMs);
+            if (syncRetryAfterMs > 0) {
+                exchange.getResponseHeaders().set("Retry-After", Long.toString(syncRetryAfterMs / 1000));
+            }
+            respondJson(exchange, 429, body);
             return;
         }
 

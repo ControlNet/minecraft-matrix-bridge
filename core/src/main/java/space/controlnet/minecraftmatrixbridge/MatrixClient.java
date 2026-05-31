@@ -142,6 +142,60 @@ public final class MatrixClient {
     }
 
     /**
+     * Gets the power level of a user in a room.
+     * Matrix API: GET /_matrix/client/v3/rooms/{roomId}/state/m.room.power_levels
+     *
+     * @return the user's power level (default 0 if not found)
+     */
+    public int getUserPowerLevel(String roomId, String userId) throws IOException, InterruptedException, MatrixException {
+        String rid = roomId == null ? "" : roomId.trim();
+        String uid = userId == null ? "" : userId.trim();
+        if (rid.isBlank() || uid.isBlank()) {
+            return 0;
+        }
+
+        String uri = homeserver + "/_matrix/client/v3/rooms/" + urlEncodePath(rid) + "/state/m.room.power_levels/";
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(uri))
+                .header("Authorization", "Bearer " + accessToken)
+                .GET()
+                .build();
+
+        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        int status = response.statusCode();
+        if (status == 404) {
+            return 0;
+        }
+        if (status / 100 != 2) {
+            throw toException("power_levels", response);
+        }
+
+        try {
+            JsonObject obj = JsonParser.parseString(response.body()).getAsJsonObject();
+            
+            // Check user-specific power level first
+            JsonObject users = getObject(obj, "users");
+            if (users != null) {
+                JsonElement userLevel = users.get(uid);
+                if (userLevel != null && userLevel.isJsonPrimitive()) {
+                    return userLevel.getAsInt();
+                }
+            }
+            
+            // Fall back to users_default
+            JsonElement usersDefault = obj.get("users_default");
+            if (usersDefault != null && usersDefault.isJsonPrimitive()) {
+                return usersDefault.getAsInt();
+            }
+            
+            return 0;
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    /**
      * Best-effort displayname lookup for a Matrix user in a room.
      * <p>
      * Uses room member state to get the per-room displayname:

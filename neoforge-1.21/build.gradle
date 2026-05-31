@@ -15,6 +15,9 @@ java {
 
 sourceSets {
     main {
+        java {
+            srcDir rootProject.file('neoforge-shared/common/src/main/java')
+        }
         resources {
             // Include core resources (e.g., assets/* lang files) for dev runs and packaging.
             srcDir project(':core').file('src/main/resources')

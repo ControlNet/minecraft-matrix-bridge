@@ -8,15 +8,28 @@ pluginManagement {
 
 plugins {
     // Allows Gradle to auto-provision required Java toolchains (e.g., Java 21 for MC 1.21+).
-    id 'org.gradle.toolchains.foojay-resolver-convention' version '0.8.0'
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '1.0.0'
 }
 
 rootProject.name = 'minecraft-matrix-bridge'
 
 include 'core'
-include 'forge-1.18'
-include 'forge-1.19'
-include 'forge-1.20'
-include 'forge-1.21'
-include 'neoforge-1.21'
-include 'forge-26'
+
+def include26Line = providers.gradleProperty('omx_modern_26')
+        .map { it.toBoolean() }
+        .orElse(false)
+        .get()
+
+// ForgeGradle 6.x (legacy lines) and ForgeGradle 7 / NeoForge 26.1 require incompatible
+// Gradle majors, so the build includes one family at a time and the scripts select the
+// appropriate launcher (`gradlew` for legacy lines, `gradlew-26` for 26.1 lines).
+if (include26Line) {
+    include 'forge-26'
+    include 'neoforge-26'
+} else {
+    include 'forge-1.18'
+    include 'forge-1.19'
+    include 'forge-1.20'
+    include 'forge-1.21'
+    include 'neoforge-1.21'
+}

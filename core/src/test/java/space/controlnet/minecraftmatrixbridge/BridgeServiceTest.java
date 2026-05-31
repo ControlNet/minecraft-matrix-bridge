@@ -157,8 +157,7 @@ public class BridgeServiceTest {
                 waitUntil(service::isReady, Duration.ofSeconds(2));
                 assertTrue(service.enqueueMcMessage("[MC] <Steve> hello"));
 
-                waitUntil(() -> server.sendCallCount() >= 2, Duration.ofSeconds(2));
-                assertTrue(server.getSendRequests().size() >= 2);
+                waitUntil(() -> server.getSendRequests().size() >= 2, Duration.ofSeconds(2));
             } finally {
                 service.stop();
             }
@@ -213,7 +212,7 @@ public class BridgeServiceTest {
             try {
                 service.start(settings, worldRoot, callbacks);
 
-                waitUntil(() -> server.sendCallCount() >= 1, Duration.ofSeconds(2));
+                waitUntil(() -> !server.getSendRequests().isEmpty(), Duration.ofSeconds(2));
                 assertTrue(received.stream().noneMatch(s -> s.contains("!mc")), "should not forward bot command to Minecraft chat");
 
                 String bodyJson = server.getSendRequests().get(0).body();
@@ -280,7 +279,7 @@ public class BridgeServiceTest {
                 assertTrue(received.contains(expectedForwarded));
 
                 assertTrue(service.enqueueMcMessage("[MC] <Steve> hello"));
-                waitUntil(() -> server.sendCallCount() >= 1, Duration.ofSeconds(2));
+                waitUntil(() -> !server.getSendRequests().isEmpty(), Duration.ofSeconds(2));
 
                 String encodedRoomId = urlEncode(roomId);
                 assertTrue(server.getSendRequests().get(0).path().contains("/_matrix/client/v3/rooms/" + encodedRoomId + "/send/m.room.message/"));
@@ -354,6 +353,126 @@ public class BridgeServiceTest {
             Thread.sleep(10);
         }
         assertTrue(condition.getAsBoolean(), "condition not met before timeout " + timeout);
+    }
+
+    @Test
+    void retriesJoinedRoomsOnRateLimit() throws Exception {
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of("!room:example.com"));
+            server.setJoinedRoomsRateLimit(1, 1);
+
+            BridgeSettings settings = new BridgeSettings(
+                    server.homeserverUrl(),
+                    "!room:example.com",
+                    "token",
+                    true,
+                    false,
+                    false,
+                    "[MC] ",
+                    "[Matrix] ",
+                    "!mc",
+                    0,
+                    20,
+                    10,
+                    64
+            );
+
+            BridgeService service = new BridgeService();
+            try {
+                service.start(settings, worldRoot, text -> {});
+
+                waitUntil(service::isReady, Duration.ofSeconds(3));
+                assertTrue(server.joinedRoomsCallCount() >= 2, "expected multiple joined_rooms calls after 429 retry");
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void retriesJoinOnRateLimit() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of());
+            server.setInvitedRooms(List.of(roomId));
+            server.setJoinRateLimit(1, 1);
+            server.enqueueSyncResponse(roomId, "s0", new JsonArray());
+
+            BridgeSettings settings = new BridgeSettings(
+                    server.homeserverUrl(),
+                    roomId,
+                    "token",
+                    false,
+                    true,
+                    false,
+                    "[MC] ",
+                    "[Matrix] ",
+                    "!mc",
+                    0,
+                    20,
+                    10,
+                    64
+            );
+
+            BridgeService service = new BridgeService();
+            try {
+                service.start(settings, worldRoot, text -> {});
+
+                waitUntil(service::isReady, Duration.ofSeconds(3));
+                assertTrue(server.joinCallCount() >= 2, "expected multiple join calls after 429 retry");
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void queueSaturationDropsMessagesWithoutBlocking() throws Exception {
+        String roomId = "!room:example.com";
+        int maxQueueSize = 5;
+
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+
+            BridgeSettings settings = new BridgeSettings(
+                    server.homeserverUrl(),
+                    roomId,
+                    "token",
+                    true,
+                    false,
+                    false,
+                    "[MC] ",
+                    "[Matrix] ",
+                    "!mc",
+                    0,
+                    20,
+                    maxQueueSize,
+                    64
+            );
+
+            BridgeService service = new BridgeService();
+            try {
+                service.start(settings, worldRoot, text -> {});
+
+                waitUntil(service::isReady, Duration.ofSeconds(2));
+
+                int successCount = 0;
+                int failCount = 0;
+                for (int i = 0; i < maxQueueSize + 10; i++) {
+                    if (service.enqueueMcMessage("[MC] <Test> message" + i)) {
+                        successCount++;
+                    } else {
+                        failCount++;
+                    }
+                }
+
+                assertTrue(successCount >= maxQueueSize, "expected at least maxQueueSize successful enqueues");
+                assertTrue(failCount > 0, "expected some messages to be dropped after queue is full");
+                assertEquals(maxQueueSize, service.getQueueSize());
+            } finally {
+                service.stop();
+            }
+        }
     }
 
     private static String urlEncode(String value) {

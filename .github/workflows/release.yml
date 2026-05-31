@@ -9,6 +9,86 @@ permissions:
   contents: write
 
 jobs:
+  build-26-dist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      should_release: ${{ steps.version.outputs.should_release }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      channel: ${{ steps.version.outputs.channel }}
+      mod_id: ${{ steps.version.outputs.mod_id }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version + whether to release
+        id: version
+        shell: bash
+        run: |
+          MOD_ID="$(grep -E '^mod_id=' gradle.properties | head -n1 | cut -d= -f2- | tr -d '\r' | xargs)"
+          if [[ -z "$MOD_ID" ]]; then
+            echo "ERROR: mod_id not found in gradle.properties" >&2
+            exit 1
+          fi
+
+          VERSION="$(grep -E '^mod_version=' gradle.properties | head -n1 | cut -d= -f2- | tr -d '\r' | xargs)"
+          if [[ -z "$VERSION" ]]; then
+            echo "ERROR: mod_version not found in gradle.properties" >&2
+            exit 1
+          fi
+
+          CHANNEL="release"
+          if echo "$VERSION" | grep -qi 'alpha'; then
+            CHANNEL="alpha"
+          elif echo "$VERSION" | grep -Eqi 'beta|rc|pre'; then
+            CHANNEL="beta"
+          fi
+
+          git fetch --tags --force
+          LATEST_TAG="$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -n1 || true)"
+          LATEST_VER="${LATEST_TAG#v}"
+
+          SHOULD_RELEASE="false"
+          if [[ -z "$LATEST_TAG" ]]; then
+            SHOULD_RELEASE="true"
+          else
+            TOP="$(printf '%s\n' "$LATEST_VER" "$VERSION" | sort -V | tail -n1)"
+            if [[ "$TOP" == "$VERSION" && "$VERSION" != "$LATEST_VER" ]]; then
+              SHOULD_RELEASE="true"
+            fi
+          fi
+
+          echo "mod_id=$MOD_ID" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "should_release=$SHOULD_RELEASE" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make Gradle wrappers executable
+        run: chmod +x ./gradlew ./gradlew-26 ./scripts/build_dist_26.sh
+
+      - name: Build 26.x dist
+        run: ./scripts/build_dist_26.sh
+
+      - name: Upload 26.x dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-26
+          path: dist/*
+
   build-and-release:
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -37,7 +117,7 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Make Gradle wrapper executable
-        run: chmod +x ./gradlew
+        run: chmod +x ./gradlew ./gradlew-26
 
       - name: Determine version + whether to release
         id: version
@@ -117,36 +197,6 @@ jobs:
           chmod +x ./scripts/build_dist.sh
           ./scripts/build_dist.sh
 
-      - name: Create tag
-        if: ${{ steps.version.outputs.should_release == 'true' }}
-        shell: bash
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          if git rev-parse "${TAG}" >/dev/null 2>&1; then
-            echo "Tag ${TAG} already exists locally; continuing."
-          else
-            git tag -a "${TAG}" -m "Release ${TAG}"
-          fi
-
-          git push origin "${TAG}"
-
-      - name: Publish GitHub Release (attach jars)
-        if: ${{ steps.version.outputs.should_release == 'true' }}
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: ${{ steps.version.outputs.tag }}
-          generate_release_notes: true
-          files: |
-            dist/${{ env.MOD_ID }}-forge-1.18.x-${{ env.VERSION }}.jar
-            dist/${{ env.MOD_ID }}-forge-1.19.x-${{ env.VERSION }}.jar
-            dist/${{ env.MOD_ID }}-forge-1.20.x-${{ env.VERSION }}.jar
-            dist/${{ env.MOD_ID }}-forge-1.21.x-${{ env.VERSION }}.jar
-            dist/${{ env.MOD_ID }}-neoforge-1.21.x-${{ env.VERSION }}.jar
-            dist/SHA256SUMS.txt
-
       - name: Upload dist for publisher jobs
         if: ${{ steps.version.outputs.should_release == 'true' }}
         uses: actions/upload-artifact@v4
@@ -209,7 +259,7 @@ jobs:
           token: ${{ env.MODRINTH_TOKEN }}
           project: ${{ env.MODRINTH_PROJECT_ID }}
           version: ${{ needs.build-and-release.outputs.version }}
-          changelog: "Automated release ${{ needs.build-and-release.outputs.tag }} (Forge ${{ matrix.mc }})."
+          changelog: "Automated release ${{ needs.build-and-release.outputs.tag }} (${{ matrix.loader }} ${{ matrix.mc }})."
           loaders: |-
             ${{ matrix.loader }}
           game-versions: ${{ matrix.game_versions }}
@@ -256,4 +306,165 @@ jobs:
           game_versions: ${{ matrix.game_versions }}
           release_type: ${{ needs.build-and-release.outputs.channel }}
           changelog: "Automated release ${{ needs.build-and-release.outputs.tag }}."
+          changelog_type: markdown
+
+  publish-github-release-26:
+    name: Publish GitHub Release (26.x)
+    needs: build-26-dist
+    runs-on: ubuntu-latest
+    if: ${{ needs.build-26-dist.outputs.should_release == 'true' }}
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download 26.x dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-26
+          path: dist
+
+      - name: Create tag
+        shell: bash
+        env:
+          TAG: ${{ needs.build-26-dist.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git rev-parse "${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists locally; continuing."
+          else
+            git tag -a "${TAG}" -m "Release ${TAG}"
+          fi
+
+          git push origin "${TAG}"
+
+      - name: Rename 26 checksum asset
+        shell: bash
+        run: mv dist/SHA256SUMS.txt dist/SHA256SUMS-26.txt
+
+      - name: Publish GitHub Release (attach 26.x jars)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build-26-dist.outputs.tag }}
+          name: ${{ needs.build-26-dist.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            dist/${{ needs.build-26-dist.outputs.mod_id }}-forge-26.x-${{ needs.build-26-dist.outputs.version }}.jar
+            dist/${{ needs.build-26-dist.outputs.mod_id }}-neoforge-26.x-${{ needs.build-26-dist.outputs.version }}.jar
+            dist/SHA256SUMS-26.txt
+
+  publish-github-release-legacy:
+    name: Publish GitHub Release (legacy jars)
+    needs:
+      - build-and-release
+      - publish-github-release-26
+    runs-on: ubuntu-latest
+    if: ${{ needs.build-and-release.outputs.should_release == 'true' }}
+    timeout-minutes: 20
+
+    steps:
+      - name: Download legacy dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Publish GitHub Release (attach legacy jars)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build-and-release.outputs.tag }}
+          name: ${{ needs.build-and-release.outputs.tag }}
+          files: |
+            dist/${{ needs.build-and-release.outputs.mod_id }}-forge-1.18.x-${{ needs.build-and-release.outputs.version }}.jar
+            dist/${{ needs.build-and-release.outputs.mod_id }}-forge-1.19.x-${{ needs.build-and-release.outputs.version }}.jar
+            dist/${{ needs.build-and-release.outputs.mod_id }}-forge-1.20.x-${{ needs.build-and-release.outputs.version }}.jar
+            dist/${{ needs.build-and-release.outputs.mod_id }}-forge-1.21.x-${{ needs.build-and-release.outputs.version }}.jar
+            dist/${{ needs.build-and-release.outputs.mod_id }}-neoforge-1.21.x-${{ needs.build-and-release.outputs.version }}.jar
+            dist/SHA256SUMS.txt
+
+  publish-modrinth-26:
+    name: Publish 26.x to Modrinth
+    needs: build-26-dist
+    runs-on: ubuntu-latest
+    if: ${{ needs.build-26-dist.outputs.should_release == 'true' }}
+    timeout-minutes: 20
+    env:
+      MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+      MODRINTH_PROJECT_ID: ${{ secrets.MODRINTH_PROJECT_ID }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mc: "26.1"
+            jar_suffix: "forge-26.x"
+            game_versions: |-
+              26.1
+            loader: "forge"
+          - mc: "26.1"
+            jar_suffix: "neoforge-26.x"
+            game_versions: |-
+              26.1
+            loader: "neoforge"
+
+    steps:
+      - name: Download 26.x dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-26
+          path: dist
+
+      - name: Publish
+        if: ${{ env.MODRINTH_TOKEN != '' && env.MODRINTH_PROJECT_ID != '' }}
+        uses: cloudnode-pro/modrinth-publish@v2
+        with:
+          token: ${{ env.MODRINTH_TOKEN }}
+          project: ${{ env.MODRINTH_PROJECT_ID }}
+          version: ${{ needs.build-26-dist.outputs.version }}
+          changelog: "Automated release ${{ needs.build-26-dist.outputs.tag }} (${{ matrix.loader }} ${{ matrix.mc }})."
+          loaders: |-
+            ${{ matrix.loader }}
+          game-versions: ${{ matrix.game_versions }}
+          files: dist/${{ needs.build-26-dist.outputs.mod_id }}-${{ matrix.jar_suffix }}-${{ needs.build-26-dist.outputs.version }}.jar
+
+  publish-curseforge-26:
+    name: Publish 26.x to CurseForge
+    needs: build-26-dist
+    runs-on: ubuntu-latest
+    if: ${{ needs.build-26-dist.outputs.should_release == 'true' }}
+    timeout-minutes: 30
+    env:
+      CURSEFORGE_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
+      CURSEFORGE_PROJECT_ID: ${{ secrets.CURSEFORGE_PROJECT_ID }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - jar_suffix: "forge-26.x"
+            game_versions: ${{ vars.CURSEFORGE_GAME_VERSIONS_261 || 'Minecraft 26.1:26.1,Java 25,Forge' }}
+          - jar_suffix: "neoforge-26.x"
+            game_versions: ${{ vars.CURSEFORGE_GAME_VERSIONS_NEOFORGE_261 || 'Minecraft 26.1:26.1,Java 25,NeoForge' }}
+
+    steps:
+      - name: Download 26.x dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-26
+          path: dist
+
+      - name: Upload
+        if: ${{ env.CURSEFORGE_TOKEN != '' && env.CURSEFORGE_PROJECT_ID != '' }}
+        uses: itsmeow/curseforge-upload@v3
+        with:
+          token: ${{ env.CURSEFORGE_TOKEN }}
+          project_id: ${{ env.CURSEFORGE_PROJECT_ID }}
+          game_endpoint: minecraft
+          file_path: dist/${{ needs.build-26-dist.outputs.mod_id }}-${{ matrix.jar_suffix }}-${{ needs.build-26-dist.outputs.version }}.jar
+          game_versions: ${{ matrix.game_versions }}
+          release_type: ${{ needs.build-26-dist.outputs.channel }}
+          changelog: "Automated release ${{ needs.build-26-dist.outputs.tag }}."
           changelog_type: markdown

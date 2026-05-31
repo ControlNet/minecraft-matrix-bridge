@@ -1,66 +1,67 @@
 plugins {
+    id 'java'
     id 'eclipse'
     id 'maven-publish'
-    id 'net.minecraftforge.gradle' version '[6.0,6.2)'
+    id 'net.minecraftforge.gradle' version '[7.0.17,8)'
 }
 
 base {
     archivesName = "${mod_id}-forge-26.x"
 }
 
-// TODO: This is a placeholder module for a future Forge line. Update the minecraft/forge versions when targeting
-// that line. This module is intentionally minimal.
+// Minecraft 26.1.2 requires Java 25.
 java {
-    toolchain.languageVersion = JavaLanguageVersion.of(17)
+    toolchain.languageVersion = JavaLanguageVersion.of(25)
 }
 
 sourceSets {
     main {
         java {
             srcDir rootProject.file('forge-shared/common/src/main/java')
-            srcDir rootProject.file('forge-shared/forge-1.19plus/src/main/java')
         }
         resources {
-            srcDir rootProject.file('forge-shared/common/src/main/resources')
+            srcDir project(':core').file('src/main/resources')
         }
+        output.resourcesDir = layout.buildDirectory.dir('classes/java/main').get().asFile
     }
 }
 
 ext {
-    // Placeholder values (kept valid so this project can configure/build in CI if needed).
-    minecraft_version = '1.20.1'
-    forge_version = '47.2.0'
+    minecraft_version = '26.1.2'
+    forge_version = '64.0.8'
 
-    mapping_channel = 'official'
-    mapping_version = '1.20.1'
-
-    pack_format = 15
-
-    minecraft_version_range = '[1.20,1.21)'
-    forge_version_range = '[47,)'
-    loader_version_range = '[47,)'
+    pack_format = 101
+    minecraft_version_range = '[26.1.2,26.2)'
+    forge_version_range = '[64,)'
+    loader_version_range = '[64,)'
 }
 
 minecraft {
-    mappings channel: mapping_channel, version: mapping_version
-
     runs {
-        server {
-            workingDirectory project.file('run-systemtest')
-            property 'forge.logging.console.level', 'info'
-            jvmArgs '-Djna.tmpdir=./jna'
+        configureEach {
+            workingDir = layout.projectDirectory.dir('run-systemtest')
+
+            systemProperty 'eventbus.api.strictRuntimeChecks', 'true'
+            systemProperty 'forge.enabledGameTestNamespaces', mod_id
+        }
+
+        register('server') {
             args '--nogui'
-            mods {
-                "${mod_id}" {
-                    source sourceSets.main
-                }
-            }
+            jvmArgs '-Djna.tmpdir=./jna'
         }
     }
 }
 
+repositories {
+    minecraft.mavenizer(it)
+    maven fg.forgeMaven
+    maven fg.minecraftLibsMaven
+    mavenCentral()
+}
+
 dependencies {
-    minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+    implementation minecraft.dependency("net.minecraftforge:forge:${minecraft_version}-${forge_version}")
+    annotationProcessor 'net.minecraftforge:eventbus-validator:7.0.1'
     compileOnly project(':core')
 }
 

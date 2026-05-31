@@ -19,6 +19,11 @@ public final class BridgeSettings {
     public final int maxQueueSize;
     public final int dedupSize;
 
+    public final int maxActiveEventTaps;
+    public final int defaultEventThrottleMs;
+    public final int eventCommandMinPowerLevel;
+    public final boolean enableEventTaps;
+
     public BridgeSettings(
             String homeserver,
             String roomId,
@@ -32,7 +37,11 @@ public final class BridgeSettings {
             int syncTimeoutMs,
             int timelineLimit,
             int maxQueueSize,
-            int dedupSize
+            int dedupSize,
+            boolean enableEventTaps,
+            int maxActiveEventTaps,
+            int defaultEventThrottleMs,
+            int eventCommandMinPowerLevel
     ) {
         this.homeserver = normalizeHomeserver(homeserver);
         this.roomId = trimToEmpty(roomId);
@@ -49,6 +58,31 @@ public final class BridgeSettings {
         this.timelineLimit = timelineLimit;
         this.maxQueueSize = maxQueueSize;
         this.dedupSize = dedupSize;
+
+        this.enableEventTaps = enableEventTaps;
+        this.maxActiveEventTaps = maxActiveEventTaps > 0 ? maxActiveEventTaps : 10;
+        this.defaultEventThrottleMs = defaultEventThrottleMs > 0 ? defaultEventThrottleMs : 1000;
+        this.eventCommandMinPowerLevel = eventCommandMinPowerLevel >= 0 ? eventCommandMinPowerLevel : 50;
+    }
+
+    public BridgeSettings(
+            String homeserver,
+            String roomId,
+            String accessToken,
+            boolean enableMcToMatrix,
+            boolean enableMatrixToMc,
+            boolean announceConnected,
+            String mcToMatrixPrefix,
+            String matrixToMcPrefix,
+            String matrixBotPrefix,
+            int syncTimeoutMs,
+            int timelineLimit,
+            int maxQueueSize,
+            int dedupSize
+    ) {
+        this(homeserver, roomId, accessToken, enableMcToMatrix, enableMatrixToMc, announceConnected,
+                mcToMatrixPrefix, matrixToMcPrefix, matrixBotPrefix, syncTimeoutMs, timelineLimit,
+                maxQueueSize, dedupSize, true, 10, 1000, 50);
     }
 
     public boolean isBridgeEnabled() {
@@ -78,6 +112,10 @@ public final class BridgeSettings {
                 ", timelineLimit=" + timelineLimit +
                 ", maxQueueSize=" + maxQueueSize +
                 ", dedupSize=" + dedupSize +
+                ", enableEventTaps=" + enableEventTaps +
+                ", maxActiveEventTaps=" + maxActiveEventTaps +
+                ", defaultEventThrottleMs=" + defaultEventThrottleMs +
+                ", eventCommandMinPowerLevel=" + eventCommandMinPowerLevel +
                 '}';
     }
 
