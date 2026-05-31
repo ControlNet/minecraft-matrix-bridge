@@ -157,8 +157,7 @@ public class BridgeServiceTest {
                 waitUntil(service::isReady, Duration.ofSeconds(2));
                 assertTrue(service.enqueueMcMessage("[MC] <Steve> hello"));
 
-                waitUntil(() -> server.sendCallCount() >= 2, Duration.ofSeconds(2));
-                assertTrue(server.getSendRequests().size() >= 2);
+                waitUntil(() -> server.getSendRequests().size() >= 2, Duration.ofSeconds(2));
             } finally {
                 service.stop();
             }
@@ -213,7 +212,7 @@ public class BridgeServiceTest {
             try {
                 service.start(settings, worldRoot, callbacks);
 
-                waitUntil(() -> server.sendCallCount() >= 1, Duration.ofSeconds(2));
+                waitUntil(() -> !server.getSendRequests().isEmpty(), Duration.ofSeconds(2));
                 assertTrue(received.stream().noneMatch(s -> s.contains("!mc")), "should not forward bot command to Minecraft chat");
 
                 String bodyJson = server.getSendRequests().get(0).body();
@@ -280,7 +279,7 @@ public class BridgeServiceTest {
                 assertTrue(received.contains(expectedForwarded));
 
                 assertTrue(service.enqueueMcMessage("[MC] <Steve> hello"));
-                waitUntil(() -> server.sendCallCount() >= 1, Duration.ofSeconds(2));
+                waitUntil(() -> !server.getSendRequests().isEmpty(), Duration.ofSeconds(2));
 
                 String encodedRoomId = urlEncode(roomId);
                 assertTrue(server.getSendRequests().get(0).path().contains("/_matrix/client/v3/rooms/" + encodedRoomId + "/send/m.room.message/"));
