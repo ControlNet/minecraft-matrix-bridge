@@ -158,6 +158,8 @@ public class BridgeServiceTest {
                 assertTrue(service.enqueueMcMessage("[MC] <Steve> hello"));
 
                 waitUntil(() -> server.getSendRequests().size() >= 2, Duration.ofSeconds(2));
+                assertEquals(server.getSendRequests().get(0).path(), server.getSendRequests().get(1).path(),
+                        "Retries must preserve the transaction ID");
             } finally {
                 service.stop();
             }
@@ -171,6 +173,7 @@ public class BridgeServiceTest {
 
         try (MockMatrixServer server = new MockMatrixServer("token", selfUserId)) {
             server.setJoinedRooms(List.of(roomId));
+            server.setSendRateLimit(1, 1);
 
             // Initial catch-up sync to establish a since token.
             server.enqueueSyncResponse(roomId, "s0", new JsonArray());
@@ -212,7 +215,9 @@ public class BridgeServiceTest {
             try {
                 service.start(settings, worldRoot, callbacks);
 
-                waitUntil(() -> !server.getSendRequests().isEmpty(), Duration.ofSeconds(2));
+                waitUntil(() -> server.getSendRequests().size() >= 2, Duration.ofSeconds(2));
+                assertEquals(server.getSendRequests().get(0).path(), server.getSendRequests().get(1).path(),
+                        "Bot reply retries must preserve the transaction ID");
                 assertTrue(received.stream().noneMatch(s -> s.contains("!mc")), "should not forward bot command to Minecraft chat");
 
                 String bodyJson = server.getSendRequests().get(0).body();

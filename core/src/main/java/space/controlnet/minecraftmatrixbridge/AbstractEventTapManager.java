@@ -333,6 +333,7 @@ public abstract class AbstractEventTapManager<E> {
         }
 
         synchronized List<Subscription> getEnabled() {
+            cleanupExpired(System.currentTimeMillis());
             List<Subscription> result = new ArrayList<>();
             for (Subscription sub : subs) {
                 if (sub.enabled) {
@@ -343,6 +344,7 @@ public abstract class AbstractEventTapManager<E> {
         }
 
         synchronized int disableAll() {
+            cleanupExpired(System.currentTimeMillis());
             int count = 0;
             for (Subscription sub : subs) {
                 if (sub.enabled) {
@@ -354,6 +356,7 @@ public abstract class AbstractEventTapManager<E> {
         }
 
         synchronized boolean isEmpty() {
+            cleanupExpired(System.currentTimeMillis());
             for (Subscription sub : subs) {
                 if (sub.enabled) {
                     return false;

@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ThreadLocalRandom;
@@ -415,6 +416,7 @@ public final class BridgeService {
                 return;
             }
 
+            String transactionId = UUID.randomUUID().toString();
             while (running.get()) {
                 try {
                     String roomId = resolvedRoomId;
@@ -422,7 +424,7 @@ public final class BridgeService {
                         LOGGER.warning("MatrixBridge send skipped: roomId not resolved yet.");
                         break;
                     }
-                    matrixClient.sendText(roomId, msg);
+                    matrixClient.sendText(roomId, msg, transactionId);
                     backoffMs = 1_000;
                     break;
                 } catch (MatrixClient.MatrixException e) {
@@ -775,9 +777,10 @@ public final class BridgeService {
         }
 
         long backoffMs = 1_000;
+        String transactionId = UUID.randomUUID().toString();
         for (int attempt = 0; running.get() && attempt < 3; attempt++) {
             try {
-                client.sendText(roomId, text);
+                client.sendText(roomId, text, transactionId);
                 return;
             } catch (MatrixClient.MatrixException e) {
                 if (e.statusCode == 429) {
