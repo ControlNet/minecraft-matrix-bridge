@@ -19,27 +19,30 @@ fi
 echo "Building ${MOD_ID} 26.x artifacts for version ${MOD_VERSION}..."
 
 ./gradlew-26 --no-daemon --stacktrace -Pmod_version="${MOD_VERSION}" -Pomx_modern_26=true \
-  :forge-26:build \
-  :neoforge-26:build
+  :forge-26.1:build \
+  :forge-26.2:build \
+  :neoforge-26.1:build \
+  :neoforge-26.2:build
 
 rm -rf dist
 mkdir -p dist
 
-for p in forge-26/build/libs/*.jar neoforge-26/build/libs/*.jar; do
+for p in forge-26.1/build/libs/*.jar forge-26.2/build/libs/*.jar neoforge-26.1/build/libs/*.jar neoforge-26.2/build/libs/*.jar; do
   [[ -e "${p}" ]] || continue
   b="$(basename "${p}")"
-  if [[ "${b}" == *-sources.jar || "${b}" == *-javadoc.jar ]]; then
-    continue
-  fi
-  if [[ "${b}" != *"-${MOD_VERSION}.jar" ]]; then
+  # Exclude stale artifacts left by module renames as well as auxiliary jars.
+  module="${p%%/build/libs/*}"
+  if [[ "${b}" != "${MOD_ID}-${module}.x-${MOD_VERSION}.jar" ]]; then
     continue
   fi
   cp -f "${p}" dist/
 done
 
 EXPECTED=(
-  "${MOD_ID}-forge-26.x-${MOD_VERSION}.jar"
-  "${MOD_ID}-neoforge-26.x-${MOD_VERSION}.jar"
+  "${MOD_ID}-forge-26.1.x-${MOD_VERSION}.jar"
+  "${MOD_ID}-forge-26.2.x-${MOD_VERSION}.jar"
+  "${MOD_ID}-neoforge-26.1.x-${MOD_VERSION}.jar"
+  "${MOD_ID}-neoforge-26.2.x-${MOD_VERSION}.jar"
 )
 
 for f in "${EXPECTED[@]}"; do

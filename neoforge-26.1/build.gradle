@@ -1,11 +1,11 @@
 plugins {
     id 'eclipse'
     id 'maven-publish'
-    id 'net.neoforged.moddev' version '2.0.141'
+    id 'net.neoforged.moddev' version '2.0.147'
 }
 
 base {
-    archivesName = "${mod_id}-neoforge-26.x"
+    archivesName = "${mod_id}-neoforge-26.1.x"
 }
 
 // Minecraft 26.1.2 requires Java 25.
@@ -27,10 +27,10 @@ sourceSets {
 ext {
     minecraft_version = '26.1.2'
     neo_version = '26.1.2.67-beta'
-    neo_version_range = '[26.1.2,)'
+    neo_version_range = '[26.1.0.19-beta,)'
     loader_version_range = '[3,)'
     pack_format = 101
-    minecraft_version_range = '[26.1.2,26.2)'
+    minecraft_version_range = '[26.1,26.2)'
 }
 
 neoForge {

@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,15 @@ from pathlib import Path
 from typing import Optional
 import socket
 from urllib.parse import urlparse, unquote
+from urllib.request import Request, urlopen
+
+
+MODERN_MODULE_EVENT_ALIASES = {
+    "forge-26.1": "TickEvent.ServerTickEvent.Post",
+    "forge-26.2": "TickEvent.ServerTickEvent.Post",
+    "neoforge-26.1": "ServerTickEvent.Post",
+    "neoforge-26.2": "ServerTickEvent.Post",
+}
 
 
 @dataclass
@@ -233,6 +243,7 @@ def write_server_properties(run_dir: Path, server_port: int) -> None:
         "\n".join(
             [
                 "online-mode=false",
+                "server-ip=127.0.0.1",
                 f"server-port={server_port}",
                 "max-players=4",
                 "",
@@ -295,11 +306,10 @@ def wait_for_bridge_ready(
 
 
 def event_tap_alias_for_module(module: str) -> str:
-    if module == "forge-26":
-        return "TickEvent.ServerTickEvent.Post"
-    if module == "neoforge-26":
-        return "ServerTickEvent.Post"
-    raise ValueError(f"No event tap probe configured for module: {module}")
+    try:
+        return MODERN_MODULE_EVENT_ALIASES[module]
+    except KeyError:
+        raise ValueError(f"No event tap probe configured for module: {module}") from None
 
 
 def wait_for_send_count(
@@ -361,11 +371,73 @@ def _reader_thread(stream, out_queue: "queue.Queue[str]") -> None:
     stream.close()
 
 
-def run_one(module: str, timeout_s: int) -> None:
+def packaged_server_command(root: Path, module: str, run_dir: Path,
+                            loader_coordinate: str | None = None) -> list[str]:
+    """Install the matching loader and load the built JAR as an ordinary mod."""
+    build = (root / module / "build.gradle").read_text(encoding="utf-8")
+
+    def version(name: str) -> str:
+        match = re.search(rf"^\s*{name}\s*=\s*'([^']+)'", build, re.MULTILINE)
+        if match is None:
+            raise ValueError(f"Missing {name} in {module}/build.gradle")
+        return match.group(1)
+
+    properties = dict(
+        line.split("=", 1)
+        for line in (root / "gradle.properties").read_text(encoding="utf-8").splitlines()
+        if "=" in line and not line.lstrip().startswith("#")
+    )
+    jar = root / module / "build" / "libs" / (
+        f"{properties['mod_id']}-{module}.x-{properties['mod_version']}.jar"
+    )
+    if not jar.is_file():
+        raise FileNotFoundError(f"Build {module} before testing its packaged JAR: {jar}")
+
+    if module.startswith("neoforge-"):
+        loader_version = loader_coordinate or version('neo_version')
+        coordinate = f"net/neoforged/neoforge/{loader_version}"
+        filename = f"neoforge-{loader_version}-installer.jar"
+        base = "https://maven.neoforged.net/releases"
+    else:
+        loader_version = loader_coordinate or f"{version('minecraft_version')}-{version('forge_version')}"
+        coordinate = f"net/minecraftforge/forge/{loader_version}"
+        filename = f"forge-{loader_version}-installer.jar"
+        base = "https://maven.minecraftforge.net"
+
+    installer = run_dir / filename
+    request = Request(
+        f"{base}/{coordinate}/{filename}",
+        headers={"User-Agent": "MinecraftMatrixBridge-SystemTest"},
+    )
+    with urlopen(request, timeout=120) as response, installer.open("wb") as output:
+        shutil.copyfileobj(response, output)
+    java_home = os.environ.get("JAVA_HOME")
+    java = str(Path(java_home) / "bin" / "java") if java_home else "java"
+    with (run_dir / "installer.log").open("w", encoding="utf-8") as log:
+        subprocess.run(
+            [java, "-jar", str(installer), "--installServer", str(run_dir)],
+            cwd=run_dir, stdout=log, stderr=subprocess.STDOUT,
+            check=True, timeout=600,
+        )
+    mods = run_dir / "mods"
+    mods.mkdir(exist_ok=True)
+    shutil.copy2(jar, mods / jar.name)
+    args_file = run_dir / "libraries" / coordinate / (
+        "win_args.txt" if os.name == "nt" else "unix_args.txt"
+    )
+    if not args_file.is_file():
+        raise FileNotFoundError(f"Installer did not generate {args_file}")
+    return [java, "-Djna.tmpdir=./jna", f"@{args_file}", "--nogui"]
+
+
+def run_one(module: str, timeout_s: int, packaged: bool = False,
+            loader_coordinate: str | None = None) -> None:
     root = Path(__file__).resolve().parents[1]
     # ForgeGradle 6.x (legacy lines) and the 26.x line require different Gradle
     # launchers, so pick the wrapper that matches the module under test.
-    modern_26 = module in {"forge-26", "neoforge-26"}
+    modern_26 = module in MODERN_MODULE_EVENT_ALIASES
+    if packaged and not modern_26:
+        raise ValueError("Packaged server tests currently support only the 26.x modules")
     if os.name == "nt":
         gradlew_name = "gradlew-26.bat" if modern_26 else "gradlew.bat"
     else:
@@ -373,6 +445,9 @@ def run_one(module: str, timeout_s: int) -> None:
     gradlew = root / gradlew_name
 
     run_dir = root / module / "run-systemtest"
+    if loader_coordinate:
+        # Keep cross-patch test logs separate from the default server test.
+        run_dir = run_dir / loader_coordinate
 
     # Make each run clean and deterministic.
     if run_dir.exists():
@@ -380,6 +455,7 @@ def run_one(module: str, timeout_s: int) -> None:
     ensure_eula(run_dir)
     write_server_properties(run_dir, pick_free_port())
     (run_dir / "jna").mkdir(parents=True, exist_ok=True)
+    packaged_cmd = packaged_server_command(root, module, run_dir, loader_coordinate) if packaged else None
 
     token = "token"
     room_id = "!roomid:example.com"
@@ -390,19 +466,22 @@ def run_one(module: str, timeout_s: int) -> None:
         token=token, self_user_id=self_user_id, room_id=room_id, room_alias=room_alias
     )
     homeserver = mock.start()
+    proc: Optional[subprocess.Popen[str]] = None
     try:
         write_systemtest_config(run_dir, homeserver, room_alias)
 
         env = dict(os.environ)
         env["MATRIX_ACCESS_TOKEN"] = token
-        env["GRADLE_USER_HOME"] = str(root / ".gradle-user-home")
+        env.setdefault("GRADLE_USER_HOME", str(root / ".gradle-user-home"))
 
         cmd = [str(gradlew), f":{module}:runServer", "--console=plain"]
         if modern_26:
             cmd.insert(1, "-Pomx_modern_26=true")
+        if packaged_cmd:
+            cmd = packaged_cmd
         proc = subprocess.Popen(
             cmd,
-            cwd=str(root),
+            cwd=str(run_dir if packaged else root),
             env=env,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -442,7 +521,7 @@ def run_one(module: str, timeout_s: int) -> None:
 
         state = wait_for_bridge_ready(module, run_dir, mock, proc, q, timeout_s=30)
 
-        if module in {"forge-26", "neoforge-26"}:
+        if modern_26:
             wait_for_event_index_ready(module, proc, q, timeout_s=30)
             event_alias = event_tap_alias_for_module(module)
             proc.stdin.write(f"matrix event on {event_alias}\n")
@@ -459,7 +538,7 @@ def run_one(module: str, timeout_s: int) -> None:
             mock,
             proc,
             q,
-            expected_count=2 if module in {"forge-26", "neoforge-26"} else 1,
+            expected_count=2 if modern_26 else 1,
             timeout_s=15,
         )
         proc.stdin.write("stop\n")
@@ -498,24 +577,32 @@ def run_one(module: str, timeout_s: int) -> None:
             f"[{module}] OK: whoami={counters.whoami_calls} resolve={counters.resolve_calls} sync={counters.sync_calls} send={counters.send_calls} state={state}"
         )
     finally:
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=15)
         mock.stop()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "--packaged",
+        action="store_true",
+        help="Install real loaders and test built 26.x JARs (requires Java 25)",
+    )
+    parser.add_argument(
         "--modules",
         nargs="*",
-        default=[
-            "forge-1.18",
-            "forge-1.19",
-            "forge-1.20",
-            "forge-1.21",
-            "forge-26",
-            "neoforge-1.21",
-            "neoforge-26",
-        ],
+        default=None,
         help="Gradle subprojects to system-test",
+    )
+    parser.add_argument(
+        "--loader-coordinate",
+        help="Test one packaged module against another loader (Forge: MC-Forge, NeoForge: version)",
     )
     parser.add_argument(
         "--timeout-s",
@@ -524,10 +611,24 @@ def main() -> int:
         help="Per-module startup timeout in seconds",
     )
     args = parser.parse_args()
+    if args.modules is None:
+        args.modules = list(MODERN_MODULE_EVENT_ALIASES)
+        if not args.packaged:
+            args.modules = [
+                "forge-1.18", "forge-1.19", "forge-1.20", "forge-1.21", "neoforge-1.21",
+                *args.modules,
+            ]
+    if args.packaged and any(m not in MODERN_MODULE_EVENT_ALIASES for m in args.modules):
+        parser.error("--packaged supports only the 26.x modules")
+    if args.loader_coordinate:
+        if not args.packaged or len(args.modules) != 1:
+            parser.error("--loader-coordinate requires --packaged and exactly one module")
+        if not re.fullmatch(r"\d+(?:\.\d+)+(?:-[A-Za-z0-9]+(?:\.\d+)*)?", args.loader_coordinate):
+            parser.error("Invalid loader coordinate")
 
     for module in args.modules:
         print(f"=== System test: {module} ===")
-        run_one(module, args.timeout_s)
+        run_one(module, args.timeout_s, packaged=args.packaged, loader_coordinate=args.loader_coordinate)
         print()
 
     return 0

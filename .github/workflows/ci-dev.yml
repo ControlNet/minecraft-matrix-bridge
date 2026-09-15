@@ -8,6 +8,14 @@ on:
   workflow_dispatch: {}
 
 jobs:
+  test-release-metadata:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test release metadata resolver (offline)
+        run: python3 -m unittest discover -s scripts -p 'test_release_metadata.py'
+
   test-and-build:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -57,7 +65,25 @@ jobs:
         run: ./scripts/build_dist_26.sh
 
       - name: System test 26.x servers
-        run: python3 scripts/system_test_all.py --modules forge-26 neoforge-26 --timeout-s 600
+        run: python3 scripts/system_test_all.py --packaged --modules forge-26.1 neoforge-26.1 forge-26.2 neoforge-26.2 --timeout-s 600
+
+      - name: Test 26.1 jars on earlier patch releases
+        run: |
+          python3 scripts/system_test_all.py --packaged --modules forge-26.1 --loader-coordinate 26.1-62.0.9 --timeout-s 600
+          python3 scripts/system_test_all.py --packaged --modules forge-26.1 --loader-coordinate 26.1.1-63.0.2 --timeout-s 600
+          python3 scripts/system_test_all.py --packaged --modules neoforge-26.1 --loader-coordinate 26.1.0.19-beta --timeout-s 600
+          python3 scripts/system_test_all.py --packaged --modules neoforge-26.1 --loader-coordinate 26.1.1.15-beta --timeout-s 600
+
+      - name: Upload server test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-test-logs-26
+          path: |
+            *26.*/run-systemtest/installer.log
+            *26.*/run-systemtest/logs/*.log
+            *26.*/run-systemtest/*/installer.log
+            *26.*/run-systemtest/*/logs/*.log
 
       - name: Upload 26.x dist
         uses: actions/upload-artifact@v4
