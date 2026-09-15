@@ -126,13 +126,24 @@ def resolve_targets(targets, minecraft, modrinth=None, curseforge=None):
     return result
 
 
-def validate_server_coverage(result, server_targets):
-    for target in result["modern"]["include"]:
+def validate_server_coverage(result, server_targets, exclusions=()):
+    tested_keys = {(row["module"], row["minecraft"]) for row in server_targets}
+    excluded_keys = {(row["module"], row["minecraft"]) for row in exclusions}
+    if len(tested_keys) != len(server_targets) or len(excluded_keys) != len(exclusions):
+        raise ValueError("Duplicate server test target or exclusion")
+    if tested_keys & excluded_keys or any(not row.get("reason", "").strip() for row in exclusions):
+        raise ValueError("Server exclusions must have a reason and cannot overlap test targets")
+    required_keys = set()
+    for target in (row for group in result.values() for row in group["include"]):
         tested = {row["minecraft"] for row in server_targets if row["module"] == target["module"]}
+        excluded = {row["minecraft"] for row in exclusions if row["module"] == target["module"]}
         required = set(json.loads(target["game_versions"]))
-        if required != tested:
+        required_keys.update((target["module"], version) for version in required)
+        if required != tested | excluded:
             raise ValueError(f"Server test coverage mismatch for {target['module']}: "
-                             f"missing={sorted(required - tested)}, extra={sorted(tested - required)}")
+                             f"missing={sorted(required - tested - excluded)}, extra={sorted((tested | excluded) - required)}")
+    if (tested_keys | excluded_keys) - required_keys:
+        raise ValueError("Server matrix contains unknown release targets")
 
 
 def verify_modrinth(actual, expected_versions, loader, version, channel, filename):
@@ -151,7 +162,9 @@ def verify_modrinth(actual, expected_versions, loader, version, channel, filenam
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server-targets", type=Path,
-                        help="Require modern release tags to match the successful server-test matrix")
+                        help="Require all release tags to match tested targets or explicit exclusions")
+    parser.add_argument("--server-exclusions", type=Path,
+                        help="Explicit untestable versions that retain platform tags")
     parser.add_argument("--targets", type=Path, default=ROOT / "scripts/release-targets.json")
     parser.add_argument("--output", type=Path, help="Save resolved metadata JSON")
     parser.add_argument("--check-modrinth", action="store_true")
@@ -188,7 +201,8 @@ def main():
                       fetch_json(f"{CURSEFORGE}/version-types", headers))
     result = resolve_targets(targets, minecraft, modrinth, curseforge)
     if args.server_targets:
-        validate_server_coverage(result, json.loads(args.server_targets.read_text(encoding="utf-8")))
+        exclusions = json.loads(args.server_exclusions.read_text(encoding="utf-8")) if args.server_exclusions else []
+        validate_server_coverage(result, json.loads(args.server_targets.read_text(encoding="utf-8")), exclusions)
     serialized = json.dumps(result, indent=2) + "\n"
     if args.output:
         args.output.write_text(serialized, encoding="utf-8")

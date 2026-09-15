@@ -28,6 +28,13 @@ MODERN_MODULE_EVENT_ALIASES = {
     "neoforge-26.2": "ServerTickEvent.Post",
 }
 
+MODULE_EVENT_ALIASES = {
+    **MODERN_MODULE_EVENT_ALIASES,
+    **{f"forge-{family}": "net.minecraftforge.event.TickEvent$ServerTickEvent"
+       for family in ("1.18", "1.19", "1.20", "1.21")},
+    "neoforge-1.21": "net.neoforged.neoforge.event.tick.ServerTickEvent$Post",
+}
+
 
 @dataclass
 class MatrixCounters:
@@ -308,7 +315,7 @@ def wait_for_bridge_ready(
 
 def event_tap_alias_for_module(module: str) -> str:
     try:
-        return MODERN_MODULE_EVENT_ALIASES[module]
+        return MODULE_EVENT_ALIASES[module]
     except KeyError:
         raise ValueError(f"No event tap probe configured for module: {module}") from None
 
@@ -348,9 +355,12 @@ def wait_for_event_index_ready(
     proc: subprocess.Popen[str],
     out_queue: "queue.Queue[str]",
     timeout_s: int,
+    ready: threading.Event | None = None,
 ) -> None:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
+        if ready is not None and ready.is_set():
+            return
         try:
             line = out_queue.get(timeout=0.5)
         except queue.Empty:
@@ -366,8 +376,10 @@ def wait_for_event_index_ready(
     raise RuntimeError(f"{module}: event index did not finish building before timeout")
 
 
-def _reader_thread(stream, out_queue: "queue.Queue[str]") -> None:
+def _reader_thread(stream, out_queue: "queue.Queue[str]", event_index_ready: threading.Event | None = None) -> None:
     for line in iter(stream.readline, ""):
+        if event_index_ready is not None and "Event index built in" in line:
+            event_index_ready.set()
         out_queue.put(line)
     stream.close()
 
@@ -457,8 +469,8 @@ def run_one(module: str, timeout_s: int, packaged: bool = False,
     # ForgeGradle 6.x (legacy lines) and the 26.x line require different Gradle
     # launchers, so pick the wrapper that matches the module under test.
     modern_26 = module in MODERN_MODULE_EVENT_ALIASES
-    if packaged and not modern_26:
-        raise ValueError("Packaged server tests currently support only the 26.x modules")
+    if module not in MODULE_EVENT_ALIASES:
+        raise ValueError(f"Unknown server test module: {module}")
     if os.name == "nt":
         gradlew_name = "gradlew-26.bat" if modern_26 else "gradlew.bat"
     else:
@@ -515,7 +527,8 @@ def run_one(module: str, timeout_s: int, packaged: bool = False,
         assert proc.stdin is not None
 
         q: "queue.Queue[str]" = queue.Queue()
-        t = threading.Thread(target=_reader_thread, args=(proc.stdout, q), daemon=True)
+        event_index_ready = threading.Event()
+        t = threading.Thread(target=_reader_thread, args=(proc.stdout, q, event_index_ready), daemon=True)
         t.start()
 
         started = False
@@ -542,9 +555,10 @@ def run_one(module: str, timeout_s: int, packaged: bool = False,
 
         state = wait_for_bridge_ready(module, run_dir, mock, proc, q, timeout_s=30)
 
-        if modern_26:
-            wait_for_event_index_ready(module, proc, q, timeout_s=30)
-            event_alias = event_tap_alias_for_module(module)
+        if module in MODULE_EVENT_ALIASES:
+            wait_for_event_index_ready(module, proc, q, timeout_s=60, ready=event_index_ready)
+            # Brigadier requires quotes around nested class names containing '$'.
+            event_alias = json.dumps(event_tap_alias_for_module(module))
             proc.stdin.write(f"matrix event on {event_alias}\n")
             proc.stdin.flush()
             wait_for_send_count(module, mock, proc, q, expected_count=1, timeout_s=15)
@@ -559,7 +573,7 @@ def run_one(module: str, timeout_s: int, packaged: bool = False,
             mock,
             proc,
             q,
-            expected_count=2 if modern_26 else 1,
+            expected_count=2,
             timeout_s=15,
         )
         proc.stdin.write("stop\n")
@@ -615,7 +629,7 @@ def main() -> int:
     parser.add_argument(
         "--packaged",
         action="store_true",
-        help="Install real loaders and test built 26.x JARs (requires Java 25)",
+        help="Install real loaders and test built JARs (use the target Minecraft version's Java)",
     )
     parser.add_argument(
         "--modules",
@@ -637,14 +651,9 @@ def main() -> int:
     if args.artifact_dir is not None and not args.packaged:
         parser.error("--artifact-dir requires --packaged")
     if args.modules is None:
-        args.modules = list(MODERN_MODULE_EVENT_ALIASES)
-        if not args.packaged:
-            args.modules = [
-                "forge-1.18", "forge-1.19", "forge-1.20", "forge-1.21", "neoforge-1.21",
-                *args.modules,
-            ]
-    if args.packaged and any(m not in MODERN_MODULE_EVENT_ALIASES for m in args.modules):
-        parser.error("--packaged supports only the 26.x modules")
+        args.modules = list(MODULE_EVENT_ALIASES)
+    if any(m not in MODULE_EVENT_ALIASES for m in args.modules):
+        parser.error("Unknown server test module")
     if args.loader_coordinate:
         if not args.packaged or len(args.modules) != 1:
             parser.error("--loader-coordinate requires --packaged and exactly one module")

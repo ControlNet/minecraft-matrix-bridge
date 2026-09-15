@@ -36,10 +36,17 @@ jobs:
       - name: Make Gradle wrappers executable
         run: chmod +x ./gradlew ./gradlew-26
 
-      - name: Build dist (all jars)
+      - name: Build legacy dist
         run: |
           chmod +x ./scripts/build_dist.sh
-          ./scripts/build_dist.sh
+          ./scripts/build_dist.sh --legacy-only
+
+      - name: Upload legacy dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
 
   test-and-build-26:
     runs-on: ubuntu-latest
@@ -71,6 +78,6 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  test-servers-26:
-    needs: test-and-build-26
-    uses: ./.github/workflows/server-tests-26.yml
+  test-servers:
+    needs: [test-and-build, test-and-build-26]
+    uses: ./.github/workflows/server-tests.yml

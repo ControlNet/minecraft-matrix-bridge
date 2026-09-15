@@ -85,11 +85,15 @@ python3 scripts/system_test_all.py --packaged --modules neoforge-26.1 --loader-c
 python3 scripts/system_test_all.py --packaged --modules neoforge-26.1 --loader-coordinate 26.1.1.15-beta --timeout-s 600
 ```
 
-CI builds each 26.x JAR once and uploads `dist-26`. The reusable
-`.github/workflows/server-tests-26.yml` creates an isolated job for every entry in
-`scripts/server-test-targets.json`: Forge and NeoForge on 26.1, 26.1.1, 26.1.2,
-and 26.2. Every job downloads the same artifact, checks its SHA256, and installs
-that exact JAR without invoking Gradle. There is no workflow-level parallelism
+CI builds each of the nine release JARs once: `build_dist.sh --legacy-only`
+uploads the five legacy JARs as `dist`, and `build_dist_26.sh` uploads four modern
+JARs as `dist-26`. The reusable `.github/workflows/server-tests.yml` creates an
+isolated job for every entry in `scripts/server-test-targets.json`: 45 runnable
+combinations covering every published stable patch in 1.18, 1.19, 1.20, 1.21,
+26.1, and 26.2 for the applicable release loader. Every job downloads its release
+artifact, checks its SHA256, and installs that exact JAR without invoking Gradle.
+Runtime Java is pinned per target (17, 21, or 25), independently of build Java.
+There is no workflow-level parallelism
 cap; GitHub runner availability and account limits determine concurrency.
 Failures do not cancel other matrix members, and each member retains its logs.
 
@@ -102,10 +106,27 @@ python3 scripts/system_test_all.py --packaged --artifact-dir dist --modules forg
 Expected: `Verified artifact: ... SHA256=...`, followed by the server test's
 `OK` result. A missing checksum, modified JAR, or server failure exits nonzero.
 `--artifact-dir` requires `SHA256SUMS.txt` and never falls back to a local build.
-Release publishing waits for this same matrix and consumes the same `dist-26`
-artifact. Modern release tags must exactly match matrix coverage; newly released
-Minecraft patches require a pinned test entry and passing tests before publishing.
-Legacy packaged-server coverage is not yet included.
+Release publishing waits for the entire matrix and consumes the same `dist` and
+`dist-26` artifacts. All release tags must match matrix coverage or the explicit
+exceptions in `scripts/server-test-exclusions.json`. Forge has no published
+installer for Minecraft 1.20.5 or 1.21.2, so these two combinations have no server
+job; their Modrinth and CurseForge tags are intentionally retained. NeoForge
+1.21.2 does have an installer and is tested. These exceptions do not certify
+compatibility. New Minecraft patches require a pinned test entry (or an explicitly
+reviewed no-loader exception) before publishing. Ordinary compatibility failures
+are never excluded or allowed to pass: they fail CI and block release.
+
+For example, test a legacy artifact using Java 17 after the legacy build:
+
+```bash
+./scripts/build_dist.sh --legacy-only
+python3 scripts/system_test_all.py --packaged --artifact-dir dist --modules forge-1.18 --loader-coordinate 1.18.2-40.3.12 --timeout-s 600
+```
+
+Build scripts recreate `dist/`; server tests recreate their coordinate-specific
+test worlds. Keep these directories disposable. Older versions may expose genuine
+loader/API incompatibilities in existing release JARs; adding a matrix case does
+not imply that compatibility has passed.
 
 Expected: each exits successfully with an `OK:` line and at least two outgoing
 messages to the mock Matrix service. The 26.1 jar metadata permits Minecraft

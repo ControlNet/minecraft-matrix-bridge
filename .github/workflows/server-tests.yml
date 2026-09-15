@@ -1,4 +1,4 @@
-name: Packaged 26.x compatibility
+name: Packaged compatibility (all versions)
 
 on:
   workflow_call: {}
@@ -15,7 +15,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Test artifact verification
-        run: python3 -m unittest discover -s scripts -p 'test_server_artifacts.py'
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: Check every published Minecraft patch is accounted for
+        run: python3 scripts/release_metadata.py --server-targets scripts/server-test-targets.json --server-exclusions scripts/server-test-exclusions.json
       - id: targets
         run: |
           python3 - <<'PY'
@@ -42,7 +44,7 @@ jobs:
           java-version: ${{ matrix.java }}
       - uses: actions/download-artifact@v4
         with:
-          name: dist-26
+          name: ${{ matrix.artifact }}
           path: dist
       - name: Verify and test the built JAR (no recompilation)
         env:
@@ -59,4 +61,5 @@ jobs:
           path: |
             ${{ matrix.module }}/run-systemtest/${{ matrix.loader }}/installer.log
             ${{ matrix.module }}/run-systemtest/${{ matrix.loader }}/logs/*.log
+            ${{ matrix.module }}/run-systemtest/${{ matrix.loader }}/crash-reports/*.txt
             dist/SHA256SUMS.txt

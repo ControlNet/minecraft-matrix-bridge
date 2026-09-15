@@ -5,9 +5,14 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
 SKIP_TESTS="false"
-if [[ "${1:-}" == "--skip-tests" ]]; then
-  SKIP_TESTS="true"
-fi
+LEGACY_ONLY="false"
+for arg in "$@"; do
+  case "$arg" in
+    --skip-tests) SKIP_TESTS="true" ;;
+    --legacy-only) LEGACY_ONLY="true" ;;
+    *) echo "Unknown argument: $arg" >&2; exit 1 ;;
+  esac
+done
 
 MOD_ID="$(grep -E '^mod_id=' gradle.properties | head -n1 | cut -d= -f2- | tr -d '\r' | xargs || true)"
 MOD_VERSION="$(grep -E '^mod_version=' gradle.properties | head -n1 | cut -d= -f2- | tr -d '\r' | xargs || true)"
@@ -47,7 +52,9 @@ MODERN_26_TASKS=(
 ./gradlew --no-daemon --stacktrace -Pmod_version="${MOD_VERSION}" "${LEGACY_TASKS[@]}"
 # Minecraft 26.x modules use the dedicated Gradle 9.3 launcher and opt into the
 # conditional includes in settings.gradle.
-./gradlew-26 --no-daemon --stacktrace -Pmod_version="${MOD_VERSION}" -Pomx_modern_26=true "${MODERN_26_TASKS[@]}"
+if [[ "${LEGACY_ONLY}" != "true" ]]; then
+  ./gradlew-26 --no-daemon --stacktrace -Pmod_version="${MOD_VERSION}" -Pomx_modern_26=true "${MODERN_26_TASKS[@]}"
+fi
 
 rm -rf dist
 mkdir -p dist
@@ -57,6 +64,9 @@ for p in forge-1.18/build/libs/*.jar forge-1.19/build/libs/*.jar forge-1.20/buil
   b="$(basename "${p}")"
   # Exclude stale artifacts left by module renames as well as auxiliary jars.
   module="${p%%/build/libs/*}"
+  if [[ "${LEGACY_ONLY}" == "true" && "$module" == *-26.* ]]; then
+    continue
+  fi
   if [[ "${b}" != "${MOD_ID}-${module}.x-${MOD_VERSION}.jar" ]]; then
     continue
   fi
@@ -76,6 +86,9 @@ EXPECTED=(
 )
 
 for f in "${EXPECTED[@]}"; do
+  if [[ "${LEGACY_ONLY}" == "true" && "$f" == *-26.* ]]; then
+    continue
+  fi
   if [[ ! -f "dist/${f}" ]]; then
     echo "ERROR: expected jar not found: dist/${f}" >&2
     echo "dist contains:" >&2
