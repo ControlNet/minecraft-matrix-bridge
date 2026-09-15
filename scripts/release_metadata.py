@@ -126,6 +126,15 @@ def resolve_targets(targets, minecraft, modrinth=None, curseforge=None):
     return result
 
 
+def validate_server_coverage(result, server_targets):
+    for target in result["modern"]["include"]:
+        tested = {row["minecraft"] for row in server_targets if row["module"] == target["module"]}
+        required = set(json.loads(target["game_versions"]))
+        if required != tested:
+            raise ValueError(f"Server test coverage mismatch for {target['module']}: "
+                             f"missing={sorted(required - tested)}, extra={sorted(tested - required)}")
+
+
 def verify_modrinth(actual, expected_versions, loader, version, channel, filename):
     expected = {"game_versions": sorted(expected_versions), "loaders": [loader],
                 "version_number": version, "version_type": channel, "environment": ENVIRONMENT}
@@ -141,6 +150,8 @@ def verify_modrinth(actual, expected_versions, loader, version, channel, filenam
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--server-targets", type=Path,
+                        help="Require modern release tags to match the successful server-test matrix")
     parser.add_argument("--targets", type=Path, default=ROOT / "scripts/release-targets.json")
     parser.add_argument("--output", type=Path, help="Save resolved metadata JSON")
     parser.add_argument("--check-modrinth", action="store_true")
@@ -176,6 +187,8 @@ def main():
         curseforge = (fetch_json(f"{CURSEFORGE}/versions", headers),
                       fetch_json(f"{CURSEFORGE}/version-types", headers))
     result = resolve_targets(targets, minecraft, modrinth, curseforge)
+    if args.server_targets:
+        validate_server_coverage(result, json.loads(args.server_targets.read_text(encoding="utf-8")))
     serialized = json.dumps(result, indent=2) + "\n"
     if args.output:
         args.output.write_text(serialized, encoding="utf-8")

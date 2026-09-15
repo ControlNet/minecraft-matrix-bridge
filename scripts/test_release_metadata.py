@@ -203,7 +203,8 @@ class ReleaseMetadataTests(unittest.TestCase):
                                 "--loader-coordinate", "26.1-62.0.9"]), \
                 patch.object(system_test_all, "run_one") as run, patch("builtins.print"):
             self.assertEqual(system_test_all.main(), 0)
-        run.assert_called_once_with("forge-26.1", 600, packaged=True, loader_coordinate="26.1-62.0.9")
+        run.assert_called_once_with("forge-26.1", 600, packaged=True, loader_coordinate="26.1-62.0.9",
+                                    artifact_dir=None)
 
     def test_packaged_coordinate_rejects_paths_or_multiple_modules(self):
         for args in [

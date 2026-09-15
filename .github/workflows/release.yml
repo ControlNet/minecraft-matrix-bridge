@@ -9,9 +9,13 @@ permissions:
   contents: write
 
 jobs:
+  test-servers-26:
+    needs: build-26-dist
+    uses: ./.github/workflows/server-tests-26.yml
+
   release-metadata:
     name: Resolve and validate release tags
-    needs: [build-and-release, build-26-dist]
+    needs: [build-and-release, build-26-dist, test-servers-26]
     if: ${{ needs.build-and-release.outputs.should_release == 'true' && needs.build-26-dist.outputs.should_release == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -33,7 +37,7 @@ jobs:
           args=()
           if [[ "$CHECK_MODRINTH" == 'true' ]]; then args+=(--check-modrinth); fi
           if [[ "$CHECK_CURSEFORGE" == 'true' ]]; then args+=(--check-curseforge); fi
-          python3 scripts/release_metadata.py "${args[@]}" --output release-metadata.json
+          python3 scripts/release_metadata.py "${args[@]}" --server-targets scripts/server-test-targets.json --output release-metadata.json
       - name: Save resolved release tags
         uses: actions/upload-artifact@v4
         with:
@@ -120,6 +124,7 @@ jobs:
         with:
           name: dist-26
           path: dist/*
+          if-no-files-found: error
 
   build-and-release:
     runs-on: ubuntu-latest

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import queue
@@ -371,8 +372,26 @@ def _reader_thread(stream, out_queue: "queue.Queue[str]") -> None:
     stream.close()
 
 
+def verify_artifact(directory: Path, filename: str) -> Path:
+    """Fail closed before starting a server with an unverified release artifact."""
+    matches = []
+    for line in (directory / "SHA256SUMS.txt").read_text(encoding="utf-8").splitlines():
+        digest, name = line.split(maxsplit=1)
+        if name.removeprefix("*") == filename:
+            matches.append(digest)
+    if len(matches) != 1 or not re.fullmatch(r"[0-9a-f]{64}", matches[0]):
+        raise ValueError(f"Missing or ambiguous checksum for {filename}")
+    jar = directory / filename
+    actual = hashlib.sha256(jar.read_bytes()).hexdigest()
+    if actual != matches[0]:
+        raise ValueError(f"SHA256 mismatch for {filename}")
+    print(f"Verified artifact: {filename} SHA256={actual}", flush=True)
+    return jar
+
+
 def packaged_server_command(root: Path, module: str, run_dir: Path,
-                            loader_coordinate: str | None = None) -> list[str]:
+                            loader_coordinate: str | None = None,
+                            artifact_dir: Path | None = None) -> list[str]:
     """Install the matching loader and load the built JAR as an ordinary mod."""
     build = (root / module / "build.gradle").read_text(encoding="utf-8")
 
@@ -390,6 +409,8 @@ def packaged_server_command(root: Path, module: str, run_dir: Path,
     jar = root / module / "build" / "libs" / (
         f"{properties['mod_id']}-{module}.x-{properties['mod_version']}.jar"
     )
+    if artifact_dir is not None:
+        jar = verify_artifact(artifact_dir, jar.name)
     if not jar.is_file():
         raise FileNotFoundError(f"Build {module} before testing its packaged JAR: {jar}")
 
@@ -431,7 +452,7 @@ def packaged_server_command(root: Path, module: str, run_dir: Path,
 
 
 def run_one(module: str, timeout_s: int, packaged: bool = False,
-            loader_coordinate: str | None = None) -> None:
+            loader_coordinate: str | None = None, artifact_dir: Path | None = None) -> None:
     root = Path(__file__).resolve().parents[1]
     # ForgeGradle 6.x (legacy lines) and the 26.x line require different Gradle
     # launchers, so pick the wrapper that matches the module under test.
@@ -455,7 +476,7 @@ def run_one(module: str, timeout_s: int, packaged: bool = False,
     ensure_eula(run_dir)
     write_server_properties(run_dir, pick_free_port())
     (run_dir / "jna").mkdir(parents=True, exist_ok=True)
-    packaged_cmd = packaged_server_command(root, module, run_dir, loader_coordinate) if packaged else None
+    packaged_cmd = packaged_server_command(root, module, run_dir, loader_coordinate, artifact_dir) if packaged else None
 
     token = "token"
     room_id = "!roomid:example.com"
@@ -589,6 +610,8 @@ def run_one(module: str, timeout_s: int, packaged: bool = False,
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--artifact-dir", type=Path,
+                        help="Use built release JARs from this directory; require SHA256SUMS.txt")
     parser.add_argument(
         "--packaged",
         action="store_true",
@@ -611,6 +634,8 @@ def main() -> int:
         help="Per-module startup timeout in seconds",
     )
     args = parser.parse_args()
+    if args.artifact_dir is not None and not args.packaged:
+        parser.error("--artifact-dir requires --packaged")
     if args.modules is None:
         args.modules = list(MODERN_MODULE_EVENT_ALIASES)
         if not args.packaged:
@@ -628,7 +653,8 @@ def main() -> int:
 
     for module in args.modules:
         print(f"=== System test: {module} ===")
-        run_one(module, args.timeout_s, packaged=args.packaged, loader_coordinate=args.loader_coordinate)
+        run_one(module, args.timeout_s, packaged=args.packaged, loader_coordinate=args.loader_coordinate,
+                artifact_dir=args.artifact_dir)
         print()
 
     return 0

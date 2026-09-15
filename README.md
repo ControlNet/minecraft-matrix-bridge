@@ -76,7 +76,7 @@ Build the jars first and use Java 25 (`JAVA_HOME` or `PATH`). Packaged tests ins
 For cross-patch checks, `--loader-coordinate` selects a different loader for a
 single built jar. It recreates only `run-systemtest/<coordinate>`; a default test
 still recreates the entire parent directory, so run the default test first.
-CI runs these four checks after the default 26.x tests:
+For example, these commands test earlier patches locally:
 
 ```bash
 python3 scripts/system_test_all.py --packaged --modules forge-26.1 --loader-coordinate 26.1-62.0.9 --timeout-s 600
@@ -84,6 +84,28 @@ python3 scripts/system_test_all.py --packaged --modules forge-26.1 --loader-coor
 python3 scripts/system_test_all.py --packaged --modules neoforge-26.1 --loader-coordinate 26.1.0.19-beta --timeout-s 600
 python3 scripts/system_test_all.py --packaged --modules neoforge-26.1 --loader-coordinate 26.1.1.15-beta --timeout-s 600
 ```
+
+CI builds each 26.x JAR once and uploads `dist-26`. The reusable
+`.github/workflows/server-tests-26.yml` creates an isolated job for every entry in
+`scripts/server-test-targets.json`: Forge and NeoForge on 26.1, 26.1.1, 26.1.2,
+and 26.2. Every job downloads the same artifact, checks its SHA256, and installs
+that exact JAR without invoking Gradle. There is no workflow-level parallelism
+cap; GitHub runner availability and account limits determine concurrency.
+Failures do not cancel other matrix members, and each member retains its logs.
+
+To reproduce a CI case after building `dist/`, use Java 25 and run:
+
+```bash
+python3 scripts/system_test_all.py --packaged --artifact-dir dist --modules forge-26.1 --loader-coordinate 26.1-62.0.9 --timeout-s 600
+```
+
+Expected: `Verified artifact: ... SHA256=...`, followed by the server test's
+`OK` result. A missing checksum, modified JAR, or server failure exits nonzero.
+`--artifact-dir` requires `SHA256SUMS.txt` and never falls back to a local build.
+Release publishing waits for this same matrix and consumes the same `dist-26`
+artifact. Modern release tags must exactly match matrix coverage; newly released
+Minecraft patches require a pinned test entry and passing tests before publishing.
+Legacy packaged-server coverage is not yet included.
 
 Expected: each exits successfully with an `OK:` line and at least two outgoing
 messages to the mock Matrix service. The 26.1 jar metadata permits Minecraft
