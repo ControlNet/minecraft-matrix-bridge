@@ -2,7 +2,6 @@ package space.controlnet.minecraftmatrixbridge;
 
 import com.mojang.logging.LogUtils;
 import net.minecraftforge.common.MinecraftForge;
-import net.minecraftforge.fml.ModLoadingContext;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.config.ModConfig;
 import org.slf4j.Logger;
@@ -13,7 +12,10 @@ public final class MatrixBridgeMod {
     public static final Logger LOGGER = LogUtils.getLogger();
 
     public MatrixBridgeMod() {
-        ModLoadingContext.get().registerConfig(ModConfig.Type.COMMON, MatrixBridgeConfig.SPEC, MOD_ID + ".toml");
+        // Resolve our container explicitly; this API also supports older loaders
+        // that do not provide constructor-injected loading contexts.
+        var container = ForgeHooks.getModContainer();
+        container.addConfig(new ModConfig(ModConfig.Type.COMMON, MatrixBridgeConfig.SPEC, container, MOD_ID + ".toml"));
         MinecraftForge.EVENT_BUS.register(new ForgeHooks());
         LOGGER.info("Minecraft Matrix Bridge loaded (server-only).");
     }

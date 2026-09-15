@@ -13,7 +13,7 @@ jobs:
     outputs:
       matrix: ${{ steps.targets.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Test artifact verification
         run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Check every published Minecraft patch is accounted for
@@ -37,12 +37,12 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: ${{ matrix.java }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ matrix.artifact }}
           path: dist
@@ -55,7 +55,7 @@ jobs:
           --modules "$MODULE" --loader-coordinate "$LOADER" --timeout-s 600
       - name: Upload logs and artifact checksums
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: server-test-${{ matrix.module }}-${{ matrix.minecraft }}
           path: |

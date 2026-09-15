@@ -17,6 +17,8 @@ import net.minecraftforge.event.server.ServerStoppingEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.common.MinecraftForge;
 import org.slf4j.Logger;
+import net.minecraftforge.fml.ModContainer;
+import net.minecraftforge.fml.ModList;
 
 import com.mojang.brigadier.arguments.StringArgumentType;
 
@@ -32,6 +34,11 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 
 public final class ForgeHooks {
+    static ModContainer getModContainer() {
+        return ModList.get().getModContainerById(MatrixBridgeMod.MOD_ID)
+                .orElseThrow(() -> new IllegalStateException("Missing mod container: " + MatrixBridgeMod.MOD_ID));
+    }
+
     private static final Logger LOGGER = LogUtils.getLogger();
     private static final int MAX_WAIT_TICKS = 100; // 5 seconds max wait for client settings
     // Default ClientInformation values (from ClientInformation.createDefault())

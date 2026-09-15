@@ -24,7 +24,7 @@ jobs:
       legacy: ${{ steps.metadata.outputs.legacy }}
       modern: ${{ steps.metadata.outputs.modern }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Test release metadata resolver
         run: python3 -m unittest discover -s scripts -p 'test_release_metadata.py'
       - name: Resolve all platform tags before publishing
@@ -40,7 +40,7 @@ jobs:
           if [[ "$CHECK_CURSEFORGE" == 'true' ]]; then args+=(--check-curseforge); fi
           python3 scripts/release_metadata.py "${args[@]}" --server-targets scripts/server-test-targets.json --server-exclusions scripts/server-test-exclusions.json --output release-metadata.json
       - name: Save resolved release tags
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-metadata
           path: release-metadata.json
@@ -58,7 +58,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -106,13 +106,13 @@ jobs:
           echo "should_release=$SHOULD_RELEASE" >> "$GITHUB_OUTPUT"
 
       - name: Set up Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "25"
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
 
       - name: Make Gradle wrappers executable
         run: chmod +x ./gradlew ./gradlew-26 ./scripts/build_dist_26.sh
@@ -121,7 +121,7 @@ jobs:
         run: ./scripts/build_dist_26.sh
 
       - name: Upload 26.x dist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist-26
           path: dist/*
@@ -141,18 +141,18 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "21"
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
 
       - name: Make Gradle wrapper executable
         run: chmod +x ./gradlew ./gradlew-26
@@ -237,7 +237,7 @@ jobs:
 
       - name: Upload dist for publisher jobs
         if: ${{ steps.version.outputs.should_release == 'true' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/*
@@ -256,9 +256,9 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.release-metadata.outputs.legacy) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Download dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist
@@ -306,7 +306,7 @@ jobs:
 
     steps:
       - name: Download dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist
@@ -341,18 +341,18 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Download 26.x dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: dist-26
           path: dist
 
       - name: Download release metadata
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: release-metadata
           path: release-metadata
@@ -378,7 +378,7 @@ jobs:
         run: mv dist/SHA256SUMS.txt dist/SHA256SUMS-26.txt
 
       - name: Publish GitHub Release (attach 26.x jars)
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.build-26-dist.outputs.tag }}
           name: ${{ needs.build-26-dist.outputs.tag }}
@@ -402,13 +402,13 @@ jobs:
 
     steps:
       - name: Download legacy dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist
 
       - name: Publish GitHub Release (attach legacy jars)
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.build-and-release.outputs.tag }}
           name: ${{ needs.build-and-release.outputs.tag }}
@@ -434,9 +434,9 @@ jobs:
       matrix: ${{ fromJSON(needs.release-metadata.outputs.modern) }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Download 26.x dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: dist-26
           path: dist
@@ -485,7 +485,7 @@ jobs:
 
     steps:
       - name: Download 26.x dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: dist-26
           path: dist
