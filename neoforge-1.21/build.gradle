@@ -29,7 +29,8 @@ ext {
     minecraft_version = '1.21.1'
     // NeoForge 21.1.x targets Minecraft 1.21.1.
     neo_version = '21.1.218'
-    neo_version_range = '[21.1,)'
+    // Runtime support includes Minecraft 1.21 on NeoForge 21.0.x.
+    neo_version_range = '[21.0,)'
 
     pack_format = 34
 
