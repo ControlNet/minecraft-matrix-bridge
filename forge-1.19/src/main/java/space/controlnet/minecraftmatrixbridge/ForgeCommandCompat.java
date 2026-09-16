@@ -7,8 +7,11 @@ final class ForgeCommandCompat {
     private ForgeCommandCompat() {
     }
 
+    static ForgeMinecraftCompat minecraft() {
+        return new ForgeMinecraftCompat();
+    }
+
     static void sendSuccess(CommandSourceStack source, Component message, boolean broadcastToOps) {
         source.sendSuccess(message, broadcastToOps);
     }
 }
-
