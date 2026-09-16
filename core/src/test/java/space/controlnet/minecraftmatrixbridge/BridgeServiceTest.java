@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -26,6 +27,62 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 public class BridgeServiceTest {
     @TempDir
     Path worldRoot;
+
+    @Test
+    void stopRetainsStateUntilBlockedBootstrapExits() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            BridgeSettings settings = new BridgeSettings(
+                    server.homeserverUrl(), roomId, "token", true, false, true,
+                    "[MC] ", "[Matrix] ", "!mc", 0, 20, 10, 64
+            );
+
+            CountDownLatch callbackEntered = new CountDownLatch(1);
+            CountDownLatch releaseCallback = new CountDownLatch(1);
+            AtomicBoolean blockFirstAnnouncement = new AtomicBoolean(true);
+            McCallbacks callbacks = new McCallbacks() {
+                @Override
+                public void broadcast(String text) {
+                }
+
+                @Override
+                public void announceMatrixConnected(String roomIdOrAlias) {
+                    if (!blockFirstAnnouncement.getAndSet(false)) {
+                        return;
+                    }
+                    callbackEntered.countDown();
+                    boolean released = false;
+                    while (!released) {
+                        try {
+                            released = releaseCallback.await(100, TimeUnit.MILLISECONDS);
+                        } catch (InterruptedException ignored) {
+                            // Deliberately model a callback that cannot stop immediately.
+                        }
+                    }
+                }
+            };
+
+            BridgeService service = new BridgeService();
+            service.start(settings, worldRoot, callbacks);
+            assertTrue(callbackEntered.await(2, TimeUnit.SECONDS));
+
+            service.stop();
+            service.start(settings, worldRoot, callbacks);
+            assertTrue(!service.isRunning(), "restart must wait for the previous lifecycle to exit");
+
+            releaseCallback.countDown();
+            waitUntil(() -> !service.isReady(), Duration.ofSeconds(1));
+            service.stop();
+
+            service.start(settings, worldRoot, callbacks);
+            try {
+                waitUntil(service::isReady, Duration.ofSeconds(2));
+            } finally {
+                service.stop();
+            }
+        }
+    }
 
     @Test
     void forwardsMatrixMessagesAndPersistsSince() throws Exception {

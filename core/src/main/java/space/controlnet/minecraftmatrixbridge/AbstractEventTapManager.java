@@ -4,16 +4,30 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
 public abstract class AbstractEventTapManager<E> {
     private static final Logger LOGGER = Logger.getLogger("MatrixBridge");
+
+    private static final ClassValue<ConcurrentHashMap<String, CompletableFuture<IndexBuild>>> EVENT_INDEX_CACHE =
+            new ClassValue<>() {
+                @Override
+                protected ConcurrentHashMap<String, CompletableFuture<IndexBuild>> computeValue(Class<?> type) {
+                    return new ConcurrentHashMap<>();
+                }
+            };
+    private static final ConcurrentHashMap<ListenerKey, ListenerSlot<?>> LISTENER_SLOTS =
+            new ConcurrentHashMap<>();
 
     private static final int DEFAULT_MAX_TAPS = 10;
     private static final long DEFAULT_THROTTLE_MS = 1000;
@@ -22,22 +36,67 @@ public abstract class AbstractEventTapManager<E> {
 
     private final BridgeService bridgeService;
     private final AtomicReference<EventIndex> eventIndexRef = new AtomicReference<>(null);
-    private final CompletableFuture<EventIndex> eventIndexFuture;
+    private final AtomicReference<Throwable> eventIndexFailureRef = new AtomicReference<>(null);
+    private final CompletableFuture<IndexBuild> eventIndexFuture;
+    private final AtomicBoolean active = new AtomicBoolean(true);
 
     private final int maxActiveTaps;
     private final long defaultThrottleMs;
 
     private final ConcurrentHashMap<String, SubscriptionBucket> subscriptions = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Class<?>, Boolean> registeredListeners = new ConcurrentHashMap<>();
+    private final Set<ListenerSlot<E>> listenerSlots = ConcurrentHashMap.newKeySet();
 
     protected AbstractEventTapManager(BridgeService bridgeService, int maxActiveTaps, long defaultThrottleMs) {
+        this(bridgeService, maxActiveTaps, defaultThrottleMs, null);
+    }
+
+    AbstractEventTapManager(
+            BridgeService bridgeService,
+            int maxActiveTaps,
+            long defaultThrottleMs,
+            CompletableFuture<EventIndex> suppliedIndexFuture
+    ) {
         this.bridgeService = bridgeService;
         this.maxActiveTaps = maxActiveTaps > 0 ? maxActiveTaps : DEFAULT_MAX_TAPS;
         this.defaultThrottleMs = defaultThrottleMs > 0 ? defaultThrottleMs : DEFAULT_THROTTLE_MS;
-        this.eventIndexFuture = CompletableFuture.supplyAsync(() -> {
-            EventIndex index = EventIndex.scanClasspath(getClass().getClassLoader(), getLoaderName());
-            eventIndexRef.set(index);
-            return index;
+        this.eventIndexFuture = suppliedIndexFuture == null
+                ? sharedEventIndexFuture(getClass(), getLoaderName())
+                : observeIndexFuture(suppliedIndexFuture, getLoaderName());
+        this.eventIndexFuture.thenAccept(build -> {
+            eventIndexFailureRef.set(build.failure);
+            eventIndexRef.set(build.index);
+        });
+    }
+
+    private static CompletableFuture<IndexBuild> sharedEventIndexFuture(Class<?> managerType, String loaderName) {
+        ConcurrentHashMap<String, CompletableFuture<IndexBuild>> cache = EVENT_INDEX_CACHE.get(managerType);
+        return cache.computeIfAbsent(loaderName, key -> {
+            CompletableFuture<EventIndex> scan = CompletableFuture.supplyAsync(
+                    () -> EventIndex.scanClasspath(managerType.getClassLoader(), loaderName));
+            CompletableFuture<IndexBuild> observed = observeIndexFuture(scan, loaderName);
+            observed.thenAcceptAsync(build -> {
+                if (build.failure != null) {
+                    cache.remove(key, observed);
+                }
+            });
+            return observed;
+        });
+    }
+
+    private static CompletableFuture<IndexBuild> observeIndexFuture(
+            CompletableFuture<EventIndex> source,
+            String loaderName
+    ) {
+        return source.handle((index, failure) -> {
+            if (failure == null) {
+                return new IndexBuild(index == null ? EventIndex.empty() : index, null);
+            }
+            Throwable cause = failure instanceof CompletionException && failure.getCause() != null
+                    ? failure.getCause()
+                    : failure;
+            LOGGER.log(Level.SEVERE, "Event index build failed for " + loaderName, cause);
+            return new IndexBuild(EventIndex.empty(), cause);
         });
     }
 
@@ -51,15 +110,26 @@ public abstract class AbstractEventTapManager<E> {
 
     protected abstract void registerEventListener(Class<E> eventClass, Consumer<E> listener);
 
+    /**
+     * Identity of the event bus used to register listeners. Managers created by
+     * reload for the same bus share one dispatcher per event class.
+     */
+    protected Object getListenerRegistryKey() {
+        return getClass();
+    }
+
     public boolean isIndexReady() {
         return eventIndexRef.get() != null;
     }
 
-    private EventIndex getEventIndex() {
+    EventIndex getEventIndex() {
         return eventIndexRef.get();
     }
 
     public String handleCommand(String[] args) {
+        if (!active.get()) {
+            return "Event tap manager is no longer active.";
+        }
         if (args == null || args.length == 0) {
             return getHelpText();
         }
@@ -80,6 +150,10 @@ public abstract class AbstractEventTapManager<E> {
             return "Usage: event on <eventName> [filter] [duration]";
         }
 
+        String indexFailure = getIndexFailureMessage();
+        if (indexFailure != null) {
+            return indexFailure;
+        }
         EventIndex index = getEventIndex();
         if (index == null) {
             return "Event index is still building. Please try again in a few seconds.";
@@ -152,10 +226,15 @@ public abstract class AbstractEventTapManager<E> {
                 throttleMs
         );
 
+        try {
+            ensureListenerRegistered(eventClass);
+        } catch (RuntimeException | LinkageError e) {
+            LOGGER.log(Level.WARNING, "Failed to register event listener for " + fqcn, e);
+            return "Failed to register event listener for: " + fqcn + ". Check the server log for details.";
+        }
+
         SubscriptionBucket bucket = subscriptions.computeIfAbsent(fqcn, k -> new SubscriptionBucket());
         bucket.add(sub);
-
-        ensureListenerRegistered(eventClass);
 
         String durationDisplay = duration.toDisplayString();
         String filterDisplay = normalizedFilter == null ? "(none)" : "'" + filter + "'";
@@ -235,6 +314,10 @@ public abstract class AbstractEventTapManager<E> {
             return "Usage: event search <query>";
         }
 
+        String indexFailure = getIndexFailureMessage();
+        if (indexFailure != null) {
+            return indexFailure;
+        }
         EventIndex index = getEventIndex();
         if (index == null) {
             return "Event index is still building. Please try again in a few seconds.";
@@ -273,22 +356,55 @@ public abstract class AbstractEventTapManager<E> {
         return count;
     }
 
+    private String getIndexFailureMessage() {
+        Throwable failure = eventIndexFailureRef.get();
+        if (failure == null) {
+            return null;
+        }
+        return "Event index failed to build. Check the server log for details.";
+    }
+
+    /**
+     * Deactivates this manager and releases it from shared event dispatchers.
+     */
+    public void close() {
+        if (!active.getAndSet(false)) {
+            return;
+        }
+        for (ListenerSlot<E> slot : listenerSlots) {
+            slot.deactivate(this);
+        }
+        listenerSlots.clear();
+        subscriptions.clear();
+        registeredListeners.clear();
+    }
+
     @SuppressWarnings("unchecked")
     private void ensureListenerRegistered(Class<?> eventClass) {
-        if (registeredListeners.containsKey(eventClass)) {
+        if (!active.get() || registeredListeners.putIfAbsent(eventClass, true) != null) {
             return;
         }
 
-        registeredListeners.put(eventClass, true);
-
-        // A parent listener also receives subtype instances. Dispatch only the
-        // bucket this listener owns, not the runtime class or every ancestor:
-        // the bus invokes parent and child listeners independently.
-        registerEventListener((Class<E>) eventClass, event -> onEvent(eventClass.getName(), event));
-        LOGGER.fine("Registered event listener for: " + eventClass.getName());
+        try {
+            ListenerKey key = new ListenerKey(getListenerRegistryKey(), eventClass);
+            ListenerSlot<E> slot = (ListenerSlot<E>) LISTENER_SLOTS.computeIfAbsent(key, ignored -> {
+                ListenerSlot<E> created = new ListenerSlot<>(eventClass.getName());
+                registerEventListener((Class<E>) eventClass, created::dispatch);
+                LOGGER.fine("Registered shared event listener for: " + eventClass.getName());
+                return created;
+            });
+            slot.activate(this);
+            listenerSlots.add(slot);
+        } catch (RuntimeException | Error e) {
+            registeredListeners.remove(eventClass);
+            throw e;
+        }
     }
 
     private void onEvent(String fqcn, E event) {
+        if (!active.get()) {
+            return;
+        }
         SubscriptionBucket bucket = subscriptions.get(fqcn);
         if (bucket == null) {
             return;
@@ -323,11 +439,67 @@ public abstract class AbstractEventTapManager<E> {
         bucket.cleanupExpired(nowMs);
     }
 
-    private static Class<?> tryLoadClass(String fqcn) {
+    private Class<?> tryLoadClass(String fqcn) {
         try {
-            return Class.forName(fqcn);
-        } catch (ClassNotFoundException | NoClassDefFoundError e) {
+            return Class.forName(fqcn, false, getClass().getClassLoader());
+        } catch (ClassNotFoundException | LinkageError | SecurityException e) {
             return null;
+        }
+    }
+
+    private static final class IndexBuild {
+        final EventIndex index;
+        final Throwable failure;
+
+        IndexBuild(EventIndex index, Throwable failure) {
+            this.index = index;
+            this.failure = failure;
+        }
+    }
+
+    private static final class ListenerKey {
+        private final Object registry;
+        private final Class<?> eventClass;
+
+        ListenerKey(Object registry, Class<?> eventClass) {
+            this.registry = registry;
+            this.eventClass = eventClass;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            return other instanceof ListenerKey key
+                    && registry == key.registry
+                    && eventClass == key.eventClass;
+        }
+
+        @Override
+        public int hashCode() {
+            return 31 * System.identityHashCode(registry) + System.identityHashCode(eventClass);
+        }
+    }
+
+    private static final class ListenerSlot<T> {
+        private final String eventClassName;
+        private final AtomicReference<AbstractEventTapManager<T>> manager = new AtomicReference<>();
+
+        ListenerSlot(String eventClassName) {
+            this.eventClassName = eventClassName;
+        }
+
+        void activate(AbstractEventTapManager<T> nextManager) {
+            manager.set(nextManager);
+        }
+
+        void deactivate(AbstractEventTapManager<T> oldManager) {
+            manager.compareAndSet(oldManager, null);
+        }
+
+        void dispatch(T event) {
+            AbstractEventTapManager<T> current = manager.get();
+            if (current != null) {
+                current.onEvent(eventClassName, event);
+            }
         }
     }
 

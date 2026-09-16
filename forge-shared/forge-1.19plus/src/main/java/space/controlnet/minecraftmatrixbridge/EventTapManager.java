@@ -36,6 +36,11 @@ public final class EventTapManager extends AbstractEventTapManager<Object> {
     }
 
     @Override
+    protected Object getListenerRegistryKey() {
+        return eventBus;
+    }
+
+    @Override
     protected void registerEventListener(Class<Object> eventClass, Consumer<Object> listener) {
         eventBus.listen(eventClass, listener);
     }

@@ -3,7 +3,6 @@ import hashlib
 import json
 import io
 import queue
-import threading
 from pathlib import Path
 import tempfile
 import unittest
@@ -72,11 +71,21 @@ class ArtifactTests(unittest.TestCase):
                 system_test_all.installed_server_command("java", self.directory, coordinate)
 
     def test_early_event_index_message_is_not_lost_by_bridge_readiness(self):
-        ready = threading.Event()
+        probe = system_test_all.EventIndexProbe()
         output = queue.Queue()
-        system_test_all._reader_thread(io.StringIO("Event index built in 6 ms\n"), output, ready)
+        summary = "Event index built in 6 ms: scanned 2 jars, 100 classes, found 20 events\n"
+        system_test_all._reader_thread(io.StringIO(summary), output, probe)
         output.get_nowait()  # Bridge readiness may consume the log before the event probe.
-        system_test_all.wait_for_event_index_ready("forge-1.18", None, output, timeout_s=1, ready=ready)
+        system_test_all.wait_for_event_index_ready("forge-1.18", None, output, timeout_s=1, probe=probe)
+
+    def test_empty_event_index_is_rejected(self):
+        probe = system_test_all.EventIndexProbe()
+        probe.record("Event index built in 5 ms: scanned 0 jars, 0 classes, found 0 events\n")
+
+        with self.assertRaisesRegex(RuntimeError, "event index is empty"):
+            system_test_all.wait_for_event_index_ready(
+                "neoforge-1.21", None, queue.Queue(), timeout_s=1, probe=probe
+            )
 
     def test_release_cannot_advertise_untested_patch(self):
         result = {"modern": {"include": [{"module": "forge-26.1", "game_versions": '["26.1","26.1.1"]'}]}}

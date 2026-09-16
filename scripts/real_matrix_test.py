@@ -418,14 +418,14 @@ class SynapseTestServer:
 def _reader_thread(
     stream,
     out_queue: "queue.Queue[str]",
-    event_index_ready: threading.Event,
+    event_index_probe: system_test_all.EventIndexProbe,
     bridge_ready: threading.Event,
     redactions: list[str],
 ) -> None:
     for raw_line in iter(stream.readline, ""):
         line = redact_text(raw_line, redactions)
         if "Event index built in" in line:
-            event_index_ready.set()
+            event_index_probe.record(line)
         if "MatrixBridge started as" in line:
             bridge_ready.set()
         out_queue.put(line)
@@ -553,14 +553,14 @@ def run_one(
         assert proc.stdin is not None
 
         output: "queue.Queue[str]" = queue.Queue()
-        event_index_ready = threading.Event()
+        event_index_probe = system_test_all.EventIndexProbe()
         bridge_ready = threading.Event()
         reader = threading.Thread(
             target=_reader_thread,
             args=(
                 proc.stdout,
                 output,
-                event_index_ready,
+                event_index_probe,
                 bridge_ready,
                 synapse.secrets_to_redact,
             ),
@@ -606,7 +606,7 @@ def run_one(
             proc,
             output,
             timeout_s=60,
-            ready=event_index_ready,
+            probe=event_index_probe,
         )
         api.send_text(fixture.alice_token, fixture.room_id, "!mc event list")
         _, event_reply = api.wait_for_text(

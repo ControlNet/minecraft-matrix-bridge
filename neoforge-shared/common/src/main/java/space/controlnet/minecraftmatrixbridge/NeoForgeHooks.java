@@ -42,12 +42,21 @@ public final class NeoForgeHooks {
     private volatile String connectedRoomIdOrAlias = "";
     private final ConcurrentHashMap<UUID, Integer> pendingConnectedNoticeTicks = new ConcurrentHashMap<>();
 
+    private void closeEventTapManager() {
+        EventTapManager manager = eventTapManager;
+        eventTapManager = null;
+        if (manager != null) {
+            manager.close();
+        }
+    }
+
     @SubscribeEvent
     public void onServerStarted(ServerStartedEvent event) {
         MinecraftServer server = event.getServer();
         this.runningServer = server;
         Path worldRoot = server.getWorldPath(LevelResource.ROOT);
 
+        closeEventTapManager();
         if (bridgeService != null) {
             bridgeService.stop();
         }
@@ -143,7 +152,7 @@ public final class NeoForgeHooks {
     public void onServerStopping(ServerStoppingEvent event) {
         BridgeService service = bridgeService;
         bridgeService = null;
-        eventTapManager = null;
+        closeEventTapManager();
         runningServer = null;
         connectedRoomIdOrAlias = "";
         pendingConnectedNoticeTicks.clear();
@@ -328,7 +337,7 @@ public final class NeoForgeHooks {
                     if (bridgeService != null) {
                         bridgeService.stop();
                     }
-                    eventTapManager = null;
+                    closeEventTapManager();
                     bridgeService = new BridgeService();
                     callbacks = new McCallbacks() {
                         @Override

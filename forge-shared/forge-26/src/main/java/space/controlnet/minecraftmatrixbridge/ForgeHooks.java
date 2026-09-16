@@ -29,6 +29,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -48,6 +49,8 @@ public final class ForgeHooks {
     // Default ClientInformation values (from ClientInformation.createDefault())
     private static final int DEFAULT_VIEW_DISTANCE = 2;
     private static final int DEFAULT_MODEL_CUSTOMISATION = 0;
+    private static final ConcurrentHashMap<Class<?>, Method> VIEW_DISTANCE_METHODS = new ConcurrentHashMap<>();
+    private static final Set<Class<?>> MISSING_VIEW_DISTANCE_METHODS = ConcurrentHashMap.newKeySet();
 
     private BridgeService bridgeService;
     private McCallbacks callbacks;
@@ -56,12 +59,21 @@ public final class ForgeHooks {
     private volatile String connectedRoomIdOrAlias = "";
     private final ConcurrentHashMap<UUID, Integer> pendingConnectedNoticeTicks = new ConcurrentHashMap<>();
 
+    private void closeEventTapManager() {
+        EventTapManager manager = eventTapManager;
+        eventTapManager = null;
+        if (manager != null) {
+            manager.close();
+        }
+    }
+
     @SubscribeEvent
     public void onServerStarted(ServerStartedEvent event) {
         MinecraftServer server = event.getServer();
         this.runningServer = server;
         Path worldRoot = server.getWorldPath(LevelResource.ROOT);
 
+        closeEventTapManager();
         if (bridgeService != null) {
             bridgeService.stop();
         }
@@ -156,7 +168,7 @@ public final class ForgeHooks {
     public void onServerStopping(ServerStoppingEvent event) {
         BridgeService service = bridgeService;
         bridgeService = null;
-        eventTapManager = null;
+        closeEventTapManager();
         runningServer = null;
         connectedRoomIdOrAlias = "";
         pendingConnectedNoticeTicks.clear();
@@ -292,41 +304,45 @@ public final class ForgeHooks {
     }
 
     private static int getPlayerViewDistance(ServerPlayer player) {
-        // Try different method names across MC versions
-        try {
-            Method m = player.getClass().getMethod("requestedViewDistance");
-            Object res = m.invoke(player);
-            if (res instanceof Integer i) {
-                return i;
+        Class<?> playerType = player.getClass();
+        Method method = VIEW_DISTANCE_METHODS.get(playerType);
+        if (method == null && !MISSING_VIEW_DISTANCE_METHODS.contains(playerType)) {
+            method = findViewDistanceMethod(playerType);
+            if (method == null) {
+                MISSING_VIEW_DISTANCE_METHODS.add(playerType);
+                return DEFAULT_VIEW_DISTANCE;
             }
-        } catch (Exception ignored) {
+            Method existing = VIEW_DISTANCE_METHODS.putIfAbsent(playerType, method);
+            if (existing != null) {
+                method = existing;
+            }
         }
-        try {
-            // Older versions might use clientViewDistance or similar
-            Method m = player.getClass().getMethod("getRequestedViewDistance");
-            Object res = m.invoke(player);
-            if (res instanceof Integer i) {
-                return i;
+        if (method != null) {
+            try {
+                Object result = method.invoke(player);
+                if (result instanceof Integer value) {
+                    return value;
+                }
+            } catch (ReflectiveOperationException | RuntimeException ignored) {
+                VIEW_DISTANCE_METHODS.remove(playerType, method);
+                MISSING_VIEW_DISTANCE_METHODS.add(playerType);
             }
-        } catch (Exception ignored) {
         }
         return DEFAULT_VIEW_DISTANCE;
     }
 
-    private static int getPlayerModelCustomisation(ServerPlayer player) {
-        try {
-            // Get the entity data for model customisation
-            // This is stored in the synched entity data
-            Method getEntityData = player.getClass().getMethod("getEntityData");
-            Object entityData = getEntityData.invoke(player);
-            if (entityData != null) {
-                // The model customisation is typically a byte value
-                // We need to find the DATA_PLAYER_MODE_CUSTOMISATION accessor
-                // This is complex due to obfuscation, so we'll use a simpler heuristic
+    private static Method findViewDistanceMethod(Class<?> playerType) {
+        for (String methodName : new String[]{"requestedViewDistance", "getRequestedViewDistance"}) {
+            try {
+                return playerType.getMethod(methodName);
+            } catch (NoSuchMethodException ignored) {
+                // Try the next version-specific name.
             }
-        } catch (Exception ignored) {
         }
-        // Fall back to checking if language is non-default as additional heuristic
+        return null;
+    }
+
+    private static int getPlayerModelCustomisation(ServerPlayer player) {
         String lang = getPlayerLanguage(player);
         if (!"en_us".equals(lang)) {
             return 1; // Non-default, so settings were received
@@ -383,7 +399,7 @@ public final class ForgeHooks {
                     if (bridgeService != null) {
                         bridgeService.stop();
                     }
-                    eventTapManager = null; // Clear old event tap manager
+                    closeEventTapManager();
                     bridgeService = new BridgeService();
                     callbacks = new McCallbacks() {
                         @Override

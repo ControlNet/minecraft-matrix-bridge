@@ -35,6 +35,31 @@ MODULE_EVENT_ALIASES = {
     "neoforge-1.21": "net.neoforged.neoforge.event.tick.ServerTickEvent$Post",
 }
 
+EVENT_INDEX_SUMMARY = re.compile(
+    r"Event index built in \d+ ms: scanned (\d+) jars, (\d+) classes, found (\d+) events"
+)
+
+
+class EventIndexProbe:
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.summary: str | None = None
+
+    def record(self, line: str) -> None:
+        self.summary = line
+        self.done.set()
+
+
+def validate_event_index_summary(module: str, line: str | None) -> None:
+    match = EVENT_INDEX_SUMMARY.search(line or "")
+    if match is None:
+        raise RuntimeError(f"{module}: malformed event index completion message: {line!r}")
+    jars, classes, events = (int(value) for value in match.groups())
+    if jars < 1 or classes < 1 or events < 1:
+        raise RuntimeError(
+            f"{module}: event index is empty: jars={jars}, classes={classes}, events={events}"
+        )
+
 
 @dataclass
 class MatrixCounters:
@@ -355,11 +380,12 @@ def wait_for_event_index_ready(
     proc: subprocess.Popen[str],
     out_queue: "queue.Queue[str]",
     timeout_s: int,
-    ready: threading.Event | None = None,
+    probe: EventIndexProbe | None = None,
 ) -> None:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        if ready is not None and ready.is_set():
+        if probe is not None and probe.done.is_set():
+            validate_event_index_summary(module, probe.summary)
             return
         try:
             line = out_queue.get(timeout=0.5)
@@ -371,15 +397,16 @@ def wait_for_event_index_ready(
         if not line.startswith("Downloading: "):
             sys.stdout.write(f"[{module}] {line}")
         if "Event index built in" in line:
+            validate_event_index_summary(module, line)
             return
 
     raise RuntimeError(f"{module}: event index did not finish building before timeout")
 
 
-def _reader_thread(stream, out_queue: "queue.Queue[str]", event_index_ready: threading.Event | None = None) -> None:
+def _reader_thread(stream, out_queue: "queue.Queue[str]", event_index_probe: EventIndexProbe | None = None) -> None:
     for line in iter(stream.readline, ""):
-        if event_index_ready is not None and "Event index built in" in line:
-            event_index_ready.set()
+        if event_index_probe is not None and "Event index built in" in line:
+            event_index_probe.record(line)
         out_queue.put(line)
     stream.close()
 
@@ -566,8 +593,8 @@ def run_one(module: str, timeout_s: int, packaged: bool = False,
         assert proc.stdin is not None
 
         q: "queue.Queue[str]" = queue.Queue()
-        event_index_ready = threading.Event()
-        t = threading.Thread(target=_reader_thread, args=(proc.stdout, q, event_index_ready), daemon=True)
+        event_index_probe = EventIndexProbe()
+        t = threading.Thread(target=_reader_thread, args=(proc.stdout, q, event_index_probe), daemon=True)
         t.start()
 
         started = False
@@ -595,7 +622,7 @@ def run_one(module: str, timeout_s: int, packaged: bool = False,
         state = wait_for_bridge_ready(module, run_dir, mock, proc, q, timeout_s=30)
 
         if module in MODULE_EVENT_ALIASES:
-            wait_for_event_index_ready(module, proc, q, timeout_s=60, ready=event_index_ready)
+            wait_for_event_index_ready(module, proc, q, timeout_s=60, probe=event_index_probe)
             # Brigadier requires quotes around nested class names containing '$'.
             event_alias = json.dumps(event_tap_alias_for_module(module))
             proc.stdin.write(f"matrix event on {event_alias}\n")

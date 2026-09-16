@@ -4,8 +4,9 @@ import java.io.DataInputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
-import java.net.URISyntaxException;
+import java.net.URI;
 import java.net.URL;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Enumeration;
@@ -107,30 +108,28 @@ public final class EventIndex {
         Set<String> scannedJars = new HashSet<>();
         int jarCount = 0;
         int classCount = 0;
+        int unresolvableManifestCount = 0;
 
         try {
             // Get all JAR URLs from the classpath
             Enumeration<URL> resources = classLoader.getResources("META-INF/MANIFEST.MF");
             while (resources.hasMoreElements()) {
                 URL manifestUrl = resources.nextElement();
-                String urlStr = manifestUrl.toString();
-
-                // Extract JAR path from jar:file:/path/to/file.jar!/META-INF/MANIFEST.MF
-                if (urlStr.startsWith("jar:file:")) {
-                    int bangIdx = urlStr.indexOf("!/");
-                    if (bangIdx > 0) {
-                        String jarPath = urlStr.substring(9, bangIdx); // Skip "jar:file:"
-                        if (!scannedJars.contains(jarPath)) {
-                            scannedJars.add(jarPath);
-                            File jarFile = new File(jarPath);
-                            if (jarFile.exists() && jarFile.isFile()) {
-                                int scanned = scanJarFile(jarFile, classInfoMap);
-                                if (scanned > 0) {
-                                    jarCount++;
-                                    classCount += scanned;
-                                }
-                            }
+                File jarFile = jarFileFromManifestUrl(manifestUrl.toExternalForm());
+                if (jarFile == null) {
+                    unresolvableManifestCount++;
+                    continue;
+                }
+                String jarPath = jarFile.getAbsolutePath();
+                if (scannedJars.add(jarPath)) {
+                    if (jarFile.isFile()) {
+                        int scanned = scanJarFile(jarFile, classInfoMap);
+                        if (scanned > 0) {
+                            jarCount++;
+                            classCount += scanned;
                         }
+                    } else {
+                        LOGGER.fine("Event index manifest resolved to a missing JAR: " + jarFile);
                     }
                 }
             }
@@ -138,10 +137,10 @@ public final class EventIndex {
             // Also try to scan from java.class.path
             String classPath = System.getProperty("java.class.path", "");
             for (String path : classPath.split(File.pathSeparator)) {
-                if (path.endsWith(".jar") && !scannedJars.contains(path)) {
-                    scannedJars.add(path);
+                if (path.endsWith(".jar")) {
                     File jarFile = new File(path);
-                    if (jarFile.exists() && jarFile.isFile()) {
+                    String jarPath = jarFile.getAbsolutePath();
+                    if (scannedJars.add(jarPath) && jarFile.isFile()) {
                         int scanned = scanJarFile(jarFile, classInfoMap);
                         if (scanned > 0) {
                             jarCount++;
@@ -188,8 +187,51 @@ public final class EventIndex {
         LOGGER.info("Event index built in " + elapsedMs + " ms: scanned " + jarCount + " jars, " +
                 classCount + " classes, found " + eventCount + " events (" +
                 bySimpleName.size() + " simple names, " + byAlias.size() + " aliases)");
+        if (jarCount == 0) {
+            LOGGER.warning("Event index found no scannable JARs for " + loaderName
+                    + " (unresolvable manifests=" + unresolvableManifestCount + "). Event search will be unavailable.");
+        } else if (eventCount == 0) {
+            LOGGER.warning("Event index scanned JARs but found no Forge/NeoForge event classes for " + loaderName + ".");
+        }
 
         return new EventIndex(bySimpleName, byAlias, loaderName, System.currentTimeMillis(), eventCount);
+    }
+
+    /**
+     * Resolves the containing JAR from standard {@code jar:file:} manifests and
+     * SecureJarHandler {@code union:} manifests without losing URL encoding.
+     */
+    static File jarFileFromManifestUrl(String manifestUrl) {
+        if (manifestUrl == null || manifestUrl.isBlank()) {
+            return null;
+        }
+        int bangIndex = manifestUrl.indexOf("!/");
+        if (bangIndex < 0) {
+            return null;
+        }
+
+        String container = manifestUrl.substring(0, bangIndex);
+        while (container.startsWith("jar:")) {
+            container = container.substring("jar:".length());
+        }
+
+        if (container.startsWith("union:")) {
+            container = container.substring("union:".length());
+            container = container.replaceFirst("(?i)%23\\d+$", "");
+            if (!container.startsWith("file:")) {
+                container = "file:" + container;
+            }
+        }
+        if (!container.startsWith("file:")) {
+            return null;
+        }
+
+        try {
+            return Path.of(URI.create(container)).toFile();
+        } catch (IllegalArgumentException e) {
+            LOGGER.fine("Failed to resolve event index manifest URL '" + manifestUrl + "': " + e.getMessage());
+            return null;
+        }
     }
 
     /**

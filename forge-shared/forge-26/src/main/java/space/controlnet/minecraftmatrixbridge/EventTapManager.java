@@ -26,6 +26,11 @@ public final class EventTapManager extends AbstractEventTapManager<Event> {
         return Event.class;
     }
 
+    @Override
+    protected Object getListenerRegistryKey() {
+        return eventBus;
+    }
+
     @SuppressWarnings("unchecked")
     @Override
     protected void registerEventListener(Class<Event> eventClass, Consumer<Event> listener) {

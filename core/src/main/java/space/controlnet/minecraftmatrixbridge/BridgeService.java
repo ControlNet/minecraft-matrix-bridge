@@ -50,6 +50,11 @@ public final class BridgeService {
             if (running.get()) {
                 return;
             }
+            reapTerminatedThreads();
+            if (bootstrapThread != null || senderThread != null || syncThread != null) {
+                LOGGER.warning("MatrixBridge start ignored because the previous lifecycle is still stopping.");
+                return;
+            }
 
             this.settings = settings;
             this.callbacks = callbacks;
@@ -107,19 +112,37 @@ public final class BridgeService {
         join(syt);
 
         synchronized (lifecycleLock) {
-            bootstrapThread = null;
-            senderThread = null;
-            syncThread = null;
-            outgoingQueue = null;
-            matrixClient = null;
-            sinceStore = null;
-            dedup = null;
-            callbacks = null;
-            settings = null;
-            selfUserId = "";
-            resolvedRoomId = "";
-            announcedConnected = false;
+            reapTerminatedThreads();
+            if (bootstrapThread == null && senderThread == null && syncThread == null) {
+                clearLifecycleState();
+            } else {
+                LOGGER.warning("MatrixBridge worker threads did not stop within 2 seconds; retaining lifecycle state until they exit.");
+            }
         }
+    }
+
+    private void reapTerminatedThreads() {
+        if (bootstrapThread != null && !bootstrapThread.isAlive()) {
+            bootstrapThread = null;
+        }
+        if (senderThread != null && !senderThread.isAlive()) {
+            senderThread = null;
+        }
+        if (syncThread != null && !syncThread.isAlive()) {
+            syncThread = null;
+        }
+    }
+
+    private void clearLifecycleState() {
+        outgoingQueue = null;
+        matrixClient = null;
+        sinceStore = null;
+        dedup = null;
+        callbacks = null;
+        settings = null;
+        selfUserId = "";
+        resolvedRoomId = "";
+        announcedConnected = false;
     }
 
     public boolean enqueueMcMessage(String formattedText) {
@@ -179,29 +202,40 @@ public final class BridgeService {
                 return;
             }
 
-            if (settings.enableMcToMatrix) {
-                senderThread = new Thread(this::senderLoop, "MatrixBridge-Sender");
-                senderThread.start();
-            }
-            if (settings.enableMatrixToMc) {
-                syncThread = new Thread(this::syncLoop, "MatrixBridge-Sync");
-                syncThread.start();
+            BridgeSettings activeSettings;
+            McCallbacks activeCallbacks;
+            synchronized (lifecycleLock) {
+                if (!running.get() || settings == null) {
+                    return;
+                }
+                activeSettings = settings;
+                activeCallbacks = callbacks;
+                if (activeSettings.enableMcToMatrix) {
+                    senderThread = new Thread(this::senderLoop, "MatrixBridge-Sender");
+                    senderThread.start();
+                }
+                if (activeSettings.enableMatrixToMc) {
+                    syncThread = new Thread(this::syncLoop, "MatrixBridge-Sync");
+                    syncThread.start();
+                }
+                ready.set(true);
             }
 
-            ready.set(true);
-            if (settings.roomId != null && settings.roomId.startsWith("#") && !settings.roomId.equals(roomId)) {
-                LOGGER.info("MatrixBridge started as " + userId + " (room alias " + settings.roomId + " -> " + roomId + ").");
+            if (!running.get()) {
+                return;
+            }
+            if (activeSettings.roomId != null && activeSettings.roomId.startsWith("#") && !activeSettings.roomId.equals(roomId)) {
+                LOGGER.info("MatrixBridge started as " + userId + " (room alias " + activeSettings.roomId + " -> " + roomId + ").");
             } else {
                 LOGGER.info("MatrixBridge started as " + userId + " (room " + roomId + ").");
             }
 
-            McCallbacks cb = callbacks;
-            if (cb != null && settings.announceConnected && !announcedConnected) {
+            if (activeCallbacks != null && activeSettings.announceConnected && !announcedConnected) {
                 announcedConnected = true;
-                String displayRoom = settings.roomId != null && settings.roomId.startsWith("#")
-                        ? settings.roomId
+                String displayRoom = activeSettings.roomId != null && activeSettings.roomId.startsWith("#")
+                        ? activeSettings.roomId
                         : roomId;
-                cb.announceMatrixConnected(displayRoom);
+                activeCallbacks.announceMatrixConnected(displayRoom);
             }
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "MatrixBridge bootstrap failed: " + e, e);
