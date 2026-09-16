@@ -2,7 +2,6 @@ package space.controlnet.minecraftmatrixbridge;
 
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
-import com.mojang.logging.LogUtils;
 import net.minecraft.Util;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
@@ -21,6 +20,7 @@ import net.minecraftforge.event.server.ServerStartedEvent;
 import net.minecraftforge.event.server.ServerStoppingEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import net.minecraftforge.fml.ModContainer;
 import net.minecraftforge.fml.ModList;
 
@@ -41,7 +41,7 @@ public final class ForgeHooks {
                 .orElseThrow(() -> new IllegalStateException("Missing mod container: " + MatrixBridgeMod.MOD_ID));
     }
 
-    private static final Logger LOGGER = LogUtils.getLogger();
+    private static final Logger LOGGER = LoggerFactory.getLogger(ForgeHooks.class);
     private static final int MAX_WAIT_TICKS = 100; // 5 seconds max wait for client settings
     // Default ClientInformation values (from ClientInformation.createDefault())
     private static final int DEFAULT_VIEW_DISTANCE = 2;

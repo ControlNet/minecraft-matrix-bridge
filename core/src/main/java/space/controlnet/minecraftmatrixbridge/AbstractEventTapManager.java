@@ -277,12 +277,14 @@ public abstract class AbstractEventTapManager<E> {
 
         registeredListeners.put(eventClass, true);
 
-        registerEventListener((Class<E>) eventClass, this::onEvent);
+        // A parent listener also receives subtype instances. Dispatch only the
+        // bucket this listener owns, not the runtime class or every ancestor:
+        // the bus invokes parent and child listeners independently.
+        registerEventListener((Class<E>) eventClass, event -> onEvent(eventClass.getName(), event));
         LOGGER.fine("Registered event listener for: " + eventClass.getName());
     }
 
-    protected void onEvent(E event) {
-        String fqcn = event.getClass().getName();
+    private void onEvent(String fqcn, E event) {
         SubscriptionBucket bucket = subscriptions.get(fqcn);
         if (bucket == null) {
             return;

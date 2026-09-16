@@ -6,6 +6,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CiMaintenanceTests(unittest.TestCase):
+    def test_oldest_forge_sources_do_not_require_mojang_logging(self):
+        for directory in ("forge-shared/common/src/main/java", "forge-1.18/src/main/java"):
+            for path in (ROOT / directory).rglob("*.java"):
+                self.assertNotIn("com.mojang.logging.LogUtils", path.read_text(), str(path))
+
     def test_first_party_actions_use_node24_releases(self):
         expected = {
             "actions/checkout": "v7",
