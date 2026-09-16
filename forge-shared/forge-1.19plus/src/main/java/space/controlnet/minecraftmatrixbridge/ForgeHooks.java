@@ -14,7 +14,6 @@ import net.minecraftforge.event.server.ServerStoppingEvent;
 import net.minecraftforge.event.server.ServerStoppedEvent;
 import com.electronwill.nightconfig.core.file.FileWatcher;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
-import net.minecraftforge.common.MinecraftForge;
 import org.slf4j.Logger;
 import net.minecraftforge.fml.ModContainer;
 import net.minecraftforge.fml.ModList;
@@ -34,6 +33,11 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public final class ForgeHooks {
     private static final ForgeMinecraftCompat MC = ForgeCommandCompat.minecraft();
+    private static final ForgeEventBus EVENTS = ForgeCommandCompat.events();
+
+    static void register() {
+        EVENTS.register(new ForgeHooks());
+    }
     static ModContainer getModContainer() {
         return ModList.get().getModContainerById(MatrixBridgeMod.MOD_ID)
                 .orElseThrow(() -> new IllegalStateException("Missing mod container: " + MatrixBridgeMod.MOD_ID));
@@ -136,7 +140,7 @@ public final class ForgeHooks {
         if (settings.enableEventTaps) {
             eventTapManager = new EventTapManager(
                     bridgeService,
-                    MinecraftForge.EVENT_BUS,
+                    EVENTS,
                     settings.maxActiveEventTaps,
                     settings.defaultEventThrottleMs
             );
@@ -183,7 +187,7 @@ public final class ForgeHooks {
         ConfigWatcherShutdown.afterServerExit(MC.isDedicatedServer(event.getServer()), version,
                 Thread.currentThread(), () -> {
                     try {
-                        FileWatcher.defaultInstance().stop();
+                        EVENTS.stopConfigWatcher();
                     } catch (Exception e) {
                         // Older NightConfig declares IOException; newer versions do not.
                         throw new IllegalStateException("Could not close NightConfig FileWatcher", e);
@@ -242,6 +246,10 @@ public final class ForgeHooks {
         if (event.phase != TickEvent.Phase.END) {
             return;
         }
+        onServerPostTick();
+    }
+
+    void onServerPostTick() {
         MinecraftServer s = runningServer;
         if (s == null) {
             return;
@@ -474,7 +482,7 @@ public final class ForgeHooks {
                     if (settings.enableEventTaps) {
                         eventTapManager = new EventTapManager(
                                 bridgeService,
-                                MinecraftForge.EVENT_BUS,
+                                EVENTS,
                                 settings.maxActiveEventTaps,
                                 settings.defaultEventThrottleMs
                         );

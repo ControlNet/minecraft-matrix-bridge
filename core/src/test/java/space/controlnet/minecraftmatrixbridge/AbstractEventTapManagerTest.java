@@ -13,7 +13,7 @@ class AbstractEventTapManagerTest {
     public static class ParentEvent {}
     public static class ChildEvent extends ParentEvent {}
 
-    private static final class TestManager extends AbstractEventTapManager<Object> {
+    private static class TestManager extends AbstractEventTapManager<Object> {
         final Map<Class<?>, Consumer<Object>> listeners = new HashMap<>();
 
         TestManager() {
@@ -32,6 +32,17 @@ class AbstractEventTapManagerTest {
             });
             assertTrue(handleCommand(new String[]{"on", type.getName()}).startsWith("Enabled tap"));
         }
+    }
+
+    @Test
+    void loaderValidationHookCanRejectNonEvents() {
+        var manager = new TestManager() {
+            @Override protected boolean isEventClass(Class<?> type) { return type == ParentEvent.class; }
+        };
+        manager.subscribe(ParentEvent.class);
+        assertTrue(manager.handleCommand(new String[]{"on", ChildEvent.class.getName()})
+                .startsWith("Class is not an Event subtype"));
+        assertFalse(manager.listeners.containsKey(ChildEvent.class));
     }
 
     @Test

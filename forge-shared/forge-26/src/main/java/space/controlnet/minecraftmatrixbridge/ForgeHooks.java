@@ -34,6 +34,10 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 
 public final class ForgeHooks {
+    static void register() {
+        MinecraftForge.EVENT_BUS.register(new ForgeHooks());
+    }
+
     static ModContainer getModContainer() {
         return ModList.getModContainerById(MatrixBridgeMod.MOD_ID)
                 .orElseThrow(() -> new IllegalStateException("Missing mod container: " + MatrixBridgeMod.MOD_ID));

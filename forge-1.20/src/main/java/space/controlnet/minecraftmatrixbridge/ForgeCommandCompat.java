@@ -16,4 +16,8 @@ final class ForgeCommandCompat {
     static void sendSuccess(CommandSourceStack source, Component message, boolean broadcastToOps) {
         source.sendSuccess(() -> message, broadcastToOps);
     }
+
+    static ForgeEventBus events() {
+        return new ForgeEventBus();
+    }
 }

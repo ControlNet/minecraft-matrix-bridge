@@ -45,6 +45,10 @@ public abstract class AbstractEventTapManager<E> {
 
     protected abstract Class<E> getEventBaseClass();
 
+    protected boolean isEventClass(Class<?> eventClass) {
+        return getEventBaseClass().isAssignableFrom(eventClass);
+    }
+
     protected abstract void registerEventListener(Class<E> eventClass, Consumer<E> listener);
 
     public boolean isIndexReady() {
@@ -113,7 +117,7 @@ public abstract class AbstractEventTapManager<E> {
             return "Client-only events cannot be tapped on a dedicated server: " + fqcn;
         }
 
-        if (!getEventBaseClass().isAssignableFrom(eventClass)) {
+        if (!isEventClass(eventClass)) {
             return "Class is not an Event subtype: " + fqcn;
         }
 

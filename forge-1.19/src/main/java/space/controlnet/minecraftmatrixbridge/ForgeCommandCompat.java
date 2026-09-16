@@ -11,6 +11,10 @@ final class ForgeCommandCompat {
         return new ForgeMinecraftCompat();
     }
 
+    static ForgeEventBus events() {
+        return new ForgeEventBus();
+    }
+
     static void sendSuccess(CommandSourceStack source, Component message, boolean broadcastToOps) {
         source.sendSuccess(message, broadcastToOps);
     }
