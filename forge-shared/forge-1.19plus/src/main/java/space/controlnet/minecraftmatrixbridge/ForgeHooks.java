@@ -14,6 +14,8 @@ import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.entity.player.PlayerEvent;
 import net.minecraftforge.event.server.ServerStartedEvent;
 import net.minecraftforge.event.server.ServerStoppingEvent;
+import net.minecraftforge.event.server.ServerStoppedEvent;
+import com.electronwill.nightconfig.core.file.FileWatcher;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.common.MinecraftForge;
 import org.slf4j.Logger;
@@ -174,6 +176,21 @@ public final class ForgeHooks {
             }
         }
         callbacks = null;
+    }
+
+    @SubscribeEvent
+    public void onServerStopped(ServerStoppedEvent event) {
+        var descriptor = FileWatcher.class.getModule().getDescriptor();
+        String version = descriptor == null ? "" : descriptor.rawVersion().orElse("");
+        ConfigWatcherShutdown.afterServerExit(event.getServer().isDedicatedServer(), version,
+                Thread.currentThread(), () -> {
+                    try {
+                        FileWatcher.defaultInstance().stop();
+                    } catch (Exception e) {
+                        // Older NightConfig declares IOException; newer versions do not.
+                        throw new IllegalStateException("Could not close NightConfig FileWatcher", e);
+                    }
+                });
     }
 
     @SubscribeEvent
