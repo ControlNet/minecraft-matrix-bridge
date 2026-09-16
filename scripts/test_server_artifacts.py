@@ -15,6 +15,31 @@ from release_metadata import validate_server_coverage
 
 
 class ArtifactTests(unittest.TestCase):
+    def test_installed_server_prefers_platform_argument_file(self):
+        for platform, filename in (("posix", "unix_args.txt"), ("nt", "win_args.txt")):
+            coordinate = "net/minecraftforge/forge/1.20.3-49.0.2"
+            args = self.directory / "libraries" / coordinate / filename
+            args.parent.mkdir(parents=True, exist_ok=True)
+            args.write_text("synthetic argument file; not executable")
+            (self.directory / "forge-1.20.3-49.0.2-shim.jar").write_bytes(b"synthetic shim")
+            with patch.object(system_test_all.os, "name", platform):
+                command = system_test_all.installed_server_command("java", self.directory, coordinate)
+            self.assertEqual(["java", "-Djna.tmpdir=./jna", f"@{args}", "--nogui"], command)
+
+    def test_forge_shim_is_used_when_arguments_are_absent(self):
+        shim = self.directory / "forge-1.20.3-49.0.2-shim.jar"
+        shim.write_bytes(b"synthetic shim; not a runnable JAR")
+        command = system_test_all.installed_server_command(
+            "java", self.directory, "net/minecraftforge/forge/1.20.3-49.0.2")
+        self.assertEqual(["java", "-Djna.tmpdir=./jna", "-jar", str(shim), "--nogui"], command)
+
+    def test_unrelated_shim_does_not_mask_missing_launcher(self):
+        (self.directory / "forge-1.20.3-49.0.2-shim.jar").write_bytes(b"synthetic shim")
+        for coordinate in ("net/minecraftforge/forge/1.20.4-49.0.3",
+                           "net/neoforged/neoforge/21.1.250"):
+            with self.assertRaises(FileNotFoundError):
+                system_test_all.installed_server_command("java", self.directory, coordinate)
+
     def test_early_event_index_message_is_not_lost_by_bridge_readiness(self):
         ready = threading.Event()
         output = queue.Queue()

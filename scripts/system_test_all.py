@@ -455,12 +455,25 @@ def packaged_server_command(root: Path, module: str, run_dir: Path,
     mods = run_dir / "mods"
     mods.mkdir(exist_ok=True)
     shutil.copy2(jar, mods / jar.name)
+    return installed_server_command(java, run_dir, coordinate)
+
+
+def installed_server_command(java: str, run_dir: Path, coordinate: str) -> list[str]:
+    """Use the installed argument file, or Forge's executable server shim."""
     args_file = run_dir / "libraries" / coordinate / (
         "win_args.txt" if os.name == "nt" else "unix_args.txt"
     )
-    if not args_file.is_file():
-        raise FileNotFoundError(f"Installer did not generate {args_file}")
-    return [java, "-Djna.tmpdir=./jna", f"@{args_file}", "--nogui"]
+    command = [java, "-Djna.tmpdir=./jna"]
+    if args_file.is_file():
+        return [*command, f"@{args_file}", "--nogui"]
+    # Forge 1.20.3 installs a runnable shim instead of platform argument files.
+    # Match the exact installed coordinate; never choose an arbitrary server JAR.
+    if coordinate.startswith("net/minecraftforge/forge/"):
+        loader_version = coordinate.rsplit("/", 1)[1]
+        shim = run_dir / f"forge-{loader_version}-shim.jar"
+        if shim.is_file():
+            return [*command, "-jar", str(shim), "--nogui"]
+    raise FileNotFoundError(f"Installer did not generate {args_file} or a matching Forge shim JAR")
 
 
 def run_one(module: str, timeout_s: int, packaged: bool = False,
