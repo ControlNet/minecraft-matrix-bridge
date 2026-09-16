@@ -401,6 +401,33 @@ def verify_artifact(directory: Path, filename: str) -> Path:
     return jar
 
 
+def run_installer_with_retries(
+    command: list[str], run_dir: Path, log_path: Path, attempts: int = 3
+) -> None:
+    """Retry transient loader dependency downloads without hiding final failure."""
+    if attempts < 1:
+        raise ValueError("Installer attempts must be positive")
+    for attempt in range(1, attempts + 1):
+        mode = "w" if attempt == 1 else "a"
+        try:
+            with log_path.open(mode, encoding="utf-8") as log:
+                log.write(f"\n=== Installer attempt {attempt}/{attempts} ===\n")
+                log.flush()
+                subprocess.run(
+                    command,
+                    cwd=run_dir,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    check=True,
+                    timeout=600,
+                )
+            return
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            if attempt == attempts:
+                raise
+            time.sleep(2 ** (attempt - 1))
+
+
 def packaged_server_command(root: Path, module: str, run_dir: Path,
                             loader_coordinate: str | None = None,
                             artifact_dir: Path | None = None) -> list[str]:
@@ -446,12 +473,11 @@ def packaged_server_command(root: Path, module: str, run_dir: Path,
         shutil.copyfileobj(response, output)
     java_home = os.environ.get("JAVA_HOME")
     java = str(Path(java_home) / "bin" / "java") if java_home else "java"
-    with (run_dir / "installer.log").open("w", encoding="utf-8") as log:
-        subprocess.run(
-            [java, "-jar", str(installer), "--installServer", str(run_dir)],
-            cwd=run_dir, stdout=log, stderr=subprocess.STDOUT,
-            check=True, timeout=600,
-        )
+    run_installer_with_retries(
+        [java, "-jar", str(installer), "--installServer", str(run_dir)],
+        run_dir,
+        run_dir / "installer.log",
+    )
     mods = run_dir / "mods"
     mods.mkdir(exist_ok=True)
     shutil.copy2(jar, mods / jar.name)

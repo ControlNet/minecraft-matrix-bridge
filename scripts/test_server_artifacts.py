@@ -15,6 +15,37 @@ from release_metadata import validate_server_coverage
 
 
 class ArtifactTests(unittest.TestCase):
+    def test_installer_retries_a_transient_failure(self):
+        command = ["java", "-jar", "synthetic-installer.jar"]
+        failure = system_test_all.subprocess.CalledProcessError(1, command)
+        success = system_test_all.subprocess.CompletedProcess(command, 0)
+        log = self.directory / "installer.log"
+
+        with patch.object(
+            system_test_all.subprocess, "run", side_effect=[failure, success]
+        ) as run, patch.object(system_test_all.time, "sleep") as sleep:
+            system_test_all.run_installer_with_retries(
+                command, self.directory, log
+            )
+
+        self.assertEqual(2, run.call_count)
+        sleep.assert_called_once_with(1)
+        self.assertIn("Installer attempt 1/3", log.read_text())
+        self.assertIn("Installer attempt 2/3", log.read_text())
+
+    def test_installer_preserves_the_final_failure(self):
+        command = ["java", "-jar", "synthetic-installer.jar"]
+        failure = system_test_all.subprocess.CalledProcessError(1, command)
+        with patch.object(
+            system_test_all.subprocess,
+            "run",
+            side_effect=[failure, failure, failure],
+        ), patch.object(system_test_all.time, "sleep"):
+            with self.assertRaises(system_test_all.subprocess.CalledProcessError):
+                system_test_all.run_installer_with_retries(
+                    command, self.directory, self.directory / "installer.log"
+                )
+
     def test_installed_server_prefers_platform_argument_file(self):
         for platform, filename in (("posix", "unix_args.txt"), ("nt", "win_args.txt")):
             coordinate = "net/minecraftforge/forge/1.20.3-49.0.2"
