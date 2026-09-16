@@ -7,6 +7,10 @@ on:
     branches-ignore: [master]
   workflow_dispatch: {}
 
+concurrency:
+  group: ci-dev-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test-release-metadata:
     runs-on: ubuntu-latest
@@ -81,3 +85,7 @@ jobs:
   test-servers:
     needs: [test-and-build, test-and-build-26]
     uses: ./.github/workflows/server-tests.yml
+
+  test-real-matrix:
+    needs: test-servers
+    uses: ./.github/workflows/real-matrix-tests.yml

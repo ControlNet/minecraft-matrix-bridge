@@ -97,6 +97,17 @@ There is no workflow-level parallelism
 cap; GitHub runner availability and account limits determine concurrency.
 Failures do not cancel other matrix members, and each member retains its logs.
 
+After the packaged mock-Matrix matrix succeeds, the dev CI calls the separate
+`.github/workflows/real-matrix-tests.yml` workflow. It reuses the same 45 target
+entries and the same verified `dist` / `dist-26` artifacts, then starts an
+ephemeral, digest-pinned Synapse container for every target. This high-cost gate
+does not compile the mod again and is not part of local unit or standard build
+tasks. It verifies real authentication, room alias resolution, invitation/join,
+incremental sync, Minecraft-to-Matrix messages, Matrix bot commands, Matrix
+power-level state, and clean server shutdown. Runtime credentials and the
+Synapse database are generated per job and deleted after the test; only redacted
+failure logs are uploaded. Release CI does not repeat this matrix.
+
 To reproduce a CI case after building `dist/`, use Java 25 and run:
 
 ```bash
@@ -106,6 +117,17 @@ python3 scripts/system_test_all.py --packaged --artifact-dir dist --modules forg
 Expected: `Verified artifact: ... SHA256=...`, followed by the server test's
 `OK` result. A missing checksum, modified JAR, or server failure exits nonzero.
 `--artifact-dir` requires `SHA256SUMS.txt` and never falls back to a local build.
+
+To reproduce the real Synapse case for the same prebuilt artifact:
+
+```bash
+python3 scripts/real_matrix_test.py --artifact-dir dist --module forge-26.1 --loader-coordinate 26.1-62.0.9 --timeout-s 600
+```
+
+Expected: `REAL MATRIX OK`. Docker is required. The command recreates only
+`forge-26.1/run-realmatrixtest/26.1-62.0.9`; keep that test directory
+disposable. The Synapse image is pinned by both version and SHA256 digest.
+
 Release publishing waits for the entire matrix and consumes the same `dist` and
 `dist-26` artifacts. All release tags must match matrix coverage or the explicit
 exceptions in `scripts/server-test-exclusions.json`. Forge has no published
