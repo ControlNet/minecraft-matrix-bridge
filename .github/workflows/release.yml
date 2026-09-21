@@ -9,6 +9,43 @@ permissions:
   contents: write
 
 jobs:
+  test-servers:
+    needs: [build-and-release, build-26-dist]
+    if: ${{ needs.build-and-release.outputs.should_release == 'true' && needs.build-26-dist.outputs.should_release == 'true' }}
+    uses: ./.github/workflows/server-tests.yml
+
+  release-metadata:
+    name: Resolve and validate release tags
+    needs: [build-and-release, build-26-dist, test-servers]
+    if: ${{ needs.build-and-release.outputs.should_release == 'true' && needs.build-26-dist.outputs.should_release == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      legacy: ${{ steps.metadata.outputs.legacy }}
+      modern: ${{ steps.metadata.outputs.modern }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test release metadata resolver
+        run: python3 -m unittest discover -s scripts -p 'test_release_metadata.py'
+      - name: Resolve all platform tags before publishing
+        id: metadata
+        env:
+          CHECK_MODRINTH: ${{ needs.build-and-release.outputs.has_modrinth }}
+          MODRINTH_PROJECT_ID: ${{ secrets.MODRINTH_PROJECT_ID }}
+          CHECK_CURSEFORGE: ${{ needs.build-and-release.outputs.has_curseforge }}
+          CURSEFORGE_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
+        run: |
+          args=()
+          if [[ "$CHECK_MODRINTH" == 'true' ]]; then args+=(--check-modrinth); fi
+          if [[ "$CHECK_CURSEFORGE" == 'true' ]]; then args+=(--check-curseforge); fi
+          python3 scripts/release_metadata.py "${args[@]}" --server-targets scripts/server-test-targets.json --server-exclusions scripts/server-test-exclusions.json --output release-metadata.json
+      - name: Save resolved release tags
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-metadata
+          path: release-metadata.json
+          if-no-files-found: error
+
   build-26-dist:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -21,7 +58,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -69,13 +106,13 @@ jobs:
           echo "should_release=$SHOULD_RELEASE" >> "$GITHUB_OUTPUT"
 
       - name: Set up Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "25"
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
 
       - name: Make Gradle wrappers executable
         run: chmod +x ./gradlew ./gradlew-26 ./scripts/build_dist_26.sh
@@ -84,10 +121,11 @@ jobs:
         run: ./scripts/build_dist_26.sh
 
       - name: Upload 26.x dist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist-26
           path: dist/*
+          if-no-files-found: error
 
   build-and-release:
     runs-on: ubuntu-latest
@@ -103,18 +141,18 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "21"
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
 
       - name: Make Gradle wrapper executable
         run: chmod +x ./gradlew ./gradlew-26
@@ -195,18 +233,19 @@ jobs:
         if: ${{ steps.version.outputs.should_release == 'true' }}
         run: |
           chmod +x ./scripts/build_dist.sh
-          ./scripts/build_dist.sh
+          ./scripts/build_dist.sh --legacy-only
 
       - name: Upload dist for publisher jobs
         if: ${{ steps.version.outputs.should_release == 'true' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/*
+          if-no-files-found: error
 
   publish-modrinth:
-    name: Publish to Modrinth
-    needs: build-and-release
+    name: Publish to Modrinth (${{ matrix.module }})
+    needs: [build-and-release, release-metadata]
     runs-on: ubuntu-latest
     if: ${{ needs.build-and-release.outputs.should_release == 'true' && needs.build-and-release.outputs.has_modrinth == 'true' }}
     timeout-minutes: 20
@@ -215,59 +254,46 @@ jobs:
       MODRINTH_PROJECT_ID: ${{ secrets.MODRINTH_PROJECT_ID }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - mc: "1.18.x"
-            jar_suffix: "forge-1.18.x"
-            game_versions: |-
-              1.18.x
-            loader: "forge"
-          - mc: "1.19.x"
-            jar_suffix: "forge-1.19.x"
-            game_versions: |-
-              1.19.x
-            loader: "forge"
-          - mc: "1.20.x"
-            jar_suffix: "forge-1.20.x"
-            game_versions: |-
-              1.20
-              1.20.1
-              1.20.2
-              1.20.3
-              1.20.4
-            loader: "forge"
-          - mc: "1.21.x"
-            jar_suffix: "forge-1.21.x"
-            game_versions: |-
-              1.21.x
-            loader: "forge"
-          - mc: "1.21.x"
-            jar_suffix: "neoforge-1.21.x"
-            game_versions: |-
-              1.21.x
-            loader: "neoforge"
+      matrix: ${{ fromJSON(needs.release-metadata.outputs.legacy) }}
     steps:
+      - uses: actions/checkout@v7
       - name: Download dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist
 
       - name: Publish
+        id: publish
         uses: cloudnode-pro/modrinth-publish@v2
         with:
           token: ${{ env.MODRINTH_TOKEN }}
           project: ${{ env.MODRINTH_PROJECT_ID }}
           version: ${{ needs.build-and-release.outputs.version }}
+          name: "${{ needs.build-and-release.outputs.version }} (${{ matrix.loader }} ${{ matrix.mc }})"
+          channel: ${{ needs.build-and-release.outputs.channel }}
+          environment: ${{ matrix.environment }}
           changelog: "Automated release ${{ needs.build-and-release.outputs.tag }} (${{ matrix.loader }} ${{ matrix.mc }})."
           loaders: |-
             ${{ matrix.loader }}
           game-versions: ${{ matrix.game_versions }}
           files: dist/${{ needs.build-and-release.outputs.mod_id }}-${{ matrix.jar_suffix }}-${{ needs.build-and-release.outputs.version }}.jar
 
+      - name: Verify published tags
+        env:
+          VERSION_ID: ${{ steps.publish.outputs.version-id }}
+          EXPECTED_GAME_VERSIONS: ${{ matrix.game_versions }}
+          EXPECTED_LOADER: ${{ matrix.loader }}
+          EXPECTED_VERSION: ${{ needs.build-and-release.outputs.version }}
+          EXPECTED_CHANNEL: ${{ needs.build-and-release.outputs.channel }}
+          EXPECTED_FILENAME: ${{ needs.build-and-release.outputs.mod_id }}-${{ matrix.jar_suffix }}-${{ needs.build-and-release.outputs.version }}.jar
+        run: |
+          printf 'Modrinth version ID: `%s`\n' "$VERSION_ID" >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/release_metadata.py --verify-modrinth "$VERSION_ID"
+
   publish-curseforge:
-    name: Publish to CurseForge
-    needs: build-and-release
+    name: Publish to CurseForge (${{ matrix.module }})
+    needs: [build-and-release, release-metadata]
     runs-on: ubuntu-latest
     if: ${{ needs.build-and-release.outputs.should_release == 'true' && needs.build-and-release.outputs.has_curseforge == 'true' }}
     timeout-minutes: 30
@@ -276,56 +302,60 @@ jobs:
       CURSEFORGE_PROJECT_ID: ${{ secrets.CURSEFORGE_PROJECT_ID }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - jar_suffix: "forge-1.18.x"
-            game_versions: ${{ vars.CURSEFORGE_GAME_VERSIONS_118 || 'Minecraft 1.18:1.18.2,Java 17,Forge' }}
-          - jar_suffix: "forge-1.19.x"
-            game_versions: ${{ vars.CURSEFORGE_GAME_VERSIONS_119 || 'Minecraft 1.19:1.19.2,Java 17,Forge' }}
-          - jar_suffix: "forge-1.20.x"
-            game_versions: ${{ vars.CURSEFORGE_GAME_VERSIONS_120 || 'Minecraft 1.20:1.20.1,Java 17,Forge' }}
-          - jar_suffix: "forge-1.21.x"
-            game_versions: ${{ vars.CURSEFORGE_GAME_VERSIONS_121 || 'Minecraft 1.21:1.21.1,Java 21,Forge' }}
-          - jar_suffix: "neoforge-1.21.x"
-            game_versions: ${{ vars.CURSEFORGE_GAME_VERSIONS_NEOFORGE_121 || 'Minecraft 1.21:1.21.1,Java 21,NeoForge' }}
+      matrix: ${{ fromJSON(needs.release-metadata.outputs.legacy) }}
 
     steps:
       - name: Download dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist
 
       - name: Upload
+        id: publish
         uses: itsmeow/curseforge-upload@v3
         with:
           token: ${{ env.CURSEFORGE_TOKEN }}
           project_id: ${{ env.CURSEFORGE_PROJECT_ID }}
           game_endpoint: minecraft
           file_path: dist/${{ needs.build-and-release.outputs.mod_id }}-${{ matrix.jar_suffix }}-${{ needs.build-and-release.outputs.version }}.jar
-          game_versions: ${{ matrix.game_versions }}
+          game_versions: ${{ matrix.curseforge_ids }}
+          display_name: "${{ needs.build-and-release.outputs.version }} (${{ matrix.loader }} ${{ matrix.mc }})"
           release_type: ${{ needs.build-and-release.outputs.channel }}
           changelog: "Automated release ${{ needs.build-and-release.outputs.tag }}."
           changelog_type: markdown
 
+      - name: Record uploaded file ID
+        env:
+          FILE_ID: ${{ steps.publish.outputs.id }}
+        run: |
+          [[ "$FILE_ID" =~ ^[0-9]+$ ]]
+          printf 'CurseForge file ID: `%s` (tags validated before upload; moderation may be pending)\n' "$FILE_ID" >> "$GITHUB_STEP_SUMMARY"
+
   publish-github-release-26:
     name: Publish GitHub Release (26.x)
-    needs: build-26-dist
+    needs: [build-26-dist, release-metadata]
     runs-on: ubuntu-latest
     if: ${{ needs.build-26-dist.outputs.should_release == 'true' }}
     timeout-minutes: 20
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Download 26.x dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: dist-26
           path: dist
+
+      - name: Download release metadata
+        uses: actions/download-artifact@v8
+        with:
+          name: release-metadata
+          path: release-metadata
 
       - name: Create tag
         shell: bash
@@ -348,15 +378,18 @@ jobs:
         run: mv dist/SHA256SUMS.txt dist/SHA256SUMS-26.txt
 
       - name: Publish GitHub Release (attach 26.x jars)
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.build-26-dist.outputs.tag }}
           name: ${{ needs.build-26-dist.outputs.tag }}
           generate_release_notes: true
           files: |
-            dist/${{ needs.build-26-dist.outputs.mod_id }}-forge-26.x-${{ needs.build-26-dist.outputs.version }}.jar
-            dist/${{ needs.build-26-dist.outputs.mod_id }}-neoforge-26.x-${{ needs.build-26-dist.outputs.version }}.jar
+            dist/${{ needs.build-26-dist.outputs.mod_id }}-forge-26.1.x-${{ needs.build-26-dist.outputs.version }}.jar
+            dist/${{ needs.build-26-dist.outputs.mod_id }}-forge-26.2.x-${{ needs.build-26-dist.outputs.version }}.jar
+            dist/${{ needs.build-26-dist.outputs.mod_id }}-neoforge-26.1.x-${{ needs.build-26-dist.outputs.version }}.jar
+            dist/${{ needs.build-26-dist.outputs.mod_id }}-neoforge-26.2.x-${{ needs.build-26-dist.outputs.version }}.jar
             dist/SHA256SUMS-26.txt
+            release-metadata/release-metadata.json
 
   publish-github-release-legacy:
     name: Publish GitHub Release (legacy jars)
@@ -369,13 +402,13 @@ jobs:
 
     steps:
       - name: Download legacy dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist
 
       - name: Publish GitHub Release (attach legacy jars)
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.build-and-release.outputs.tag }}
           name: ${{ needs.build-and-release.outputs.tag }}
@@ -388,75 +421,77 @@ jobs:
             dist/SHA256SUMS.txt
 
   publish-modrinth-26:
-    name: Publish 26.x to Modrinth
-    needs: build-26-dist
+    name: Publish to Modrinth (${{ matrix.module }})
+    needs: [build-26-dist, build-and-release, release-metadata]
     runs-on: ubuntu-latest
-    if: ${{ needs.build-26-dist.outputs.should_release == 'true' }}
+    if: ${{ needs.build-26-dist.outputs.should_release == 'true' && needs.build-and-release.outputs.has_modrinth == 'true' }}
     timeout-minutes: 20
     env:
       MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
       MODRINTH_PROJECT_ID: ${{ secrets.MODRINTH_PROJECT_ID }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - mc: "26.1"
-            jar_suffix: "forge-26.x"
-            game_versions: |-
-              26.1
-            loader: "forge"
-          - mc: "26.1"
-            jar_suffix: "neoforge-26.x"
-            game_versions: |-
-              26.1
-            loader: "neoforge"
+      matrix: ${{ fromJSON(needs.release-metadata.outputs.modern) }}
 
     steps:
+      - uses: actions/checkout@v7
       - name: Download 26.x dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: dist-26
           path: dist
 
       - name: Publish
+        id: publish
         if: ${{ env.MODRINTH_TOKEN != '' && env.MODRINTH_PROJECT_ID != '' }}
         uses: cloudnode-pro/modrinth-publish@v2
         with:
           token: ${{ env.MODRINTH_TOKEN }}
           project: ${{ env.MODRINTH_PROJECT_ID }}
           version: ${{ needs.build-26-dist.outputs.version }}
+          name: "${{ needs.build-26-dist.outputs.version }} (${{ matrix.loader }} ${{ matrix.mc }})"
+          channel: ${{ needs.build-26-dist.outputs.channel }}
+          environment: ${{ matrix.environment }}
           changelog: "Automated release ${{ needs.build-26-dist.outputs.tag }} (${{ matrix.loader }} ${{ matrix.mc }})."
           loaders: |-
             ${{ matrix.loader }}
           game-versions: ${{ matrix.game_versions }}
           files: dist/${{ needs.build-26-dist.outputs.mod_id }}-${{ matrix.jar_suffix }}-${{ needs.build-26-dist.outputs.version }}.jar
 
+      - name: Verify published tags
+        env:
+          VERSION_ID: ${{ steps.publish.outputs.version-id }}
+          EXPECTED_GAME_VERSIONS: ${{ matrix.game_versions }}
+          EXPECTED_LOADER: ${{ matrix.loader }}
+          EXPECTED_VERSION: ${{ needs.build-26-dist.outputs.version }}
+          EXPECTED_CHANNEL: ${{ needs.build-26-dist.outputs.channel }}
+          EXPECTED_FILENAME: ${{ needs.build-26-dist.outputs.mod_id }}-${{ matrix.jar_suffix }}-${{ needs.build-26-dist.outputs.version }}.jar
+        run: |
+          printf 'Modrinth version ID: `%s`\n' "$VERSION_ID" >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/release_metadata.py --verify-modrinth "$VERSION_ID"
+
   publish-curseforge-26:
-    name: Publish 26.x to CurseForge
-    needs: build-26-dist
+    name: Publish to CurseForge (${{ matrix.module }})
+    needs: [build-26-dist, build-and-release, release-metadata]
     runs-on: ubuntu-latest
-    if: ${{ needs.build-26-dist.outputs.should_release == 'true' }}
+    if: ${{ needs.build-26-dist.outputs.should_release == 'true' && needs.build-and-release.outputs.has_curseforge == 'true' }}
     timeout-minutes: 30
     env:
       CURSEFORGE_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
       CURSEFORGE_PROJECT_ID: ${{ secrets.CURSEFORGE_PROJECT_ID }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - jar_suffix: "forge-26.x"
-            game_versions: ${{ vars.CURSEFORGE_GAME_VERSIONS_261 || 'Minecraft 26.1:26.1,Java 25,Forge' }}
-          - jar_suffix: "neoforge-26.x"
-            game_versions: ${{ vars.CURSEFORGE_GAME_VERSIONS_NEOFORGE_261 || 'Minecraft 26.1:26.1,Java 25,NeoForge' }}
+      matrix: ${{ fromJSON(needs.release-metadata.outputs.modern) }}
 
     steps:
       - name: Download 26.x dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: dist-26
           path: dist
 
       - name: Upload
+        id: publish
         if: ${{ env.CURSEFORGE_TOKEN != '' && env.CURSEFORGE_PROJECT_ID != '' }}
         uses: itsmeow/curseforge-upload@v3
         with:
@@ -464,7 +499,15 @@ jobs:
           project_id: ${{ env.CURSEFORGE_PROJECT_ID }}
           game_endpoint: minecraft
           file_path: dist/${{ needs.build-26-dist.outputs.mod_id }}-${{ matrix.jar_suffix }}-${{ needs.build-26-dist.outputs.version }}.jar
-          game_versions: ${{ matrix.game_versions }}
+          game_versions: ${{ matrix.curseforge_ids }}
+          display_name: "${{ needs.build-26-dist.outputs.version }} (${{ matrix.loader }} ${{ matrix.mc }})"
           release_type: ${{ needs.build-26-dist.outputs.channel }}
           changelog: "Automated release ${{ needs.build-26-dist.outputs.tag }}."
           changelog_type: markdown
+
+      - name: Record uploaded file ID
+        env:
+          FILE_ID: ${{ steps.publish.outputs.id }}
+        run: |
+          [[ "$FILE_ID" =~ ^[0-9]+$ ]]
+          printf 'CurseForge file ID: `%s` (tags validated before upload; moderation may be pending)\n' "$FILE_ID" >> "$GITHUB_STEP_SUMMARY"

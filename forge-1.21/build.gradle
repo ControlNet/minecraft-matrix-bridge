@@ -39,8 +39,9 @@ ext {
     pack_format = 34
 
     minecraft_version_range = '[1.21,1.22)'
-    forge_version_range = '[52,)'
-    loader_version_range = '[52,)'
+    // Runtime minimum covers the family base release, not just the compile target.
+    forge_version_range = '[51,)'
+    loader_version_range = '[51,)'
 }
 
 minecraft {
@@ -71,7 +72,36 @@ tasks.withType(JavaExec).configureEach {
 dependencies {
     minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
     compileOnly project(':core')
+    testImplementation platform('org.junit:junit-bom:5.10.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
+
+tasks.named('test', Test).configure {
+    useJUnitPlatform()
+}
+
+// Keep EventBus 7 tests isolated from the legacy userdev runtime used to build the JAR.
+sourceSets {
+    eventBusTest {
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += sourceSets.main.output
+    }
+}
+
+dependencies {
+    eventBusTestImplementation 'net.minecraftforge:eventbus:7.0.5'
+    eventBusTestImplementation platform('org.junit:junit-bom:5.10.2')
+    eventBusTestImplementation 'org.junit.jupiter:junit-jupiter'
+    eventBusTestRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+def eventBusTest = tasks.register('eventBusTest', Test) {
+    testClassesDirs = sourceSets.eventBusTest.output.classesDirs
+    classpath = sourceSets.eventBusTest.runtimeClasspath
+    useJUnitPlatform()
+}
+tasks.named('check').configure { dependsOn(eventBusTest) }
 
 tasks.named('processResources', ProcessResources).configure {
     var replaceProperties = [

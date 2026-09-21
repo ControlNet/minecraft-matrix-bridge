@@ -25,38 +25,185 @@ Bridges chat between a Minecraft server and **one Matrix room** (unencrypted onl
 - **Event Taps**: dynamically subscribe to Forge/NeoForge events and forward them to Matrix for debugging/monitoring.
 
 ## Requirements
-- Java 17 (Forge 1.18–1.20), Java 21 (Forge/NeoForge 1.21.x), or Java 25 (Forge/NeoForge 26.1)
+- Java 17 (Forge 1.18–1.20), Java 21 (Forge/NeoForge 1.21.x), or Java 25 (Forge/NeoForge 26.1 and 26.2)
 - Minecraft Forge/NeoForge server matching the versions. I only manually test it in popular minor versions, and hopefully it works in other minor versions.
     - 1.18.2
     - 1.19.2
     - 1.20.1
     - 1.21.1
-    - 26.1
+    - 26.1.2
+    - 26.2
 - Matrix room must be **unencrypted** (no E2EE)
 
 ## Installation
 1. Download the jar or build it locally with `./scripts/build_dist.sh` (all supported versions) or `./scripts/build_dist_26.sh` (26.x only). The generated jars are written to `dist/`.
-2. Drop the jar into your Forge/NeoForge server's `mods/` folder (pick the jar matching your loader + Minecraft major).
+2. Drop the jar into your Forge/NeoForge server's `mods/` folder (pick the jar matching your loader and Minecraft release; 26.1 and 26.2 use separate jars).
 3. Start the server once to generate config.
 
 ### Build all versions (creates `dist/`)
 To build jars for all supported Minecraft versions and collect them into `dist/`:
 - `./scripts/build_dist.sh`
 
-`dist/` includes Forge jars for 1.18.x–1.21.x and 26.x, plus NeoForge jars for 1.21.x and 26.x.
+`dist/` includes nine jars: Forge for 1.18.x–1.21.x, 26.1.x, and 26.2.x; NeoForge for 1.21.x, 26.1.x, and 26.2.x.
 
 ### Build only the 26.x line
 The 26.x projects use the dedicated Gradle 9 wrapper and are conditionally included by `settings.gradle`.
 
-- Build and collect both 26.x jars into `dist/`: `./scripts/build_dist_26.sh`
-- Build Forge 26 only: `./gradlew-26 -Pomx_modern_26=true :forge-26:build`
-- Build NeoForge 26 only: `./gradlew-26 -Pomx_modern_26=true :neoforge-26:build`
+- Build and collect all four 26.x jars into `dist/`: `./scripts/build_dist_26.sh`
+- Build Forge 26.1 only: `./gradlew-26 -Pomx_modern_26=true :forge-26.1:build`
+- Build Forge 26.2 only: `./gradlew-26 -Pomx_modern_26=true :forge-26.2:build`
+- Build NeoForge 26.1 only: `./gradlew-26 -Pomx_modern_26=true :neoforge-26.1:build`
+- Build NeoForge 26.2 only: `./gradlew-26 -Pomx_modern_26=true :neoforge-26.2:build`
 - On Windows, use `gradlew-26.bat` instead of `./gradlew-26`
 
 `./scripts/build_dist_26.sh` produces:
-- `dist/minecraftmatrixbridge-forge-26.x-<version>.jar`
-- `dist/minecraftmatrixbridge-neoforge-26.x-<version>.jar`
+- `dist/minecraftmatrixbridge-forge-26.1.x-<version>.jar`
+- `dist/minecraftmatrixbridge-forge-26.2.x-<version>.jar`
+- `dist/minecraftmatrixbridge-neoforge-26.1.x-<version>.jar`
+- `dist/minecraftmatrixbridge-neoforge-26.2.x-<version>.jar`
 - `dist/SHA256SUMS.txt`
+
+The 26.2 modules target Forge 65.1.3 and NeoForge 26.2.0.88 respectively, require Java 25, and exclude Minecraft 26.3.
+
+Run the 26.x server integration tests with:
+
+```bash
+python3 scripts/system_test_all.py --packaged --modules forge-26.1 neoforge-26.1 forge-26.2 neoforge-26.2 --timeout-s 600
+```
+
+Build the jars first and use Java 25 (`JAVA_HOME` or `PATH`). Packaged tests install each loader and load the actual jar from `mods/`; omit `--packaged` to use Gradle development runs. These tests use a local mock Matrix server and recreate each module's `run-systemtest` directory. Do not store valuable worlds there. They cover startup, Matrix connection/sync, persisted state, command-driven sends, event taps, and shutdown; real-player chat requires separate manual verification.
+
+For cross-patch checks, `--loader-coordinate` selects a different loader for a
+single built jar. It recreates only `run-systemtest/<coordinate>`; a default test
+still recreates the entire parent directory, so run the default test first.
+For example, these commands test earlier patches locally:
+
+```bash
+python3 scripts/system_test_all.py --packaged --modules forge-26.1 --loader-coordinate 26.1-62.0.9 --timeout-s 600
+python3 scripts/system_test_all.py --packaged --modules forge-26.1 --loader-coordinate 26.1.1-63.0.2 --timeout-s 600
+python3 scripts/system_test_all.py --packaged --modules neoforge-26.1 --loader-coordinate 26.1.0.19-beta --timeout-s 600
+python3 scripts/system_test_all.py --packaged --modules neoforge-26.1 --loader-coordinate 26.1.1.15-beta --timeout-s 600
+```
+
+CI builds each of the nine release JARs once: `build_dist.sh --legacy-only`
+uploads the five legacy JARs as `dist`, and `build_dist_26.sh` uploads four modern
+JARs as `dist-26`. The reusable `.github/workflows/server-tests.yml` creates an
+isolated job for every entry in `scripts/server-test-targets.json`: 45 runnable
+combinations covering every published stable patch in 1.18, 1.19, 1.20, 1.21,
+26.1, and 26.2 for the applicable release loader. Every job downloads its release
+artifact, checks its SHA256, and installs that exact JAR without invoking Gradle.
+Runtime Java is pinned per target (17, 21, or 25), independently of build Java.
+There is no workflow-level parallelism
+cap; GitHub runner availability and account limits determine concurrency.
+Failures do not cancel other matrix members, and each member retains its logs.
+
+After the packaged mock-Matrix matrix succeeds, the dev CI calls the separate
+`.github/workflows/real-matrix-tests.yml` workflow. It reuses the same 45 target
+entries and the same verified `dist` / `dist-26` artifacts, then starts an
+ephemeral, digest-pinned Synapse container for every target. This high-cost gate
+does not compile the mod again and is not part of local unit or standard build
+tasks. It verifies real authentication, room alias resolution, invitation/join,
+incremental sync, Minecraft-to-Matrix messages, Matrix bot commands, Matrix
+power-level state, and clean server shutdown. Runtime credentials and the
+Synapse database are generated per job and deleted after the test; only redacted
+failure logs are uploaded. Release CI does not repeat this matrix.
+
+To reproduce a CI case after building `dist/`, use Java 25 and run:
+
+```bash
+python3 scripts/system_test_all.py --packaged --artifact-dir dist --modules forge-26.1 --loader-coordinate 26.1-62.0.9 --timeout-s 600
+```
+
+Expected: `Verified artifact: ... SHA256=...`, followed by the server test's
+`OK` result. A missing checksum, modified JAR, or server failure exits nonzero.
+`--artifact-dir` requires `SHA256SUMS.txt` and never falls back to a local build.
+
+To reproduce the real Synapse case for the same prebuilt artifact:
+
+```bash
+python3 scripts/real_matrix_test.py --artifact-dir dist --module forge-26.1 --loader-coordinate 26.1-62.0.9 --timeout-s 600
+```
+
+Expected: `REAL MATRIX OK`. Docker is required. The command recreates only
+`forge-26.1/run-realmatrixtest/26.1-62.0.9`; keep that test directory
+disposable. The Synapse image is pinned by both version and SHA256 digest.
+
+Release publishing waits for the entire matrix and consumes the same `dist` and
+`dist-26` artifacts. All release tags must match matrix coverage or the explicit
+exceptions in `scripts/server-test-exclusions.json`. Forge has no published
+installer for Minecraft 1.20.5 or 1.21.2, so these two combinations have no server
+job; their Modrinth and CurseForge tags are intentionally retained. NeoForge
+1.21.2 does have an installer and is tested. These exceptions do not certify
+compatibility. New Minecraft patches require a pinned test entry (or an explicitly
+reviewed no-loader exception) before publishing. Ordinary compatibility failures
+are never excluded or allowed to pass: they fail CI and block release.
+
+For example, test a legacy artifact using Java 17 after the legacy build:
+
+```bash
+./scripts/build_dist.sh --legacy-only
+python3 scripts/system_test_all.py --packaged --artifact-dir dist --modules forge-1.18 --loader-coordinate 1.18.2-40.3.12 --timeout-s 600
+```
+
+Build scripts recreate `dist/`; server tests recreate their coordinate-specific
+test worlds. Keep these directories disposable. Older versions may expose genuine
+loader/API incompatibilities in existing release JARs; adding a matrix case does
+not imply that compatibility has passed.
+
+Expected: each exits successfully with an `OK:` line and at least two outgoing
+messages to the mock Matrix service. The 26.1 jar metadata permits Minecraft
+`[26.1,26.2)`, with Forge 62.0.9+ or NeoForge 26.1.0.19-beta+; compilation still
+targets Minecraft 26.1.2.
+
+### Release metadata
+
+`scripts/release-targets.json` is the shared publication policy for all nine jars.
+Each Minecraft family includes its base release and **all published stable patch
+versions**: `1.20` includes 1.20 through 1.20.6; `26.1` does not include 26.2.
+Snapshots and pre-releases are excluded. This is the intended support policy,
+not evidence that every patch has been runtime-tested.
+
+Before any release upload, CI resolves Mojang's version catalog once, validates
+every version on each enabled platform, and generates both publisher matrices
+from that same list. CurseForge also receives the target's Java and loader tags
+and the explicit `Server` tag (not `Client`);
+missing or ambiguous IDs fail preflight instead of silently dropping tags.
+The former `CURSEFORGE_GAME_VERSIONS_*` repository-variable overrides are no
+longer used. Edit the shared target policy instead.
+
+The resolved list is saved in the Actions summary and `release-metadata` artifact,
+and attached to the GitHub release as `release-metadata.json`. Modrinth tags,
+loader, release channel, version number, filename, and `server_only` environment
+are checked after upload. Modrinth uploads explicitly set `environment: server_only`;
+preflight also checks the configured project's environment. A mismatched project
+setting stops publication rather than silently changing project settings. The
+read-only CLI uses `MODRINTH_PROJECT_ID`, `--modrinth-project`, or the default
+`mc-matrix-bridge` slug for this check. Older project responses are checked through
+`client_side=unsupported` and `server_side=required` when `environment` is absent.
+CurseForge's returned file ID is recorded; its post-moderation metadata is not
+automatically read back with the upload-only credential. Both publishers use
+the same explicit release channel and loader-specific display names.
+
+Run the offline tests (synthetic API catalogs) and a read-only live preflight:
+
+```bash
+python3 -m unittest discover -s scripts -p 'test_release_metadata.py'
+python3 scripts/release_metadata.py --check-modrinth
+```
+
+Expected: all tests pass, and the preflight prints five legacy and four modern
+targets with full stable-version lists. For a CurseForge preflight, provide
+`CURSEFORGE_TOKEN` through the environment and run:
+
+```bash
+python3 scripts/release_metadata.py --check-modrinth --check-curseforge
+```
+
+Never put credentials in the target JSON or command arguments. Local `.env`
+files are gitignored; the script does not load them automatically. CI continues
+to use the existing platform secrets. These commands never upload or edit files
+on either platform. Publishing a new mod version re-resolves available Minecraft
+patches; this does not retroactively update older uploads or schedule tag edits.
 
 ## Configuration
 Edit `config/minecraftmatrixbridge.toml`:

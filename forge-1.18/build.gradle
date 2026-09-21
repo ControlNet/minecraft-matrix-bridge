@@ -35,8 +35,9 @@ ext {
     pack_format = 8
 
     minecraft_version_range = '[1.18,1.19)'
-    forge_version_range = '[40,)'
-    loader_version_range = '[40,)'
+    // Runtime minimum covers the family base release, not just the compile target.
+    forge_version_range = '[38,)'
+    loader_version_range = '[38,)'
 }
 
 minecraft {

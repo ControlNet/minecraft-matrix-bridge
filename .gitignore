@@ -19,6 +19,7 @@ world/
 saves/
 
 ### Common generated artifacts
+__pycache__/
 *.log
 *.hprof
 hs_err_pid*
@@ -58,6 +59,7 @@ kubeconfig
 .s3cfg
 
 dist/
+.omo/
 
 ### Avoid committing extracted Gradle plugin metadata (not mod metadata)
 /META-INF/

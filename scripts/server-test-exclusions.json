@@ -1,0 +1,4 @@
+[
+  {"module":"forge-1.20","minecraft":"1.20.5","reason":"No Forge installer is published for Minecraft 1.20.5; retain platform tags by explicit release policy."},
+  {"module":"forge-1.21","minecraft":"1.21.2","reason":"No Forge installer is published for Minecraft 1.21.2; retain platform tags by explicit release policy."}
+]

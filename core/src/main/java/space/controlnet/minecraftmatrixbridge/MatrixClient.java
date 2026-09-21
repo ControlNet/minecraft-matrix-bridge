@@ -12,6 +12,8 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.UUID;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.HashSet;
@@ -21,6 +23,7 @@ public final class MatrixClient {
     private final HttpClient http;
     private final String homeserver;
     private final String accessToken;
+    private final Duration requestTimeout;
 
     private static final int DISPLAYNAME_CACHE_SIZE = 512;
     private static final long DISPLAYNAME_TTL_MS = 10 * 60 * 1000L;
@@ -33,13 +36,29 @@ public final class MatrixClient {
     };
 
     public MatrixClient(String homeserver, String accessToken) {
-        this.http = HttpClient.newHttpClient();
+        this(homeserver, accessToken, Duration.ofSeconds(30));
+    }
+
+    MatrixClient(String homeserver, String accessToken, Duration requestTimeout) {
+        if (requestTimeout.isZero() || requestTimeout.isNegative()) {
+            throw new IllegalArgumentException("Request timeout must be positive");
+        }
+        this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
         this.homeserver = stripTrailingSlash(homeserver);
         this.accessToken = accessToken;
+        this.requestTimeout = requestTimeout;
+    }
+
+    private HttpRequest.Builder newRequest() {
+        return HttpRequest.newBuilder().timeout(requestTimeout);
+    }
+
+    Duration syncRequestTimeout(int timeoutMs) {
+        return requestTimeout.plusMillis(Math.max(0, timeoutMs));
     }
 
     public String whoami() throws IOException, InterruptedException, MatrixException {
-        HttpRequest request = HttpRequest.newBuilder()
+        HttpRequest request = newRequest()
                 .uri(URI.create(homeserver + "/_matrix/client/v3/account/whoami"))
                 .header("Authorization", "Bearer " + accessToken)
                 .GET()
@@ -61,7 +80,7 @@ public final class MatrixClient {
     public String resolveRoomAlias(String roomAlias) throws IOException, InterruptedException, MatrixException {
         String uri = homeserver + "/_matrix/client/v3/directory/room/" + urlEncodePath(roomAlias);
 
-        HttpRequest request = HttpRequest.newBuilder()
+        HttpRequest request = newRequest()
                 .uri(URI.create(uri))
                 .header("Authorization", "Bearer " + accessToken)
                 .GET()
@@ -81,7 +100,7 @@ public final class MatrixClient {
     }
 
     public Set<String> joinedRooms() throws IOException, InterruptedException, MatrixException {
-        HttpRequest request = HttpRequest.newBuilder()
+        HttpRequest request = newRequest()
                 .uri(URI.create(homeserver + "/_matrix/client/v3/joined_rooms"))
                 .header("Authorization", "Bearer " + accessToken)
                 .GET()
@@ -121,7 +140,7 @@ public final class MatrixClient {
         }
 
         String uri = homeserver + "/_matrix/client/v3/join/" + urlEncodePath(value);
-        HttpRequest request = HttpRequest.newBuilder()
+        HttpRequest request = newRequest()
                 .uri(URI.create(uri))
                 .header("Authorization", "Bearer " + accessToken)
                 .POST(HttpRequest.BodyPublishers.noBody())
@@ -156,7 +175,7 @@ public final class MatrixClient {
 
         String uri = homeserver + "/_matrix/client/v3/rooms/" + urlEncodePath(rid) + "/state/m.room.power_levels/";
 
-        HttpRequest request = HttpRequest.newBuilder()
+        HttpRequest request = newRequest()
                 .uri(URI.create(uri))
                 .header("Authorization", "Bearer " + accessToken)
                 .GET()
@@ -222,7 +241,7 @@ public final class MatrixClient {
         String uri = homeserver + "/_matrix/client/v3/rooms/" + urlEncodePath(rid)
                 + "/state/m.room.member/" + urlEncodePath(uid);
 
-        HttpRequest request = HttpRequest.newBuilder()
+        HttpRequest request = newRequest()
                 .uri(URI.create(uri))
                 .header("Authorization", "Bearer " + accessToken)
                 .GET()
@@ -253,7 +272,14 @@ public final class MatrixClient {
     }
 
     public void sendText(String roomId, String text) throws IOException, InterruptedException, MatrixException {
-        String txnId = Long.toString(System.currentTimeMillis());
+        sendText(roomId, text, UUID.randomUUID().toString());
+    }
+
+    /** Reuse the same transaction ID when retrying a logical message. */
+    public void sendText(String roomId, String text, String txnId) throws IOException, InterruptedException, MatrixException {
+        if (txnId == null || txnId.isBlank()) {
+            throw new IllegalArgumentException("Transaction ID must not be blank");
+        }
         String uri = homeserver + "/_matrix/client/v3/rooms/" + urlEncodePath(roomId)
                 + "/send/m.room.message/" + urlEncodePath(txnId);
 
@@ -261,7 +287,7 @@ public final class MatrixClient {
         body.addProperty("msgtype", "m.text");
         body.addProperty("body", text == null ? "" : text);
 
-        HttpRequest request = HttpRequest.newBuilder()
+        HttpRequest request = newRequest()
                 .uri(URI.create(uri))
                 .header("Authorization", "Bearer " + accessToken)
                 .header("Content-Type", "application/json")
@@ -287,7 +313,8 @@ public final class MatrixClient {
             sb.append("&filter=").append(urlEncodeQuery(filterJson));
         }
 
-        HttpRequest request = HttpRequest.newBuilder()
+        HttpRequest request = newRequest()
+                .timeout(syncRequestTimeout(timeoutMs))
                 .uri(URI.create(sb.toString()))
                 .header("Authorization", "Bearer " + accessToken)
                 .GET()

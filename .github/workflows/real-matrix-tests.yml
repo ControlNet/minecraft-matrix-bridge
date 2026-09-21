@@ -1,0 +1,68 @@
+name: Real Matrix compatibility (all versions)
+
+on:
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+env:
+  SYNAPSE_IMAGE: docker.io/matrixdotorg/synapse:v1.160.0@sha256:78de1d10bef02e375f861d1cc99f8bedd9381d4f9083ea8b2c22a053477b205f
+
+jobs:
+  targets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: targets
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          targets = json.loads(Path('scripts/server-test-targets.json').read_text())
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('matrix=' + json.dumps({'include': targets}) + '\n')
+          PY
+
+  synapse:
+    name: Synapse + ${{ matrix.module }} on MC ${{ matrix.minecraft }}
+    needs: targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+      - name: Pull the digest-pinned Synapse image
+        run: docker pull "$SYNAPSE_IMAGE"
+      - name: Test the built JAR against real Synapse (no recompilation)
+        env:
+          MODULE: ${{ matrix.module }}
+          LOADER: ${{ matrix.loader }}
+        run: >-
+          python3 scripts/real_matrix_test.py --artifact-dir dist
+          --module "$MODULE" --loader-coordinate "$LOADER" --timeout-s 600
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: real-matrix-${{ matrix.module }}-${{ matrix.minecraft }}
+          if-no-files-found: ignore
+          path: |
+            ${{ matrix.module }}/run-realmatrixtest/${{ matrix.loader }}/installer.log
+            ${{ matrix.module }}/run-realmatrixtest/${{ matrix.loader }}/logs/*.log
+            ${{ matrix.module }}/run-realmatrixtest/${{ matrix.loader }}/crash-reports/*.txt
+            ${{ matrix.module }}/run-realmatrixtest/${{ matrix.loader }}/synapse.log
+            dist/SHA256SUMS.txt

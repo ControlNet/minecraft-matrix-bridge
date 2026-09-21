@@ -1,15 +1,11 @@
 package space.controlnet.minecraftmatrixbridge;
 
-import net.minecraftforge.eventbus.api.Event;
-import net.minecraftforge.eventbus.api.EventPriority;
-import net.minecraftforge.eventbus.api.IEventBus;
-
 import java.util.function.Consumer;
 
-public final class EventTapManager extends AbstractEventTapManager<Event> {
-    private final IEventBus eventBus;
+public final class EventTapManager extends AbstractEventTapManager<Object> {
+    private final ForgeEventBus eventBus;
 
-    public EventTapManager(BridgeService bridgeService, IEventBus eventBus, int maxActiveTaps, long defaultThrottleMs) {
+    EventTapManager(BridgeService bridgeService, ForgeEventBus eventBus, int maxActiveTaps, long defaultThrottleMs) {
         super(bridgeService, maxActiveTaps, defaultThrottleMs);
         this.eventBus = eventBus;
     }
@@ -20,12 +16,32 @@ public final class EventTapManager extends AbstractEventTapManager<Event> {
     }
 
     @Override
-    protected Class<Event> getEventBaseClass() {
-        return Event.class;
+    public String handleCommand(String[] args) {
+        if (args != null && args.length > 1 && ("on".equalsIgnoreCase(args[0]) || "off".equalsIgnoreCase(args[0]))) {
+            args = args.clone();
+            args[1] = eventBus.eventName(args[1]);
+        }
+        return super.handleCommand(args);
     }
 
     @Override
-    protected void registerEventListener(Class<Event> eventClass, Consumer<Event> listener) {
-        eventBus.addListener(EventPriority.NORMAL, false, eventClass, listener);
+    @SuppressWarnings("unchecked")
+    protected Class<Object> getEventBaseClass() {
+        return (Class<Object>) eventBus.eventBaseClass();
+    }
+
+    @Override
+    protected boolean isEventClass(Class<?> eventClass) {
+        return eventBus.isEventClass(eventClass);
+    }
+
+    @Override
+    protected Object getListenerRegistryKey() {
+        return eventBus;
+    }
+
+    @Override
+    protected void registerEventListener(Class<Object> eventClass, Consumer<Object> listener) {
+        eventBus.listen(eventClass, listener);
     }
 }

@@ -2,7 +2,10 @@ package space.controlnet.minecraftmatrixbridge;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -10,6 +13,9 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.*;
 
 public class EventIndexTest {
+
+    @TempDir
+    Path temporaryDirectory;
 
     private EventIndex eventIndex;
 
@@ -45,6 +51,26 @@ public class EventIndexTest {
         assertTrue(empty.isEmpty());
         assertEquals(0, empty.getSimpleNameCount());
         assertEquals(0, empty.getAliasCount());
+    }
+
+    @Test
+    void resolvesEncodedJarManifestPath() throws Exception {
+        Path jar = Files.createDirectories(temporaryDirectory.resolve("space ünicode"))
+                .resolve("events.jar");
+        Files.createFile(jar);
+        String manifestUrl = "jar:" + jar.toUri().toASCIIString() + "!/META-INF/MANIFEST.MF";
+
+        assertEquals(jar.toRealPath().toFile(), EventIndex.jarFileFromManifestUrl(manifestUrl));
+    }
+
+    @Test
+    void resolvesSecureJarUnionManifestPath() throws Exception {
+        Path jar = temporaryDirectory.resolve("events.jar");
+        Files.createFile(jar);
+        String unionUrl = "union:" + jar.toUri().getRawPath()
+                + "%23127!/META-INF/MANIFEST.MF";
+
+        assertEquals(jar.toRealPath().toFile(), EventIndex.jarFileFromManifestUrl(unionUrl));
     }
 
     @Test

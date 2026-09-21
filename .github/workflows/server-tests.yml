@@ -1,0 +1,65 @@
+name: Packaged compatibility (all versions)
+
+on:
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+jobs:
+  targets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test artifact verification
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: Check every published Minecraft patch is accounted for
+        run: python3 scripts/release_metadata.py --server-targets scripts/server-test-targets.json --server-exclusions scripts/server-test-exclusions.json
+      - id: targets
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          targets = json.loads(Path('scripts/server-test-targets.json').read_text())
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('matrix=' + json.dumps({'include': targets}) + '\n')
+          PY
+
+  server:
+    name: ${{ matrix.module }} on MC ${{ matrix.minecraft }}
+    needs: targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+      - name: Verify and test the built JAR (no recompilation)
+        env:
+          MODULE: ${{ matrix.module }}
+          LOADER: ${{ matrix.loader }}
+        run: >-
+          python3 scripts/system_test_all.py --packaged --artifact-dir dist
+          --modules "$MODULE" --loader-coordinate "$LOADER" --timeout-s 600
+      - name: Upload logs and artifact checksums
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: server-test-${{ matrix.module }}-${{ matrix.minecraft }}
+          path: |
+            ${{ matrix.module }}/run-systemtest/${{ matrix.loader }}/installer.log
+            ${{ matrix.module }}/run-systemtest/${{ matrix.loader }}/logs/*.log
+            ${{ matrix.module }}/run-systemtest/${{ matrix.loader }}/crash-reports/*.txt
+            dist/SHA256SUMS.txt

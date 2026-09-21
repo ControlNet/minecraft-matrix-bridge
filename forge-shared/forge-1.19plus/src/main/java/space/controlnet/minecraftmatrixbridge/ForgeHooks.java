@@ -3,20 +3,20 @@ package space.controlnet.minecraftmatrixbridge;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.logging.LogUtils;
 import net.minecraft.commands.CommandSourceStack;
-import net.minecraft.commands.Commands;
-import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.world.level.storage.LevelResource;
 import net.minecraftforge.event.RegisterCommandsEvent;
 import net.minecraftforge.event.ServerChatEvent;
 import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.entity.player.PlayerEvent;
 import net.minecraftforge.event.server.ServerStartedEvent;
 import net.minecraftforge.event.server.ServerStoppingEvent;
+import net.minecraftforge.event.server.ServerStoppedEvent;
+import com.electronwill.nightconfig.core.file.FileWatcher;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
-import net.minecraftforge.common.MinecraftForge;
 import org.slf4j.Logger;
+import net.minecraftforge.fml.ModContainer;
+import net.minecraftforge.fml.ModList;
 
 import com.mojang.brigadier.arguments.StringArgumentType;
 
@@ -27,16 +27,30 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 
 public final class ForgeHooks {
+    private static final ForgeMinecraftCompat MC = ForgeCommandCompat.minecraft();
+    private static final ForgeEventBus EVENTS = ForgeCommandCompat.events();
+
+    static void register() {
+        EVENTS.register(new ForgeHooks());
+    }
+    static ModContainer getModContainer() {
+        return ModList.get().getModContainerById(MatrixBridgeMod.MOD_ID)
+                .orElseThrow(() -> new IllegalStateException("Missing mod container: " + MatrixBridgeMod.MOD_ID));
+    }
+
     private static final Logger LOGGER = LogUtils.getLogger();
     private static final int MAX_WAIT_TICKS = 100; // 5 seconds max wait for client settings
     // Default ClientInformation values (from ClientInformation.createDefault())
     private static final int DEFAULT_VIEW_DISTANCE = 2;
     private static final int DEFAULT_MODEL_CUSTOMISATION = 0;
+    private static final ConcurrentHashMap<Class<?>, Method> VIEW_DISTANCE_METHODS = new ConcurrentHashMap<>();
+    private static final Set<Class<?>> MISSING_VIEW_DISTANCE_METHODS = ConcurrentHashMap.newKeySet();
 
     private BridgeService bridgeService;
     private McCallbacks callbacks;
@@ -45,12 +59,21 @@ public final class ForgeHooks {
     private volatile String connectedRoomIdOrAlias = "";
     private final ConcurrentHashMap<UUID, Integer> pendingConnectedNoticeTicks = new ConcurrentHashMap<>();
 
+    private void closeEventTapManager() {
+        EventTapManager manager = eventTapManager;
+        eventTapManager = null;
+        if (manager != null) {
+            manager.close();
+        }
+    }
+
     @SubscribeEvent
     public void onServerStarted(ServerStartedEvent event) {
         MinecraftServer server = event.getServer();
         this.runningServer = server;
-        Path worldRoot = server.getWorldPath(LevelResource.ROOT);
+        Path worldRoot = MC.worldRoot(server);
 
+        closeEventTapManager();
         if (bridgeService != null) {
             bridgeService.stop();
         }
@@ -62,7 +85,7 @@ public final class ForgeHooks {
                 if (s == null) {
                     return;
                 }
-                s.execute(() -> s.getPlayerList().broadcastSystemMessage(Component.literal(text), false));
+                s.execute(() -> MC.broadcast(s, text));
             }
 
                     @Override
@@ -74,7 +97,7 @@ public final class ForgeHooks {
 	                        String room = (roomIdOrAlias == null || roomIdOrAlias.isBlank()) ? "<unknown>" : roomIdOrAlias;
 	                        connectedRoomIdOrAlias = room;
 	                        s.execute(() -> {
-	                            for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+	                            for (ServerPlayer p : MC.players(s)) {
 	                                scheduleConnectedNotice(p);
 	                            }
 	                        });
@@ -90,8 +113,8 @@ public final class ForgeHooks {
                             }
                             s.execute(() -> {
                                 List<String> names = new ArrayList<>();
-                                for (ServerPlayer p : s.getPlayerList().getPlayers()) {
-                                    names.add(p.getGameProfile().getName());
+                                for (ServerPlayer p : MC.players(s)) {
+                                    names.add(MC.playerName(p));
                                 }
                                 Collections.sort(names);
                                 fut.complete(names);
@@ -129,7 +152,7 @@ public final class ForgeHooks {
         if (settings.enableEventTaps) {
             eventTapManager = new EventTapManager(
                     bridgeService,
-                    MinecraftForge.EVENT_BUS,
+                    EVENTS,
                     settings.maxActiveEventTaps,
                     settings.defaultEventThrottleMs
             );
@@ -145,7 +168,7 @@ public final class ForgeHooks {
     public void onServerStopping(ServerStoppingEvent event) {
         BridgeService service = bridgeService;
         bridgeService = null;
-        eventTapManager = null;
+        closeEventTapManager();
         runningServer = null;
         connectedRoomIdOrAlias = "";
         pendingConnectedNoticeTicks.clear();
@@ -170,6 +193,21 @@ public final class ForgeHooks {
     }
 
     @SubscribeEvent
+    public void onServerStopped(ServerStoppedEvent event) {
+        var descriptor = FileWatcher.class.getModule().getDescriptor();
+        String version = descriptor == null ? "" : descriptor.rawVersion().orElse("");
+        ConfigWatcherShutdown.afterServerExit(MC.isDedicatedServer(event.getServer()), version,
+                Thread.currentThread(), () -> {
+                    try {
+                        EVENTS.stopConfigWatcher();
+                    } catch (Exception e) {
+                        // Older NightConfig declares IOException; newer versions do not.
+                        throw new IllegalStateException("Could not close NightConfig FileWatcher", e);
+                    }
+                });
+    }
+
+    @SubscribeEvent
     public void onServerChat(ServerChatEvent event) {
         if (bridgeService == null || !bridgeService.isRunning()) {
             return;
@@ -183,7 +221,7 @@ public final class ForgeHooks {
             return;
         }
 
-        String playerName = event.getPlayer().getGameProfile().getName();
+        String playerName = MC.playerName(event.getPlayer());
         String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "<" + playerName + "> " + msg;
         bridgeService.enqueueMcMessage(formatted);
     }
@@ -195,7 +233,7 @@ public final class ForgeHooks {
         if (service != null && service.isRunning()
                 && MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get()
                 && MatrixBridgeConfig.ENABLE_JOIN_LEAVE_TO_MATRIX.get()) {
-            String playerName = event.getEntity().getGameProfile().getName();
+            String playerName = MC.playerName(event.getEntity());
             String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "* " + playerName + " joined the game";
             service.enqueueMcMessage(formatted);
         }
@@ -220,6 +258,10 @@ public final class ForgeHooks {
         if (event.phase != TickEvent.Phase.END) {
             return;
         }
+        onServerPostTick();
+    }
+
+    void onServerPostTick() {
         MinecraftServer s = runningServer;
         if (s == null) {
             return;
@@ -237,7 +279,7 @@ public final class ForgeHooks {
             UUID id = e.getKey();
             int ticksWaited = (e.getValue() == null ? 0 : e.getValue()) + 1;
 
-            ServerPlayer p = s.getPlayerList().getPlayer(id);
+            ServerPlayer p = MC.player(s, id);
             if (p == null) {
                 pendingConnectedNoticeTicks.remove(id);
                 continue;
@@ -253,7 +295,7 @@ public final class ForgeHooks {
                 pendingConnectedNoticeTicks.remove(id);
                 String lang = getPlayerLanguage(p);
                 String msg = Localizer.connected(lang, room);
-                p.sendSystemMessage(Component.literal(msg));
+                MC.sendPlayerMessage(p, MC.text(msg));
             } else {
                 pendingConnectedNoticeTicks.put(id, ticksWaited);
             }
@@ -284,41 +326,45 @@ public final class ForgeHooks {
     }
 
     private static int getPlayerViewDistance(ServerPlayer player) {
-        // Try different method names across MC versions
-        try {
-            Method m = player.getClass().getMethod("requestedViewDistance");
-            Object res = m.invoke(player);
-            if (res instanceof Integer i) {
-                return i;
+        Class<?> playerType = player.getClass();
+        Method method = VIEW_DISTANCE_METHODS.get(playerType);
+        if (method == null && !MISSING_VIEW_DISTANCE_METHODS.contains(playerType)) {
+            method = findViewDistanceMethod(playerType);
+            if (method == null) {
+                MISSING_VIEW_DISTANCE_METHODS.add(playerType);
+                return DEFAULT_VIEW_DISTANCE;
             }
-        } catch (Exception ignored) {
+            Method existing = VIEW_DISTANCE_METHODS.putIfAbsent(playerType, method);
+            if (existing != null) {
+                method = existing;
+            }
         }
-        try {
-            // Older versions might use clientViewDistance or similar
-            Method m = player.getClass().getMethod("getRequestedViewDistance");
-            Object res = m.invoke(player);
-            if (res instanceof Integer i) {
-                return i;
+        if (method != null) {
+            try {
+                Object result = method.invoke(player);
+                if (result instanceof Integer value) {
+                    return value;
+                }
+            } catch (ReflectiveOperationException | RuntimeException ignored) {
+                VIEW_DISTANCE_METHODS.remove(playerType, method);
+                MISSING_VIEW_DISTANCE_METHODS.add(playerType);
             }
-        } catch (Exception ignored) {
         }
         return DEFAULT_VIEW_DISTANCE;
     }
 
-    private static int getPlayerModelCustomisation(ServerPlayer player) {
-        try {
-            // Get the entity data for model customisation
-            // This is stored in the synched entity data
-            Method getEntityData = player.getClass().getMethod("getEntityData");
-            Object entityData = getEntityData.invoke(player);
-            if (entityData != null) {
-                // The model customisation is typically a byte value
-                // We need to find the DATA_PLAYER_MODE_CUSTOMISATION accessor
-                // This is complex due to obfuscation, so we'll use a simpler heuristic
+    private static Method findViewDistanceMethod(Class<?> playerType) {
+        for (String methodName : new String[]{"requestedViewDistance", "getRequestedViewDistance"}) {
+            try {
+                return playerType.getMethod(methodName);
+            } catch (NoSuchMethodException ignored) {
+                // Try the next version-specific name.
             }
-        } catch (Exception ignored) {
         }
-        // Fall back to checking if language is non-default as additional heuristic
+        return null;
+    }
+
+    private static int getPlayerModelCustomisation(ServerPlayer player) {
         String lang = getPlayerLanguage(player);
         if (!"en_us".equals(lang)) {
             return 1; // Non-default, so settings were received
@@ -331,7 +377,7 @@ public final class ForgeHooks {
             return;
         }
         // Start with 0 ticks waited
-        pendingConnectedNoticeTicks.put(p.getUUID(), 0);
+        pendingConnectedNoticeTicks.put(MC.playerId(p), 0);
     }
 
     @SubscribeEvent
@@ -347,35 +393,35 @@ public final class ForgeHooks {
             return;
         }
 
-        String playerName = event.getEntity().getGameProfile().getName();
+        String playerName = MC.playerName(event.getEntity());
         String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "* " + playerName + " left the game";
         service.enqueueMcMessage(formatted);
     }
 
     @SubscribeEvent
     public void onRegisterCommands(RegisterCommandsEvent event) {
-        LiteralArgumentBuilder<CommandSourceStack> root = Commands.literal("matrix")
-                .requires(source -> source.hasPermission(2))
-                .then(Commands.literal("status").executes(ctx -> {
+        LiteralArgumentBuilder<CommandSourceStack> root = MC.literal("matrix")
+                .requires(source -> MC.hasPermission(source, 2))
+                .then(MC.literal("status").executes(ctx -> {
                     if (bridgeService == null) {
-                        ForgeCommandCompat.sendSuccess(ctx.getSource(), Component.literal("MatrixBridge: not initialized."), false);
+                        MC.sendSuccess(ctx.getSource(), MC.text("MatrixBridge: not initialized."), false);
                         return 0;
                     }
                     String msg = "MatrixBridge: running=" + bridgeService.isRunning()
                             + ", ready=" + bridgeService.isReady()
                             + ", selfUserId=" + (bridgeService.getSelfUserId().isBlank() ? "<unknown>" : bridgeService.getSelfUserId())
                             + ", queue=" + bridgeService.getQueueSize();
-                    ForgeCommandCompat.sendSuccess(ctx.getSource(), Component.literal(msg), false);
+                    MC.sendSuccess(ctx.getSource(), MC.text(msg), false);
                     return 1;
                 }))
-                .then(Commands.literal("reload").executes(ctx -> {
-                    MinecraftServer server = ctx.getSource().getServer();
-                    Path worldRoot = server.getWorldPath(LevelResource.ROOT);
+                .then(MC.literal("reload").executes(ctx -> {
+                    MinecraftServer server = MC.server(ctx.getSource());
+                    Path worldRoot = MC.worldRoot(server);
 
                     if (bridgeService != null) {
                         bridgeService.stop();
                     }
-                    eventTapManager = null; // Clear old event tap manager
+                    closeEventTapManager();
                     bridgeService = new BridgeService();
                     callbacks = new McCallbacks() {
                         @Override
@@ -384,7 +430,7 @@ public final class ForgeHooks {
                             if (s == null) {
                                 return;
                             }
-                            s.execute(() -> s.getPlayerList().broadcastSystemMessage(Component.literal(text), false));
+                            s.execute(() -> MC.broadcast(s, text));
                         }
 
                         @Override
@@ -396,7 +442,7 @@ public final class ForgeHooks {
                             String room = (roomIdOrAlias == null || roomIdOrAlias.isBlank()) ? "<unknown>" : roomIdOrAlias;
                             connectedRoomIdOrAlias = room;
                             s.execute(() -> {
-                                for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+                                for (ServerPlayer p : MC.players(s)) {
                                     scheduleConnectedNotice(p);
                                 }
                             });
@@ -412,8 +458,8 @@ public final class ForgeHooks {
                             }
                             s.execute(() -> {
                                 List<String> names = new ArrayList<>();
-                                for (ServerPlayer p : s.getPlayerList().getPlayers()) {
-                                    names.add(p.getGameProfile().getName());
+                                for (ServerPlayer p : MC.players(s)) {
+                                    names.add(MC.playerName(p));
                                 }
                                 Collections.sort(names);
                                 fut.complete(names);
@@ -452,50 +498,50 @@ public final class ForgeHooks {
                     if (settings.enableEventTaps) {
                         eventTapManager = new EventTapManager(
                                 bridgeService,
-                                MinecraftForge.EVENT_BUS,
+                                EVENTS,
                                 settings.maxActiveEventTaps,
                                 settings.defaultEventThrottleMs
                         );
                     }
 
-                    ForgeCommandCompat.sendSuccess(ctx.getSource(), Component.literal("MatrixBridge reload requested."), true);
+                    MC.sendSuccess(ctx.getSource(), MC.text("MatrixBridge reload requested."), true);
                     return 1;
                 }))
-                .then(Commands.literal("test").executes(ctx -> {
+                .then(MC.literal("test").executes(ctx -> {
                     if (bridgeService == null || !bridgeService.isRunning()) {
-                        ctx.getSource().sendFailure(Component.literal("MatrixBridge is not running."));
+                        MC.sendFailure(ctx.getSource(), MC.text("MatrixBridge is not running."));
                         return 0;
                     }
                     if (!MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get()) {
-                        ctx.getSource().sendFailure(Component.literal("MC → Matrix is disabled (enableMcToMatrix=false)."));
+                        MC.sendFailure(ctx.getSource(), MC.text("MC → Matrix is disabled (enableMcToMatrix=false)."));
                         return 0;
                     }
                     String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "[TEST] " + Instant.now();
                     boolean queued = bridgeService.enqueueMcMessage(formatted);
                     if (queued) {
-                        ForgeCommandCompat.sendSuccess(ctx.getSource(), Component.literal("Queued test message."), false);
+                        MC.sendSuccess(ctx.getSource(), MC.text("Queued test message."), false);
                         return 1;
                     }
-                    ctx.getSource().sendFailure(Component.literal("Failed to queue test message (queue full or bridge not ready)."));
+                    MC.sendFailure(ctx.getSource(), MC.text("Failed to queue test message (queue full or bridge not ready)."));
                     return 0;
                 }))
-                .then(Commands.literal("event")
-                    .then(Commands.literal("on")
-                        .then(Commands.argument("eventName", StringArgumentType.string())
+                .then(MC.literal("event")
+                    .then(MC.literal("on")
+                        .then(MC.argument("eventName", StringArgumentType.string())
                             .executes(ctx -> eventOn(ctx.getSource(), StringArgumentType.getString(ctx, "eventName"), "", "once"))
-                            .then(Commands.argument("filter", StringArgumentType.string())
+                            .then(MC.argument("filter", StringArgumentType.string())
                                 .executes(ctx -> eventOn(ctx.getSource(), StringArgumentType.getString(ctx, "eventName"), StringArgumentType.getString(ctx, "filter"), "once"))
-                                .then(Commands.argument("duration", StringArgumentType.string())
+                                .then(MC.argument("duration", StringArgumentType.string())
                                     .executes(ctx -> eventOn(ctx.getSource(), StringArgumentType.getString(ctx, "eventName"), StringArgumentType.getString(ctx, "filter"), StringArgumentType.getString(ctx, "duration")))))))
-                    .then(Commands.literal("off")
-                        .then(Commands.argument("eventName", StringArgumentType.string())
+                    .then(MC.literal("off")
+                        .then(MC.argument("eventName", StringArgumentType.string())
                             .executes(ctx -> eventOff(ctx.getSource(), StringArgumentType.getString(ctx, "eventName")))))
-                    .then(Commands.literal("list")
+                    .then(MC.literal("list")
                         .executes(ctx -> eventList(ctx.getSource())))
-                    .then(Commands.literal("search")
-                        .then(Commands.argument("query", StringArgumentType.string())
+                    .then(MC.literal("search")
+                        .then(MC.argument("query", StringArgumentType.string())
                             .executes(ctx -> eventSearch(ctx.getSource(), StringArgumentType.getString(ctx, "query")))))
-                    .then(Commands.literal("help")
+                    .then(MC.literal("help")
                         .executes(ctx -> eventHelp(ctx.getSource()))));
 
         event.getDispatcher().register(root);
@@ -563,60 +609,60 @@ public final class ForgeHooks {
     private int eventOn(CommandSourceStack source, String eventName, String filter, String duration) {
         EventTapManager mgr = eventTapManager;
         if (mgr == null) {
-            source.sendFailure(Component.literal("Event taps are disabled in configuration."));
+            MC.sendFailure(source, MC.text("Event taps are disabled in configuration."));
             return 0;
         }
         String[] args = {"on", eventName, filter, duration};
         String result = mgr.handleCommand(args);
-        ForgeCommandCompat.sendSuccess(source, Component.literal(result), false);
+        MC.sendSuccess(source, MC.text(result), false);
         return 1;
     }
 
     private int eventOff(CommandSourceStack source, String eventName) {
         EventTapManager mgr = eventTapManager;
         if (mgr == null) {
-            source.sendFailure(Component.literal("Event taps are disabled in configuration."));
+            MC.sendFailure(source, MC.text("Event taps are disabled in configuration."));
             return 0;
         }
         String[] args = {"off", eventName};
         String result = mgr.handleCommand(args);
-        ForgeCommandCompat.sendSuccess(source, Component.literal(result), false);
+        MC.sendSuccess(source, MC.text(result), false);
         return 1;
     }
 
     private int eventList(CommandSourceStack source) {
         EventTapManager mgr = eventTapManager;
         if (mgr == null) {
-            source.sendFailure(Component.literal("Event taps are disabled in configuration."));
+            MC.sendFailure(source, MC.text("Event taps are disabled in configuration."));
             return 0;
         }
         String[] args = {"list"};
         String result = mgr.handleCommand(args);
-        ForgeCommandCompat.sendSuccess(source, Component.literal(result), false);
+        MC.sendSuccess(source, MC.text(result), false);
         return 1;
     }
 
     private int eventSearch(CommandSourceStack source, String query) {
         EventTapManager mgr = eventTapManager;
         if (mgr == null) {
-            source.sendFailure(Component.literal("Event taps are disabled in configuration."));
+            MC.sendFailure(source, MC.text("Event taps are disabled in configuration."));
             return 0;
         }
         String[] args = {"search", query};
         String result = mgr.handleCommand(args);
-        ForgeCommandCompat.sendSuccess(source, Component.literal(result), false);
+        MC.sendSuccess(source, MC.text(result), false);
         return 1;
     }
 
     private int eventHelp(CommandSourceStack source) {
         EventTapManager mgr = eventTapManager;
         if (mgr == null) {
-            source.sendFailure(Component.literal("Event taps are disabled in configuration."));
+            MC.sendFailure(source, MC.text("Event taps are disabled in configuration."));
             return 0;
         }
         String[] args = {"help"};
         String result = mgr.handleCommand(args);
-        ForgeCommandCompat.sendSuccess(source, Component.literal(result), false);
+        MC.sendSuccess(source, MC.text(result), false);
         return 1;
     }
 }
