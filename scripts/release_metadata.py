@@ -83,11 +83,13 @@ def resolve_curseforge(family, versions, loader, java, catalog, types):
 
     def version_matches(version):
         exact = [row for row in catalog if row["name"] == version]
+        version_type_ids = {row["id"] for row in types if row["name"] == version}
+        version_typed = [row for row in exact if row["gameVersionTypeID"] in version_type_ids]
         classified = [row for row in exact if row["gameVersionTypeID"] in minecraft_type_ids]
-        # CurseForge can publish a new Minecraft tag before its version-type
-        # name follows the established convention. Fall back only when the
+        # New releases can use a type named after the exact version, while
+        # legacy releases use "Minecraft <family>". Fall back only when the
         # exact tag name is globally unambiguous.
-        return classified or exact
+        return version_typed or classified or exact
 
     def version_id(version):
         matches = version_matches(version)

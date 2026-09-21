@@ -77,6 +77,17 @@ class ReleaseMetadataTests(unittest.TestCase):
                                             "neoforge", 25, versions, types)
         self.assertEqual(result, [19, 14, 16, 17])
 
+    def test_curseforge_prefers_version_named_type_for_new_release_scheme(self):
+        versions, types = self.cf_catalog()
+        types.append({"id": 99, "name": "26.2"})
+        versions.extend([
+            {"id": 19, "name": "26.2", "gameVersionTypeID": 99},
+            {"id": 20, "name": "26.2", "gameVersionTypeID": 1},
+        ])
+        result = metadata.resolve_curseforge("26.2", ["26.2"],
+                                            "neoforge", 25, versions, types)
+        self.assertEqual(result, [19, 14, 16, 17])
+
     def test_curseforge_unique_new_version_falls_back_across_unclassified_types(self):
         versions, types = self.cf_catalog()
         types.append({"id": 99, "name": "Minecraft current"})
