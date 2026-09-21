@@ -320,7 +320,6 @@ jobs:
           game_endpoint: minecraft
           file_path: dist/${{ needs.build-and-release.outputs.mod_id }}-${{ matrix.jar_suffix }}-${{ needs.build-and-release.outputs.version }}.jar
           game_versions: ${{ matrix.curseforge_ids }}
-          display_name: "${{ needs.build-and-release.outputs.version }} (${{ matrix.loader }} ${{ matrix.mc }})"
           release_type: ${{ needs.build-and-release.outputs.channel }}
           changelog: "Automated release ${{ needs.build-and-release.outputs.tag }}."
           changelog_type: markdown
@@ -500,7 +499,6 @@ jobs:
           game_endpoint: minecraft
           file_path: dist/${{ needs.build-26-dist.outputs.mod_id }}-${{ matrix.jar_suffix }}-${{ needs.build-26-dist.outputs.version }}.jar
           game_versions: ${{ matrix.curseforge_ids }}
-          display_name: "${{ needs.build-26-dist.outputs.version }} (${{ matrix.loader }} ${{ matrix.mc }})"
           release_type: ${{ needs.build-26-dist.outputs.channel }}
           changelog: "Automated release ${{ needs.build-26-dist.outputs.tag }}."
           changelog_type: markdown
