@@ -77,6 +77,25 @@ class ReleaseMetadataTests(unittest.TestCase):
                                             "neoforge", 25, versions, types)
         self.assertEqual(result, [19, 14, 16, 17])
 
+    def test_curseforge_unique_new_version_falls_back_across_unclassified_types(self):
+        versions, types = self.cf_catalog()
+        types.append({"id": 99, "name": "Minecraft current"})
+        versions.append({"id": 19, "name": "26.2", "gameVersionTypeID": 99})
+        result = metadata.resolve_curseforge("26.2", ["26.2"],
+                                            "forge", 25, versions, types)
+        self.assertEqual(result, [19, 14, 15, 17])
+
+    def test_curseforge_unclassified_fallback_rejects_ambiguous_names(self):
+        versions, types = self.cf_catalog()
+        types.append({"id": 99, "name": "Minecraft current"})
+        versions.extend([
+            {"id": 19, "name": "26.2", "gameVersionTypeID": 99},
+            {"id": 20, "name": "26.2", "gameVersionTypeID": 2},
+        ])
+        with self.assertRaisesRegex(ValueError, "Minecraft 26.2"):
+            metadata.resolve_curseforge("26.2", ["26.2"],
+                                        "forge", 25, versions, types)
+
     def test_missing_curseforge_version_fails(self):
         versions, types = self.cf_catalog()
         with self.assertRaisesRegex(ValueError, "26.1.2"):
