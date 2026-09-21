@@ -77,11 +77,30 @@ def resolve_curseforge(family, versions, loader, java, catalog, types):
             raise ValueError(f"Invalid CurseForge ID for {label}")
         return value
 
-    namespace = f"Minecraft {family}"
-    type_id = unique_id(namespace, [row for row in types if row["name"] == namespace])
-    ids = [unique_id(f"{namespace}:{version}", [row for row in catalog
-           if row["name"] == version and row["gameVersionTypeID"] == type_id])
-           for version in versions]
+    minecraft_type_ids = {row["id"] for row in types
+                          if re.fullmatch(r"Minecraft \d+(?:\.\d+)*", row["name"])}
+    type_names = {row["id"]: row["name"] for row in types}
+
+    def version_matches(version):
+        exact = [row for row in catalog if row["name"] == version]
+        version_type_ids = {row["id"] for row in types if row["name"] == version}
+        version_typed = [row for row in exact if row["gameVersionTypeID"] in version_type_ids]
+        classified = [row for row in exact if row["gameVersionTypeID"] in minecraft_type_ids]
+        # New releases can use a type named after the exact version, while
+        # legacy releases use "Minecraft <family>". Fall back only when the
+        # exact tag name is globally unambiguous.
+        return version_typed or classified or exact
+
+    def version_id(version):
+        matches = version_matches(version)
+        label = f"Minecraft {version}"
+        if len({row["id"] for row in matches}) > 1:
+            details = sorted({f"{row['id']}@{row['gameVersionTypeID']}:"
+                              f"{type_names.get(row['gameVersionTypeID'], 'unknown')}" for row in matches})
+            label += f" candidates [{', '.join(details)}]"
+        return unique_id(label, matches)
+
+    ids = [version_id(version) for version in versions]
     for name in [f"Java {java}", LOADERS[loader], "Server"]:
         ids.append(unique_id(name, [row for row in catalog if row["name"] == name]))
     return ids
