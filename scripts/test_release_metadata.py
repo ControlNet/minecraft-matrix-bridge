@@ -92,9 +92,11 @@ class ReleaseMetadataTests(unittest.TestCase):
             {"id": 19, "name": "26.2", "gameVersionTypeID": 99},
             {"id": 20, "name": "26.2", "gameVersionTypeID": 2},
         ])
-        with self.assertRaisesRegex(ValueError, "Minecraft 26.2"):
+        with self.assertRaisesRegex(ValueError, "Minecraft 26.2") as error:
             metadata.resolve_curseforge("26.2", ["26.2"],
                                         "forge", 25, versions, types)
+        self.assertIn("Minecraft current", str(error.exception))
+        self.assertIn("Bukkit", str(error.exception))
 
     def test_missing_curseforge_version_fails(self):
         versions, types = self.cf_catalog()
