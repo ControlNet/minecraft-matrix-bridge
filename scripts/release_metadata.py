@@ -79,11 +79,16 @@ def resolve_curseforge(family, versions, loader, java, catalog, types):
 
     minecraft_type_ids = {row["id"] for row in types
                           if re.fullmatch(r"Minecraft \d+(?:\.\d+)*", row["name"])}
-    if not minecraft_type_ids:
-        raise ValueError(f"CurseForge has no Minecraft version types for {family}.x")
-    ids = [unique_id(f"Minecraft {version}", [row for row in catalog
-           if row["name"] == version and row["gameVersionTypeID"] in minecraft_type_ids])
-           for version in versions]
+
+    def version_matches(version):
+        exact = [row for row in catalog if row["name"] == version]
+        classified = [row for row in exact if row["gameVersionTypeID"] in minecraft_type_ids]
+        # CurseForge can publish a new Minecraft tag before its version-type
+        # name follows the established convention. Fall back only when the
+        # exact tag name is globally unambiguous.
+        return classified or exact
+
+    ids = [unique_id(f"Minecraft {version}", version_matches(version)) for version in versions]
     for name in [f"Java {java}", LOADERS[loader], "Server"]:
         ids.append(unique_id(name, [row for row in catalog if row["name"] == name]))
     return ids
