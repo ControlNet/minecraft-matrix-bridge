@@ -240,6 +240,10 @@ class ReleaseMetadataTests(unittest.TestCase):
         self.assertEqual(workflow.count("game_versions: ${{ matrix.curseforge_ids }}"), 2)
         self.assertEqual(workflow.count("environment: ${{ matrix.environment }}"), 2)
 
+    def test_curseforge_uploads_use_the_jar_filename_as_the_display_name(self):
+        workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/release.yml").read_text()
+        self.assertNotIn("display_name:", workflow)
+
     def test_packaged_coordinate_is_forwarded(self):
         with patch("sys.argv", ["system_test_all.py", "--packaged", "--modules", "forge-26.1",
                                 "--loader-coordinate", "26.1-62.0.9"]), \

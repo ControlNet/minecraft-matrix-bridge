@@ -1,0 +1,35 @@
+name: CurseForge File Metadata
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_ids:
+        description: Comma-separated CurseForge file IDs
+        required: true
+        type: string
+      confirmation:
+        description: Type clear-display-names to confirm
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  clear-display-names:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CURSEFORGE_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
+      CURSEFORGE_PROJECT_ID: ${{ secrets.CURSEFORGE_PROJECT_ID }}
+      FILE_IDS: ${{ inputs.file_ids }}
+      CONFIRMATION: ${{ inputs.confirmation }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate request
+        run: |
+          [[ "$CONFIRMATION" == "clear-display-names" ]]
+          [[ -n "$CURSEFORGE_TOKEN" ]]
+          [[ "$CURSEFORGE_PROJECT_ID" =~ ^[0-9]+$ ]]
+      - name: Clear display names
+        run: python3 scripts/curseforge_file_metadata.py --project-id "$CURSEFORGE_PROJECT_ID" --file-ids "$FILE_IDS"
