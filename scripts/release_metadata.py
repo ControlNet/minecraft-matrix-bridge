@@ -77,10 +77,12 @@ def resolve_curseforge(family, versions, loader, java, catalog, types):
             raise ValueError(f"Invalid CurseForge ID for {label}")
         return value
 
-    namespace = f"Minecraft {family}"
-    type_id = unique_id(namespace, [row for row in types if row["name"] == namespace])
-    ids = [unique_id(f"{namespace}:{version}", [row for row in catalog
-           if row["name"] == version and row["gameVersionTypeID"] == type_id])
+    minecraft_type_ids = {row["id"] for row in types
+                          if re.fullmatch(r"Minecraft \d+(?:\.\d+)*", row["name"])}
+    if not minecraft_type_ids:
+        raise ValueError(f"CurseForge has no Minecraft version types for {family}.x")
+    ids = [unique_id(f"Minecraft {version}", [row for row in catalog
+           if row["name"] == version and row["gameVersionTypeID"] in minecraft_type_ids])
            for version in versions]
     for name in [f"Java {java}", LOADERS[loader], "Server"]:
         ids.append(unique_id(name, [row for row in catalog if row["name"] == name]))
