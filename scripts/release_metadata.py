@@ -79,6 +79,7 @@ def resolve_curseforge(family, versions, loader, java, catalog, types):
 
     minecraft_type_ids = {row["id"] for row in types
                           if re.fullmatch(r"Minecraft \d+(?:\.\d+)*", row["name"])}
+    type_names = {row["id"]: row["name"] for row in types}
 
     def version_matches(version):
         exact = [row for row in catalog if row["name"] == version]
@@ -88,7 +89,16 @@ def resolve_curseforge(family, versions, loader, java, catalog, types):
         # exact tag name is globally unambiguous.
         return classified or exact
 
-    ids = [unique_id(f"Minecraft {version}", version_matches(version)) for version in versions]
+    def version_id(version):
+        matches = version_matches(version)
+        label = f"Minecraft {version}"
+        if len({row["id"] for row in matches}) > 1:
+            details = sorted({f"{row['id']}@{row['gameVersionTypeID']}:"
+                              f"{type_names.get(row['gameVersionTypeID'], 'unknown')}" for row in matches})
+            label += f" candidates [{', '.join(details)}]"
+        return unique_id(label, matches)
+
+    ids = [version_id(version) for version in versions]
     for name in [f"Java {java}", LOADERS[loader], "Server"]:
         ids.append(unique_id(name, [row for row in catalog if row["name"] == name]))
     return ids
