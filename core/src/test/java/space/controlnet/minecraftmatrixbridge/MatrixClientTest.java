@@ -251,6 +251,19 @@ public class MatrixClientTest {
         }
     }
 
+    @Test
+    void legacyCreatorHas100WhenTheRoomHasNoPowerLevels() throws Exception {
+        String roomId = "!nopl:example.com";
+        try (space.controlnet.minecraftmatrixbridge.testutil.MockMatrixServer server =
+                     new space.controlnet.minecraftmatrixbridge.testutil.MockMatrixServer("token", "@bot:example.com")) {
+            server.setStateError(roomId, "m.room.power_levels", "", 404);
+            server.setStateContent(roomId, "m.room.create", "", json("{\"room_version\":\"10\",\"creator\":\"@owner:x\"}"));
+            MatrixClient client = new MatrixClient(server.homeserverUrl(), "token");
+            assertEquals(100, client.getUserPowerLevel(roomId, "@owner:x"));
+            assertEquals(0, client.getUserPowerLevel(roomId, "@guest:x"));
+        }
+    }
+
     private static com.google.gson.JsonObject json(String value) {
         return com.google.gson.JsonParser.parseString(value).getAsJsonObject();
     }

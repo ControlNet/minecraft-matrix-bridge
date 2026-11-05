@@ -12,7 +12,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Optional
@@ -78,6 +78,7 @@ class MatrixCounters:
     sync_calls: int = 0
     send_calls: int = 0
     last_send_body: str = ""
+    send_bodies: list = field(default_factory=list)
 
 
 class MockMatrix:
@@ -210,6 +211,7 @@ class MockMatrix:
                     length = int(self.headers.get("Content-Length", "0") or "0")
                     body = self.rfile.read(length).decode("utf-8", errors="replace")
                     counters.last_send_body = body
+                    counters.send_bodies.append(body)
                     self._send_json(200, {"event_id": "$mock"})
                     return
 
@@ -390,6 +392,13 @@ def event_tap_alias_for_module(module: str) -> str:
         return MODULE_EVENT_ALIASES[module]
     except KeyError:
         raise ValueError(f"No event tap probe configured for module: {module}") from None
+
+
+def tap_message_body(raw: str) -> str:
+    try:
+        return str(json.loads(raw).get("body", ""))[:300]
+    except (ValueError, AttributeError):
+        return raw[:300]
 
 
 def wait_for_send_count(
@@ -681,6 +690,8 @@ def run_one(module: str, timeout_s: int, packaged: bool = False,
             proc.stdin.write(f"matrix event on {event_alias}\n")
             proc.stdin.flush()
             wait_for_send_count(module, mock, proc, q, expected_count=1, timeout_s=15)
+            # Diagnostic: show how the tapped event was serialized on this loader.
+            print(f"[{module}] event tap message: {tap_message_body(mock.counters.send_bodies[0])}", flush=True)
             proc.stdin.write(f"matrix event off {event_alias}\n")
             proc.stdin.flush()
 
