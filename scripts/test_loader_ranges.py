@@ -24,6 +24,21 @@ class LoaderRangeTests(unittest.TestCase):
         self.assertIsNotNone(match)
         self.assertEqual(match.group(1), "[21.0,)")
 
+    def test_modern_forge_has_no_loader_upper_bound(self):
+        # Forge bumps its major version for every Minecraft patch (26.2 -> 65,
+        # 26.2.1 -> 66), so a loader upper bound would reject supported patches.
+        # The Minecraft range alone bounds the family.
+        for family, minimum, loader in (("26.1", "62.0.9", "62"), ("26.2", "65.1.3", "65")):
+            source = (ROOT / f"forge-{family}" / "build.gradle").read_text()
+            for field, expected in (("forge_version_range", f"[{minimum},)"), ("loader_version_range", f"[{loader},)")):
+                with self.subTest(family=family, field=field):
+                    match = re.search(rf"\b{field}\s*=\s*'([^']+)'", source)
+                    self.assertIsNotNone(match)
+                    self.assertEqual(match.group(1), expected)
+            minecraft = re.search(r"\bminecraft_version_range\s*=\s*'([^']+)'", source).group(1)
+            major, minor = family.split(".")
+            self.assertEqual(minecraft, f"[{family},{major}.{int(minor) + 1})")
+
 
 if __name__ == "__main__":
     unittest.main()
