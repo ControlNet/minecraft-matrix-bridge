@@ -340,7 +340,7 @@ public final class ForgeHooks {
         Class<?> playerType = player.getClass();
         Method method = VIEW_DISTANCE_METHODS.get(playerType);
         if (method == null && !MISSING_VIEW_DISTANCE_METHODS.contains(playerType)) {
-            method = findViewDistanceMethod(playerType);
+            method = PlayerViewDistance.findMethod(playerType);
             if (method == null) {
                 MISSING_VIEW_DISTANCE_METHODS.add(playerType);
                 return DEFAULT_VIEW_DISTANCE;
@@ -362,17 +362,6 @@ public final class ForgeHooks {
             }
         }
         return DEFAULT_VIEW_DISTANCE;
-    }
-
-    private static Method findViewDistanceMethod(Class<?> playerType) {
-        for (String methodName : new String[]{"requestedViewDistance", "getRequestedViewDistance"}) {
-            try {
-                return playerType.getMethod(methodName);
-            } catch (NoSuchMethodException ignored) {
-                // Try the next version-specific name.
-            }
-        }
-        return null;
     }
 
     private static int getPlayerModelCustomisation(ServerPlayer player) {
