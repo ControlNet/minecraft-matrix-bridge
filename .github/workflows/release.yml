@@ -66,7 +66,11 @@ jobs:
         uses: actions/setup-java@v6
         with:
           distribution: temurin
-          java-version: "25"
+          # ForgeGradle 7 runs `modifyAccess` on Java 8; providing it avoids a flaky
+          # download from GitHub. 25 is listed last so it stays the default JAVA_HOME.
+          java-version: |
+            8
+            25
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
@@ -75,6 +79,8 @@ jobs:
         run: chmod +x ./gradlew ./gradlew-26 ./scripts/build_dist_26.sh
 
       - name: Build 26.x dist
+        env:
+          JDK8: ${{ env.JAVA_HOME_8_X64 }}
         run: ./scripts/build_dist_26.sh
 
       - name: Upload 26.x dist
