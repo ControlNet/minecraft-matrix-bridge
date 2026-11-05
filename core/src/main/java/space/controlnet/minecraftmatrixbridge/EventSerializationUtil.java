@@ -1,11 +1,25 @@
 package space.controlnet.minecraftmatrixbridge;
 
+import java.lang.reflect.Array;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Set;
+
 /**
  * Utility methods for serializing events to bounded, human-readable strings.
  *
  * <p>This utility is designed to be safe and conservative:
  * <ul>
- *   <li>Uses only {@link Object#toString()} - no reflection</li>
+ *   <li>Uses the event's own {@link Object#toString()} when it has one (records, most
+ *       26.x events). Otherwise (most Forge/NeoForge events) it lists the public
+ *       zero-argument getters, skipping event-bus plumbing, so the output and filters
+ *       see the player, position, message and so on instead of {@code Class@hash}</li>
+ *   <li>Getter failures are skipped and each value is capped at
+ *       {@value #MAX_GETTER_VALUE_LENGTH} characters</li>
  *   <li>Truncates output to a configurable maximum length</li>
  *   <li>Normalizes newlines and excessive whitespace</li>
  *   <li>Handles null inputs gracefully</li>
@@ -18,6 +32,22 @@ public final class EventSerializationUtil {
 
     /** Truncation suffix appended when output is truncated. */
     private static final String TRUNCATION_SUFFIX = "...";
+
+    static final int MAX_GETTER_VALUE_LENGTH = 200;
+    private static final int MAX_GETTERS = 32;
+    /** Event-bus plumbing that says nothing about what happened. */
+    private static final Set<String> EXCLUDED_GETTERS = Set.of(
+            "getListenerList", "isCancelable", "hasResult", "isCanceled", "getResult", "getPhase");
+
+    private record Getter(String property, Method method) {
+    }
+
+    private static final ClassValue<List<Getter>> GETTERS = new ClassValue<>() {
+        @Override
+        protected List<Getter> computeValue(Class<?> type) {
+            return findGetters(type);
+        }
+    };
 
     private EventSerializationUtil() {
         // Utility class
@@ -47,7 +77,7 @@ public final class EventSerializationUtil {
 
         String raw;
         try {
-            raw = event == null ? "null" : event.toString();
+            raw = event == null ? "null" : describe(event);
         } catch (Exception e) {
             // Defensive: toString() might throw
             raw = event == null ? "null" : event.getClass().getName() + "@<toString-error>";
@@ -62,6 +92,94 @@ public final class EventSerializationUtil {
 
         // Truncate if necessary
         return truncate(normalized, maxLength);
+    }
+
+    private static String describe(Object event) {
+        if (!overridesToString(event.getClass())) {
+            String described = describeByGetters(event);
+            if (!described.isEmpty()) {
+                return described;
+            }
+        }
+        return event.toString();
+    }
+
+    private static boolean overridesToString(Class<?> type) {
+        try {
+            return type.getMethod("toString").getDeclaringClass() != Object.class;
+        } catch (NoSuchMethodException | SecurityException e) {
+            return true;
+        }
+    }
+
+    private static String describeByGetters(Object event) {
+        StringBuilder out = new StringBuilder();
+        for (Getter getter : GETTERS.get(event.getClass())) {
+            String value;
+            try {
+                value = valueToString(getter.method().invoke(event));
+            } catch (Throwable t) {
+                if (t instanceof VirtualMachineError fatal) {
+                    throw fatal;
+                }
+                continue; // A getter that throws (or is inaccessible) is simply omitted.
+            }
+            if (out.length() > 0) {
+                out.append(", ");
+            }
+            out.append(getter.property()).append('=')
+                    .append(truncate(normalizeWhitespace(value), MAX_GETTER_VALUE_LENGTH));
+        }
+        return out.toString();
+    }
+
+    private static String valueToString(Object value) {
+        if (value == null) {
+            return "null";
+        }
+        if (value instanceof Object[] array) {
+            return Arrays.deepToString(array);
+        }
+        if (value.getClass().isArray()) {
+            List<String> items = new ArrayList<>();
+            for (int i = 0; i < Array.getLength(value); i++) {
+                items.add(String.valueOf(Array.get(value, i)));
+            }
+            return "[" + String.join(", ", items) + "]";
+        }
+        return String.valueOf(value);
+    }
+
+    private static List<Getter> findGetters(Class<?> type) {
+        List<Getter> getters = new ArrayList<>();
+        Set<String> seen = new java.util.HashSet<>();
+        for (Method method : type.getMethods()) {
+            if (method.getParameterCount() != 0 || method.getReturnType() == void.class
+                    || Modifier.isStatic(method.getModifiers()) || method.isBridge() || method.isSynthetic()
+                    || method.getDeclaringClass() == Object.class || EXCLUDED_GETTERS.contains(method.getName())) {
+                continue;
+            }
+            String property = propertyName(method.getName());
+            if (property != null && seen.add(method.getName())) {
+                getters.add(new Getter(property, method));
+            }
+        }
+        getters.sort(Comparator.comparing(Getter::property));
+        return List.copyOf(getters.size() > MAX_GETTERS ? getters.subList(0, MAX_GETTERS) : getters);
+    }
+
+    private static String propertyName(String methodName) {
+        for (String prefix : new String[]{"get", "is", "has"}) {
+            if (methodName.length() > prefix.length() && methodName.startsWith(prefix)
+                    && Character.isUpperCase(methodName.charAt(prefix.length()))) {
+                if ("has".equals(prefix)) {
+                    return methodName;
+                }
+                String rest = methodName.substring(prefix.length());
+                return Character.toLowerCase(rest.charAt(0)) + rest.substring(1);
+            }
+        }
+        return null;
     }
 
     /**
@@ -142,5 +260,26 @@ public final class EventSerializationUtil {
 
         String serialized = serialize(event, remainingLen);
         return prefix + serialized;
+    }
+
+    /** Like {@link #formatForMatrix(Object, int)} but reuses an already serialized payload. */
+    static String formatForMatrix(Object event, String serialized, int maxLength) {
+        if (event == null) {
+            return truncate("[EVT] null", maxLength);
+        }
+        String prefix = prefixFor(event);
+        int remainingLen = maxLength - prefix.length();
+        if (remainingLen < 10) {
+            return truncate(prefix, maxLength);
+        }
+        return prefix + truncate(serialized == null ? "null" : serialized, remainingLen);
+    }
+
+    private static String prefixFor(Object event) {
+        String simpleName = event.getClass().getSimpleName();
+        if (simpleName.isEmpty()) {
+            simpleName = event.getClass().getName();
+        }
+        return "[EVT] " + simpleName + ": ";
     }
 }

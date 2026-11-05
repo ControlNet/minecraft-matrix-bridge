@@ -22,8 +22,10 @@ from urllib.request import Request, urlopen
 
 
 MODERN_MODULE_EVENT_ALIASES = {
-    "forge-26.1": "TickEvent.ServerTickEvent.Post",
-    "forge-26.2": "TickEvent.ServerTickEvent.Post",
+    # Forge 26's ServerTickEvent is a sealed interface over Pre/Post, not an Event
+    # subtype; tapping the family exercises the sealed-family path.
+    "forge-26.1": "TickEvent.ServerTickEvent",
+    "forge-26.2": "TickEvent.ServerTickEvent",
     "neoforge-26.1": "ServerTickEvent.Post",
     "neoforge-26.2": "ServerTickEvent.Post",
 }

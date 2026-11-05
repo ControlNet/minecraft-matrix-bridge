@@ -19,6 +19,7 @@ sourceSets {
         java {
             srcDir rootProject.file('forge-shared/common/src/main/java')
             srcDir rootProject.file('forge-shared/forge-26/src/main/java')
+            srcDir rootProject.file('forge-shared/eventbus7/src/main/java')
         }
         resources {
             srcDir project(':core').file('src/main/resources')

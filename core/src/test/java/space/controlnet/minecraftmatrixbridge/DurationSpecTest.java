@@ -315,4 +315,11 @@ public class DurationSpecTest {
         DurationSpec spec2 = DurationSpec.timed(60_000);
         assertNotEquals(spec1, spec2);
     }
+
+    @Test
+    void calculateExpiresAtMsSaturatesInsteadOfOverflowing() {
+        // 106751991167d is the largest whole-day duration that parse() accepts.
+        DurationSpec spec = DurationSpec.parse("106751991167d");
+        assertEquals(Long.MAX_VALUE, spec.calculateExpiresAtMs(1_700_000_000_000L));
+    }
 }

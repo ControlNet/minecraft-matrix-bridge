@@ -33,6 +33,17 @@ public abstract class AbstractEventTapManager<E> {
     private static final long DEFAULT_THROTTLE_MS = 1000;
     private static final int MAX_MESSAGE_LEN = 2048;
     private static final long TICK_EVENT_MIN_THROTTLE_MS = 1000;
+    /** Tick events fire 20+ times a second; each tap looks at one at most this often. */
+    private static final long TICK_EVALUATION_INTERVAL_MS = 1000;
+    private static final long MAX_TICK_TAP_DURATION_MS = 24L * 60 * 60 * 1000;
+    private static final ClassValue<Boolean> TICK_EVENT_TYPES = new ClassValue<>() {
+        @Override
+        protected Boolean computeValue(Class<?> type) {
+            return isTickEventName(type.getName());
+        }
+    };
+
+    private final Object admissionLock = new Object();
 
     private final BridgeService bridgeService;
     private final AtomicReference<EventIndex> eventIndexRef = new AtomicReference<>(null);
@@ -200,11 +211,6 @@ public abstract class AbstractEventTapManager<E> {
             return "Event taps cannot deliver anything while MC -> Matrix is disabled (bridge.enableMcToMatrix=false).";
         }
 
-        int activeCount = countActiveTaps();
-        if (activeCount >= maxActiveTaps) {
-            return "Maximum active taps reached (" + maxActiveTaps + "). Disable some taps first with: event off <eventName>";
-        }
-
         DurationSpec duration;
         try {
             duration = DurationSpec.parse(durationStr);
@@ -212,13 +218,16 @@ public abstract class AbstractEventTapManager<E> {
             return "Invalid duration: " + durationStr + ". Use: once, permanent, or <N>s|m|h|d";
         }
 
-        boolean isTickEvent = fqcn.toLowerCase(Locale.ROOT).contains("tick");
+        boolean isTickEvent = isTickEventName(fqcn);
         long throttleMs = defaultThrottleMs;
         if (isTickEvent && throttleMs < TICK_EVENT_MIN_THROTTLE_MS) {
             throttleMs = TICK_EVENT_MIN_THROTTLE_MS;
         }
         if (isTickEvent && duration.mode == DurationSpec.Mode.PERMANENT) {
             return "Permanent subscriptions are not allowed for tick events due to performance concerns. Use a timed duration instead.";
+        }
+        if (isTickEvent && duration.mode == DurationSpec.Mode.TIMED && duration.durationMs > MAX_TICK_TAP_DURATION_MS) {
+            return "Tick event taps are limited to 24h. Use a shorter duration.";
         }
 
         String normalizedFilter = FilterUtil.normalize(filter);
@@ -231,15 +240,24 @@ public abstract class AbstractEventTapManager<E> {
                 throttleMs
         );
 
-        try {
-            ensureListenerRegistered(eventClass);
-        } catch (RuntimeException | LinkageError e) {
-            LOGGER.log(Level.WARNING, "Failed to register event listener for " + fqcn, e);
-            return "Failed to register event listener for: " + fqcn + ". Check the server log for details.";
-        }
+        // Counting and adding under one lock keeps concurrent Matrix and in-game
+        // commands from exceeding maxActiveTaps.
+        synchronized (admissionLock) {
+            int activeCount = countActiveTaps();
+            if (activeCount >= maxActiveTaps) {
+                return "Maximum active taps reached (" + maxActiveTaps + "). Disable some taps first with: event off <eventName>";
+            }
 
-        SubscriptionBucket bucket = subscriptions.computeIfAbsent(fqcn, k -> new SubscriptionBucket());
-        bucket.add(sub);
+            try {
+                ensureListenerRegistered(eventClass);
+            } catch (RuntimeException | LinkageError e) {
+                LOGGER.log(Level.WARNING, "Failed to register event listener for " + fqcn, e);
+                return "Failed to register event listener for: " + fqcn + ". Check the server log for details.";
+            }
+
+            SubscriptionBucket bucket = subscriptions.computeIfAbsent(fqcn, k -> new SubscriptionBucket());
+            bucket.add(sub);
+        }
 
         String durationDisplay = duration.toDisplayString();
         String filterDisplay = normalizedFilter == null ? "(none)" : "'" + filter + "'";
@@ -421,10 +439,21 @@ public abstract class AbstractEventTapManager<E> {
         }
 
         long nowMs = System.currentTimeMillis();
+        boolean tickEvent = event != null && TICK_EVENT_TYPES.get(event.getClass());
         String serialized = null;
 
         for (Subscription sub : enabled) {
+            // A permanent tap on a supertype (e.g. the Event base) would otherwise stream
+            // every tick event forever; only timed or one-shot taps see ticks.
+            if (tickEvent && sub.mode == DurationSpec.Mode.PERMANENT) {
+                continue;
+            }
             if (!sub.shouldForward(nowMs)) {
+                continue;
+            }
+            // Sample tick events before serializing, so a filter that never matches
+            // does not serialize every tick.
+            if (tickEvent && !sub.tryClaimEvaluation(nowMs, TICK_EVALUATION_INTERVAL_MS)) {
                 continue;
             }
 
@@ -436,12 +465,24 @@ public abstract class AbstractEventTapManager<E> {
                 continue;
             }
 
-            String msg = EventSerializationUtil.formatForMatrix(event, MAX_MESSAGE_LEN);
-            bridgeService.enqueueMcMessage(msg);
-            sub.recordMatch(nowMs);
+            // Events can fire on several threads at once; only one may claim a one-shot
+            // tap or a throttle window.
+            if (!sub.tryClaimForward(nowMs)) {
+                continue;
+            }
+            forward(EventSerializationUtil.formatForMatrix(event, serialized, MAX_MESSAGE_LEN));
         }
 
         bucket.cleanupExpired(nowMs);
+    }
+
+    static boolean isTickEventName(String fqcn) {
+        return fqcn.toLowerCase(Locale.ROOT).contains("tick");
+    }
+
+    /** Sends one tap message; overridden in tests. */
+    void forward(String message) {
+        bridgeService.enqueueMcMessage(message);
     }
 
     private Class<?> tryLoadClass(String fqcn) {
@@ -519,7 +560,7 @@ public abstract class AbstractEventTapManager<E> {
             cleanupExpired(System.currentTimeMillis());
             List<Subscription> result = new ArrayList<>();
             for (Subscription sub : subs) {
-                if (sub.enabled) {
+                if (sub.enabled.get()) {
                     result.add(sub);
                 }
             }
@@ -530,8 +571,7 @@ public abstract class AbstractEventTapManager<E> {
             cleanupExpired(System.currentTimeMillis());
             int count = 0;
             for (Subscription sub : subs) {
-                if (sub.enabled) {
-                    sub.enabled = false;
+                if (sub.enabled.getAndSet(false)) {
                     count++;
                 }
             }
@@ -541,7 +581,7 @@ public abstract class AbstractEventTapManager<E> {
         synchronized boolean isEmpty() {
             cleanupExpired(System.currentTimeMillis());
             for (Subscription sub : subs) {
-                if (sub.enabled) {
+                if (sub.enabled.get()) {
                     return false;
                 }
             }
@@ -549,7 +589,7 @@ public abstract class AbstractEventTapManager<E> {
         }
 
         synchronized void cleanupExpired(long nowMs) {
-            subs.removeIf(sub -> !sub.enabled || (sub.mode == DurationSpec.Mode.TIMED && nowMs > sub.expiresAtMs));
+            subs.removeIf(sub -> !sub.enabled.get() || (sub.mode == DurationSpec.Mode.TIMED && nowMs > sub.expiresAtMs));
         }
     }
 
@@ -562,7 +602,8 @@ public abstract class AbstractEventTapManager<E> {
         final long minIntervalMs;
         final AtomicLong matchCount = new AtomicLong(0);
         final AtomicLong lastForwardedAtMs = new AtomicLong(0);
-        volatile boolean enabled = true;
+        final AtomicLong lastEvaluatedAtMs = new AtomicLong(Long.MIN_VALUE);
+        final AtomicBoolean enabled = new AtomicBoolean(true);
 
         Subscription(UUID id, String fqcn, String filterLower, DurationSpec.Mode mode, long expiresAtMs, long minIntervalMs) {
             this.id = id;
@@ -573,24 +614,44 @@ public abstract class AbstractEventTapManager<E> {
             this.minIntervalMs = minIntervalMs;
         }
 
+        /** Cheap pre-check; {@link #tryClaimForward} makes the decision atomically. */
         boolean shouldForward(long nowMs) {
-            if (!enabled) return false;
+            if (!enabled.get()) return false;
             if (mode == DurationSpec.Mode.TIMED && nowMs > expiresAtMs) {
-                enabled = false;
+                enabled.set(false);
                 return false;
             }
-            if (nowMs - lastForwardedAtMs.get() < minIntervalMs) {
-                return false;
-            }
-            return true;
+            return nowMs - lastForwardedAtMs.get() >= minIntervalMs;
         }
 
-        void recordMatch(long nowMs) {
-            matchCount.incrementAndGet();
-            lastForwardedAtMs.set(nowMs);
-            if (mode == DurationSpec.Mode.ONCE) {
-                enabled = false;
+        /** Claims the right to look at an event, at most once per {@code intervalMs}. */
+        boolean tryClaimEvaluation(long nowMs, long intervalMs) {
+            long last = lastEvaluatedAtMs.get();
+            if (last != Long.MIN_VALUE && nowMs - last < intervalMs) {
+                return false;
             }
+            return lastEvaluatedAtMs.compareAndSet(last, nowMs);
+        }
+
+        /** Atomically claims the throttle window and, for one-shot taps, the single forward. */
+        boolean tryClaimForward(long nowMs) {
+            while (true) {
+                if (!enabled.get()) {
+                    return false;
+                }
+                long last = lastForwardedAtMs.get();
+                if (nowMs - last < minIntervalMs) {
+                    return false;
+                }
+                if (lastForwardedAtMs.compareAndSet(last, nowMs)) {
+                    break;
+                }
+            }
+            if (mode == DurationSpec.Mode.ONCE && !enabled.compareAndSet(true, false)) {
+                return false;
+            }
+            matchCount.incrementAndGet();
+            return true;
         }
     }
 }
