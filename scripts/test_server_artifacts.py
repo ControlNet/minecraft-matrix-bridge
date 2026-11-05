@@ -78,6 +78,32 @@ class ArtifactTests(unittest.TestCase):
         output.get_nowait()  # Bridge readiness may consume the log before the event probe.
         system_test_all.wait_for_event_index_ready("forge-1.18", None, output, timeout_s=1, probe=probe)
 
+    def test_matrix_probe_arrives_after_the_discarded_initial_sync(self):
+        import json as _json
+        from urllib.request import Request, urlopen
+        mock = system_test_all.MockMatrix("t", "@bot:x", "!r:x", "#r:x")
+        base = mock.start()
+        try:
+            bodies = []
+            for _ in range(3):
+                request = Request(f"{base}/_matrix/client/v3/sync", headers={"Authorization": "Bearer t"})
+                with urlopen(request, timeout=5) as response:
+                    events = _json.load(response)["rooms"]["join"]["!r:x"]["timeline"]["events"]
+                bodies.append([event["event_id"] for event in events])
+        finally:
+            mock.stop()
+        # Sync #1 is the initial catch-up that the bridge discards by design.
+        self.assertEqual(bodies[system_test_all.MATRIX_PROBE_SYNC - 1], [f"$e{system_test_all.MATRIX_PROBE_SYNC}"])
+        self.assertEqual(bodies[2], [])
+
+    def test_broadcast_probe_is_seen_even_if_readiness_consumed_the_line(self):
+        probe = system_test_all.LogProbe(system_test_all.MATRIX_PROBE_EXPECTED)
+        output = queue.Queue()
+        system_test_all._reader_thread(io.StringIO("[Server thread/INFO]: " + system_test_all.MATRIX_PROBE_EXPECTED + "\n"),
+                                       output, None, probe)
+        output.get_nowait()
+        system_test_all.wait_for_log_probe("forge-1.19", probe, None, output, timeout_s=1)
+
     def test_empty_event_index_is_rejected(self):
         probe = system_test_all.EventIndexProbe()
         probe.record("Event index built in 5 ms: scanned 0 jars, 0 classes, found 0 events\n")

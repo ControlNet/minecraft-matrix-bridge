@@ -35,6 +35,14 @@ MODULE_EVENT_ALIASES = {
     "neoforge-1.21": "net.neoforged.neoforge.event.tick.ServerTickEvent$Post",
 }
 
+MATRIX_PROBE_SYNC = 2
+MATRIX_PROBE_SENDER = "@alice:example.com"
+# Include a formatting code so the sanitizing path runs. Minecraft strips
+# formatting codes from its own console log, so this probe cannot prove the
+# bridge removed them; core unit tests cover that.
+MATRIX_PROBE_BODY = "hello \u00a7cfrom mock"
+MATRIX_PROBE_EXPECTED = f"[Matrix] <{MATRIX_PROBE_SENDER}> hello from mock"
+
 EVENT_INDEX_SUMMARY = re.compile(
     r"Event index built in \d+ ms: scanned (\d+) jars, (\d+) classes, found (\d+) events"
 )
@@ -153,15 +161,18 @@ class MockMatrix:
                     next_batch = f"s{outer._sync_next_batch}"
 
                     events = []
-                    if outer._sync_next_batch == 1:
+                    # Sync #1 is the initial catch-up, which the bridge discards by
+                    # design. Deliver the probe message on the first incremental sync
+                    # so the Matrix -> Minecraft broadcast path actually executes.
+                    if outer._sync_next_batch in (1, MATRIX_PROBE_SYNC):
                         events = [
                             {
                                 "type": "m.room.message",
                                 "event_id": f"$e{outer._sync_next_batch}",
-                                "sender": "@alice:example.com",
+                                "sender": MATRIX_PROBE_SENDER,
                                 "content": {
                                     "msgtype": "m.text",
-                                    "body": "hello from mock",
+                                    "body": MATRIX_PROBE_BODY,
                                 },
                             }
                         ]
@@ -338,6 +349,40 @@ def wait_for_bridge_ready(
     )
 
 
+class LogProbe:
+    """Records whether a server output line contains the expected text."""
+
+    def __init__(self, needle: str) -> None:
+        self.needle = needle
+        self.done = threading.Event()
+
+    def record(self, line: str) -> None:
+        if self.needle in line:
+            self.done.set()
+
+
+def wait_for_log_probe(
+    module: str,
+    probe: LogProbe,
+    proc: subprocess.Popen[str],
+    out_queue: "queue.Queue[str]",
+    timeout_s: int,
+) -> None:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if probe.done.is_set():
+            return
+        try:
+            line = out_queue.get(timeout=0.5)
+        except queue.Empty:
+            if proc.poll() is not None:
+                break
+            continue
+        if not line.startswith("Downloading: "):
+            sys.stdout.write(f"[{module}] {line}")
+    raise RuntimeError(f"{module}: Matrix message was not broadcast to Minecraft: expected {probe.needle!r}")
+
+
 def event_tap_alias_for_module(module: str) -> str:
     try:
         return MODULE_EVENT_ALIASES[module]
@@ -403,10 +448,13 @@ def wait_for_event_index_ready(
     raise RuntimeError(f"{module}: event index did not finish building before timeout")
 
 
-def _reader_thread(stream, out_queue: "queue.Queue[str]", event_index_probe: EventIndexProbe | None = None) -> None:
+def _reader_thread(stream, out_queue: "queue.Queue[str]", event_index_probe: EventIndexProbe | None = None,
+                   log_probe: LogProbe | None = None) -> None:
     for line in iter(stream.readline, ""):
         if event_index_probe is not None and "Event index built in" in line:
             event_index_probe.record(line)
+        if log_probe is not None:
+            log_probe.record(line)
         out_queue.put(line)
     stream.close()
 
@@ -594,7 +642,9 @@ def run_one(module: str, timeout_s: int, packaged: bool = False,
 
         q: "queue.Queue[str]" = queue.Queue()
         event_index_probe = EventIndexProbe()
-        t = threading.Thread(target=_reader_thread, args=(proc.stdout, q, event_index_probe), daemon=True)
+        broadcast_probe = LogProbe(MATRIX_PROBE_EXPECTED)
+        t = threading.Thread(target=_reader_thread, args=(proc.stdout, q, event_index_probe, broadcast_probe),
+                             daemon=True)
         t.start()
 
         started = False
@@ -620,6 +670,7 @@ def run_one(module: str, timeout_s: int, packaged: bool = False,
             )
 
         state = wait_for_bridge_ready(module, run_dir, mock, proc, q, timeout_s=30)
+        wait_for_log_probe(module, broadcast_probe, proc, q, timeout_s=30)
 
         if module in MODULE_EVENT_ALIASES:
             wait_for_event_index_ready(module, proc, q, timeout_s=60, probe=event_index_probe)

@@ -10,6 +10,7 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.storage.LevelResource;
+import net.minecraftforge.event.ServerChatEvent;
 
 import java.nio.file.Path;
 import java.util.List;
@@ -75,5 +76,9 @@ class ForgeMinecraftCompat {
 
     void broadcast(MinecraftServer server, String message) {
         server.getPlayerList().broadcastSystemMessage(text(message), false);
+    }
+
+    String chatMessage(ServerChatEvent event) {
+        return event.getMessage().getString();
     }
 }

@@ -216,7 +216,7 @@ public final class ForgeHooks {
             return;
         }
 
-        String msg = event.getMessage().getString();
+        String msg = MC.chatMessage(event);
         if (msg == null || msg.isBlank()) {
             return;
         }
