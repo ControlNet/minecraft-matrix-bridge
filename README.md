@@ -129,7 +129,9 @@ Same commands available via Matrix (requires `bridge.enableMatrixToMc=true` and 
 - `!mc event search <query>`
 - `!mc event help`
 
-Matrix event commands require the sender to have a power level >= `bridge.eventCommandMinPowerLevel` (default 50).
+Matrix event commands require the sender to have a power level >= `bridge.eventCommandMinPowerLevel` (default 50). In room version 12 and later, room creators always qualify.
+
+Arguments may be quoted in both places: `"two words"` is one filter and `""` means no filter. Event taps also need `bridge.enableMcToMatrix=true`, because their output is sent to the Matrix room.
 
 ### Safety Features
 - Master switch (`enableEventTaps`) - Disable entirely to skip event indexing at startup
@@ -153,6 +155,7 @@ Matrix event commands require the sender to have a power level >= `bridge.eventC
 
 # From Matrix
 !mc event on ServerChatEvent
+!mc event on PlayerLoggedInEvent "" 10m
 !mc event list
 !mc event off ServerChatEvent
 ```

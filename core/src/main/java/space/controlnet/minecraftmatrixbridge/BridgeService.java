@@ -27,7 +27,7 @@ public final class BridgeService {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean ready = new AtomicBoolean(false);
 
-    private BridgeSettings settings;
+    private volatile BridgeSettings settings;
     private MatrixClient matrixClient;
     private SinceStore sinceStore;
     private EventDeduplicator dedup;
@@ -147,7 +147,8 @@ public final class BridgeService {
 
     public boolean enqueueMcMessage(String formattedText) {
         BlockingQueue<String> q = outgoingQueue;
-        if (!running.get() || q == null) {
+        if (!running.get() || q == null || isMcToMatrixDisabledByConfig()) {
+            // Without MC -> Matrix there is no sender thread; queued messages would never leave.
             return false;
         }
         boolean ok = q.offer(formattedText);
@@ -160,6 +161,12 @@ public final class BridgeService {
             }
         }
         return ok;
+    }
+
+    /** True when the running bridge was configured without MC -> Matrix forwarding. */
+    public boolean isMcToMatrixDisabledByConfig() {
+        BridgeSettings s = settings;
+        return s != null && !s.enableMcToMatrix;
     }
 
     public boolean isRunning() {
@@ -191,6 +198,7 @@ public final class BridgeService {
             }
             selfUserId = userId;
             sinceStore.saveSelfUserId(userId);
+            sinceStore.bindOwner(settings.homeserver + "|" + userId);
 
             String roomId = resolveRoomIdWithRetry(settings.roomId);
             if (!running.get() || roomId == null || roomId.isBlank()) {
@@ -527,6 +535,15 @@ public final class BridgeService {
                     sleepMs(60_000);
                     continue;
                 }
+                if (isRejectedSince(e, since)) {
+                    // A homeserver reset or token from another server makes the since token
+                    // permanently invalid; retrying it would stall Matrix -> MC forever.
+                    LOGGER.warning("Matrix rejected the stored sync token (" + e.getMessage() + "); starting a fresh sync.");
+                    sinceStore.saveSince("");
+                    since = initialCatchup(filterJson);
+                    backoffMs = 1_000;
+                    continue;
+                }
                 long sleepMs = (e.statusCode == 429 && e.retryAfterMs > 0) ? e.retryAfterMs : jitter(backoffMs);
                 LOGGER.warning("Matrix sync failed (" + e.getMessage() + "); retrying in " + sleepMs + " ms.");
                 sleepMs(sleepMs);
@@ -546,6 +563,11 @@ public final class BridgeService {
                 backoffMs = nextBackoff(backoffMs);
             }
         }
+    }
+
+    private static boolean isRejectedSince(MatrixClient.MatrixException e, String since) {
+        return since != null && !since.isBlank()
+                && e.statusCode >= 400 && e.statusCode < 500 && e.statusCode != 429;
     }
 
     private String initialCatchup(String filterJson) {
@@ -646,8 +668,7 @@ public final class BridgeService {
             if (!"m.text".equals(msgType)) {
                 continue;
             }
-            String body = getString(content, "body");
-            body = sanitizeOneLine(body);
+            String body = sanitizeForMinecraft(getString(content, "body"));
             if (body.isBlank()) {
                 continue;
             }
@@ -660,15 +681,15 @@ public final class BridgeService {
             MatrixClient client = matrixClient;
             if (client != null) {
                 try {
-                    String dn = client.getRoomMemberDisplayName(roomId, sender);
-                    if (dn != null && !dn.isBlank()) {
+                    String dn = sanitizeForMinecraft(client.getRoomMemberDisplayName(roomId, sender));
+                    if (!dn.isBlank()) {
                         displaySender = dn;
                     }
                 } catch (Exception ignored) {
                 }
             }
 
-            String line = settings.matrixToMcPrefix + "<" + displaySender + "> " + body;
+            String line = settings.matrixToMcPrefix + "<" + sanitizeForMinecraft(displaySender) + "> " + body;
             McCallbacks cb = callbacks;
             if (cb != null) {
                 cb.broadcast(line);
@@ -700,7 +721,7 @@ public final class BridgeService {
         }
 
         String rest = trimmed.substring(prefix.length()).trim();
-        String[] parts = rest.isEmpty() ? new String[0] : rest.split("\\s+");
+        String[] parts = tokenizeCommand(rest).toArray(new String[0]);
         String sub = (parts.length >= 1) ? parts[0].toLowerCase(Locale.ROOT) : "help";
 
         if ("help".equals(sub)) {
@@ -839,6 +860,41 @@ public final class BridgeService {
         }
     }
 
+    /**
+     * Splits a bot command into arguments. Double quotes (straight, or the curly quotes
+     * that mobile keyboards substitute) group words, and {@code ""} is an empty argument,
+     * so {@code event on X "" 10m} skips the filter. An unterminated quote runs to the end.
+     */
+    static List<String> tokenizeCommand(String text) {
+        List<String> tokens = new java.util.ArrayList<>();
+        if (text == null) {
+            return tokens;
+        }
+        int i = 0;
+        int n = text.length();
+        while (i < n) {
+            char c = text.charAt(i);
+            if (Character.isWhitespace(c)) {
+                i++;
+                continue;
+            }
+            if (c == '"' || c == '\u201c') {
+                char close = c == '"' ? '"' : '\u201d';
+                int end = text.indexOf(close, i + 1);
+                tokens.add(end < 0 ? text.substring(i + 1) : text.substring(i + 1, end));
+                i = end < 0 ? n : end + 1;
+                continue;
+            }
+            int start = i;
+            while (i < n && !Character.isWhitespace(text.charAt(i))) {
+                i++;
+            }
+            tokens.add(text.substring(start, i));
+        }
+        return tokens;
+    }
+
+    /** Matrix only needs this room's message timeline; skip everything else the server would send. */
     private static String buildFilterJson(String roomId, int timelineLimit) {
         JsonObject timeline = new JsonObject();
         timeline.addProperty("limit", timelineLimit);
@@ -853,17 +909,52 @@ public final class BridgeService {
             room.add("rooms", rooms);
         }
         room.add("timeline", timeline);
+        room.add("state", excludeAll());
+        room.add("ephemeral", excludeAll());
+        room.add("account_data", excludeAll());
 
         JsonObject filter = new JsonObject();
         filter.add("room", room);
+        filter.add("presence", excludeAll());
+        filter.add("account_data", excludeAll());
         return filter.toString();
     }
 
-    private static String sanitizeOneLine(String text) {
+    private static JsonObject excludeAll() {
+        JsonArray all = new JsonArray();
+        all.add("*");
+        JsonObject eventFilter = new JsonObject();
+        eventFilter.add("not_types", all);
+        return eventFilter;
+    }
+
+    /**
+     * Makes Matrix text safe for Minecraft chat: drops section-sign formatting codes
+     * (so remote users cannot obfuscate or recolour messages) and turns control
+     * characters, including newlines, into spaces.
+     */
+    static String sanitizeForMinecraft(String text) {
         if (text == null) {
             return "";
         }
-        return text.replace('\r', ' ').replace('\n', ' ').trim();
+        StringBuilder out = new StringBuilder(text.length());
+        int i = 0;
+        while (i < text.length()) {
+            int cp = text.codePointAt(i);
+            i += Character.charCount(cp);
+            if (cp == '\u00a7') {
+                if (i < text.length()) {
+                    i += Character.charCount(text.codePointAt(i));
+                }
+                continue;
+            }
+            if (Character.isISOControl(cp)) {
+                out.append(' ');
+            } else {
+                out.appendCodePoint(cp);
+            }
+        }
+        return out.toString().trim();
     }
 
     private static String getString(JsonObject obj, String key) {

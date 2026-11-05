@@ -183,34 +183,138 @@ public final class MatrixClient {
 
         HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
         int status = response.statusCode();
-        if (status == 404) {
-            return 0;
-        }
-        if (status / 100 != 2) {
+        if (status != 404 && status / 100 != 2) {
             throw toException("power_levels", response);
         }
 
-        try {
-            JsonObject obj = JsonParser.parseString(response.body()).getAsJsonObject();
-            
-            // Check user-specific power level first
-            JsonObject users = getObject(obj, "users");
+        JsonObject powerLevels = null;
+        if (status != 404) {
+            try {
+                JsonElement parsed = JsonParser.parseString(response.body());
+                powerLevels = parsed.isJsonObject() ? parsed.getAsJsonObject() : new JsonObject();
+            } catch (Exception e) {
+                return 0;
+            }
+        }
+
+        if (powerLevels != null) {
+            JsonObject users = getObject(powerLevels, "users");
             if (users != null) {
                 JsonElement userLevel = users.get(uid);
                 if (userLevel != null && userLevel.isJsonPrimitive()) {
-                    return userLevel.getAsInt();
+                    return intOr(userLevel, 0);
                 }
             }
-            
-            // Fall back to users_default
-            JsonElement usersDefault = obj.get("users_default");
-            if (usersDefault != null && usersDefault.isJsonPrimitive()) {
-                return usersDefault.getAsInt();
+        }
+
+        // Room creators are not always listed in "users": in room v12+ they have
+        // unbounded power, and without a power_levels event the creator has 100.
+        RoomCreators creators = roomCreators(rid);
+        if (creators.contains(uid)) {
+            if (creators.privileged) {
+                return Integer.MAX_VALUE;
             }
-            
+            if (powerLevels == null) {
+                return 100;
+            }
+        }
+
+        if (powerLevels == null) {
             return 0;
-        } catch (Exception e) {
-            return 0;
+        }
+        JsonElement usersDefault = powerLevels.get("users_default");
+        return usersDefault != null && usersDefault.isJsonPrimitive() ? intOr(usersDefault, 0) : 0;
+    }
+
+    private static int intOr(JsonElement value, int fallback) {
+        try {
+            return value.getAsInt();
+        } catch (RuntimeException e) {
+            return fallback;
+        }
+    }
+
+    /** Room versions whose creators are ordinary power-level users (MSC4289 changed this in v12). */
+    private static final Set<String> LEGACY_ROOM_VERSIONS =
+            Set.of("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11");
+
+    private final java.util.concurrent.ConcurrentHashMap<String, RoomCreators> creatorsCache =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Looks up the room's creators. Lookup failures fail closed (no creator privilege)
+     * and are not cached, so a later command can succeed.
+     */
+    private RoomCreators roomCreators(String roomId) throws InterruptedException {
+        RoomCreators cached = creatorsCache.get(roomId);
+        if (cached != null) {
+            return cached;
+        }
+        try {
+            JsonObject content = getJson(roomPath(roomId) + "/state/m.room.create/", "room_create");
+            String version = getString(content, "room_version");
+            if (version.isEmpty()) {
+                version = "1"; // The spec default when room_version is absent.
+            }
+            Set<String> users = new java.util.HashSet<>();
+            boolean privileged = !LEGACY_ROOM_VERSIONS.contains(version);
+            if (privileged) {
+                // v12 room IDs are the create event's reference hash, so the event ID is derivable.
+                if (!roomId.startsWith("!") || roomId.contains(":")) {
+                    throw new MatrixException("room " + roomId + " has version " + version
+                            + " but a server-scoped room ID", 0, 0);
+                }
+                JsonObject event = getJson(roomPath(roomId) + "/event/" + urlEncodePath("$" + roomId.substring(1)), "room_create_event");
+                String sender = getString(event, "sender");
+                if (!sender.isEmpty()) {
+                    users.add(sender);
+                }
+                JsonObject eventContent = getObject(event, "content");
+                JsonElement additional = eventContent == null ? null : eventContent.get("additional_creators");
+                if (additional != null && additional.isJsonArray()) {
+                    for (JsonElement creator : additional.getAsJsonArray()) {
+                        if (creator.isJsonPrimitive()) {
+                            users.add(creator.getAsString());
+                        }
+                    }
+                }
+            } else {
+                String creator = getString(content, "creator");
+                if (!creator.isEmpty()) {
+                    users.add(creator);
+                }
+            }
+            RoomCreators result = new RoomCreators(Set.copyOf(users), privileged);
+            creatorsCache.put(roomId, result);
+            return result;
+        } catch (IOException | MatrixException | RuntimeException e) {
+            java.util.logging.Logger.getLogger("MatrixBridge").warning(
+                    "MatrixBridge could not determine the creators of " + roomId + " (" + e.getMessage()
+                            + "); treating creators as ordinary users.");
+            return new RoomCreators(Set.of(), false);
+        }
+    }
+
+    private String roomPath(String roomId) {
+        return homeserver + "/_matrix/client/v3/rooms/" + urlEncodePath(roomId);
+    }
+
+    private JsonObject getJson(String uri, String op) throws IOException, InterruptedException, MatrixException {
+        HttpRequest request = newRequest()
+                .uri(URI.create(uri))
+                .header("Authorization", "Bearer " + accessToken)
+                .GET()
+                .build();
+        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        if (response.statusCode() / 100 != 2) {
+            throw toException(op, response);
+        }
+        return JsonParser.parseString(response.body()).getAsJsonObject();
+    }
+
+    private record RoomCreators(Set<String> users, boolean privileged) {
+        boolean contains(String userId) {
+            return users.contains(userId);
         }
     }
 
@@ -286,6 +390,9 @@ public final class MatrixClient {
         JsonObject body = new JsonObject();
         body.addProperty("msgtype", "m.text");
         body.addProperty("body", text == null ? "" : text);
+        // Relayed Minecraft chat is untrusted: an empty m.mentions stops clients from
+        // treating "@room" or display names in the body as pings (Matrix 1.7+).
+        body.add("m.mentions", new JsonObject());
 
         HttpRequest request = newRequest()
                 .uri(URI.create(uri))

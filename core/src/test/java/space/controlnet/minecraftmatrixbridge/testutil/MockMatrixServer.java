@@ -35,6 +35,10 @@ public final class MockMatrixServer implements AutoCloseable {
     private final List<RecordedRequest> directoryRequests = Collections.synchronizedList(new ArrayList<>());
     private final List<RecordedRequest> joinedRoomsRequests = Collections.synchronizedList(new ArrayList<>());
     private final List<RecordedRequest> joinRequests = Collections.synchronizedList(new ArrayList<>());
+    private final List<RecordedRequest> syncRequests = Collections.synchronizedList(new ArrayList<>());
+    private final Map<String, JsonObject> stateContents = new ConcurrentHashMap<>();
+    private final Map<String, Integer> stateErrors = new ConcurrentHashMap<>();
+    private final Map<String, JsonObject> roomEvents = new ConcurrentHashMap<>();
     private final AtomicInteger whoamiCalls = new AtomicInteger();
     private final AtomicInteger sendCalls = new AtomicInteger();
     private final AtomicInteger resolveAliasCalls = new AtomicInteger();
@@ -52,6 +56,9 @@ public final class MockMatrixServer implements AutoCloseable {
     private volatile long joinRetryAfterMs = 0;
     private volatile int sync429Remaining = 0;
     private volatile long syncRetryAfterMs = 0;
+    private volatile int syncErrorRemaining = 0;
+    private volatile int syncErrorStatus = 0;
+    private volatile String syncErrorCode = "";
 
     private volatile String roomAlias = "";
     private volatile String roomIdForAlias = "";
@@ -124,6 +131,33 @@ public final class MockMatrixServer implements AutoCloseable {
     public void setSyncRateLimit(int times, long retryAfterMs) {
         sync429Remaining = Math.max(0, times);
         syncRetryAfterMs = Math.max(0, retryAfterMs);
+    }
+
+    /** Fail the next {@code times} sync requests with {@code status} and Matrix {@code errcode}. */
+    public void setSyncError(int times, int status, String errcode) {
+        syncErrorStatus = status;
+        syncErrorCode = errcode == null ? "" : errcode;
+        syncErrorRemaining = Math.max(0, times);
+    }
+
+    public List<RecordedRequest> getSyncRequests() {
+        synchronized (syncRequests) {
+            return List.copyOf(syncRequests);
+        }
+    }
+
+    /** Serve GET /rooms/{roomId}/state/{type}/{stateKey} with {@code content}. */
+    public void setStateContent(String roomId, String type, String stateKey, JsonObject content) {
+        stateContents.put(roomId + "|" + type + "|" + stateKey, content);
+    }
+
+    public void setStateError(String roomId, String type, String stateKey, int status) {
+        stateErrors.put(roomId + "|" + type + "|" + stateKey, status);
+    }
+
+    /** Serve GET /rooms/{roomId}/event/{eventId} with {@code event}. */
+    public void setRoomEvent(String roomId, String eventId, JsonObject event) {
+        roomEvents.put(roomId + "|" + eventId, event);
     }
 
     public int whoamiCallCount() {
@@ -391,6 +425,18 @@ public final class MockMatrixServer implements AutoCloseable {
             return;
         }
 
+        syncRequests.add(new RecordedRequest(exchange.getRequestMethod(), exchange.getRequestURI().getRawPath(),
+                exchange.getRequestURI().getRawQuery(), null, ""));
+
+        if (syncErrorRemaining > 0) {
+            syncErrorRemaining--;
+            JsonObject body = new JsonObject();
+            body.addProperty("errcode", syncErrorCode);
+            body.addProperty("error", "mock sync error");
+            respondJson(exchange, syncErrorStatus, body);
+            return;
+        }
+
         if (sync429Remaining > 0) {
             sync429Remaining--;
             JsonObject body = new JsonObject();
@@ -476,14 +522,37 @@ public final class MockMatrixServer implements AutoCloseable {
         }
         String rest = path.substring(prefix.length());
         String[] parts = rest.split("/", 4);
+        if (parts.length == 3 && "event".equals(parts[1])) {
+            String roomId = URLDecoder.decode(parts[0], StandardCharsets.UTF_8);
+            JsonObject event = roomEvents.get(roomId + "|" + URLDecoder.decode(parts[2], StandardCharsets.UTF_8));
+            if (event == null) {
+                respondPlain(exchange, 404, "");
+            } else {
+                respondJson(exchange, 200, event);
+            }
+            return;
+        }
         if (parts.length != 4) {
             respondPlain(exchange, 404, "");
             return;
         }
         String roomId = URLDecoder.decode(parts[0], StandardCharsets.UTF_8);
         String state = parts[1];
-        String type = parts[2];
+        String type = URLDecoder.decode(parts[2], StandardCharsets.UTF_8);
         String userId = URLDecoder.decode(parts[3], StandardCharsets.UTF_8);
+        if ("state".equals(state)) {
+            String key = roomId + "|" + type + "|" + userId;
+            Integer error = stateErrors.get(key);
+            if (error != null) {
+                respondPlain(exchange, error, "");
+                return;
+            }
+            JsonObject content = stateContents.get(key);
+            if (content != null) {
+                respondJson(exchange, 200, content);
+                return;
+            }
+        }
         if (!"state".equals(state) || !"m.room.member".equals(type)) {
             respondPlain(exchange, 404, "");
             return;

@@ -43,6 +43,34 @@ public final class SinceStore {
         atomicWrite(state);
     }
 
+    /**
+     * Ties the stored since token to {@code owner} (homeserver and account).
+     *
+     * <p>A since token is only meaningful to the homeserver and account that issued it.
+     * When the stored owner differs, the token is discarded so the next sync starts fresh
+     * instead of replaying or skipping events. State written before owners were recorded
+     * is adopted by the first owner that binds it.</p>
+     *
+     * @return {@code true} when the stored since token (if any) was kept
+     */
+    public synchronized boolean bindOwner(String owner) {
+        if (owner == null || owner.isBlank()) {
+            return true;
+        }
+        JsonObject state = loadStateObject();
+        JsonElement stored = state.get("owner");
+        boolean kept = stored == null || !stored.isJsonPrimitive() || owner.equals(stored.getAsString());
+        if (!kept) {
+            LOGGER.info("MatrixBridge homeserver or account changed; discarding the stored sync token");
+            state.remove("since");
+        }
+        if (!kept || stored == null || !owner.equals(stored.getAsString())) {
+            state.addProperty("owner", owner);
+            atomicWrite(state);
+        }
+        return kept;
+    }
+
     public synchronized void saveSelfUserId(String selfUserId) {
         if (selfUserId == null || selfUserId.isBlank()) {
             return;

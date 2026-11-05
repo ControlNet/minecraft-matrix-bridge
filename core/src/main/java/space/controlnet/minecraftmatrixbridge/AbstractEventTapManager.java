@@ -195,6 +195,11 @@ public abstract class AbstractEventTapManager<E> {
             return "Class is not an Event subtype: " + fqcn;
         }
 
+        if (bridgeService.isMcToMatrixDisabledByConfig()) {
+            // Tap output is sent through the MC -> Matrix queue, which is not running.
+            return "Event taps cannot deliver anything while MC -> Matrix is disabled (bridge.enableMcToMatrix=false).";
+        }
+
         int activeCount = countActiveTaps();
         if (activeCount >= maxActiveTaps) {
             return "Maximum active taps reached (" + maxActiveTaps + "). Disable some taps first with: event off <eventName>";
