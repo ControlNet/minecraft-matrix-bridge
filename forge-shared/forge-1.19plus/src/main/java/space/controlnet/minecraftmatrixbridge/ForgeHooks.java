@@ -166,6 +166,14 @@ public final class ForgeHooks {
 
     @SubscribeEvent
     public void onServerStopping(ServerStoppingEvent event) {
+        shutdownBridge(true);
+    }
+
+    /**
+     * Stops the bridge and releases event taps. Idempotent: the stopped handler calls it
+     * again because loaders skip ServerStoppingEvent when the server crashes.
+     */
+    private void shutdownBridge(boolean announceStopping) {
         BridgeService service = bridgeService;
         bridgeService = null;
         closeEventTapManager();
@@ -173,7 +181,8 @@ public final class ForgeHooks {
         connectedRoomIdOrAlias = "";
         pendingConnectedNoticeTicks.clear();
         if (service != null) {
-            if (MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get() && MatrixBridgeConfig.ENABLE_SERVER_LIFECYCLE_TO_MATRIX.get()) {
+            if (announceStopping && MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get()
+                    && MatrixBridgeConfig.ENABLE_SERVER_LIFECYCLE_TO_MATRIX.get()) {
                 String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "* Server stopping.";
                 service.enqueueMcMessage(formatted);
                 Thread t = new Thread(() -> {
@@ -194,6 +203,8 @@ public final class ForgeHooks {
 
     @SubscribeEvent
     public void onServerStopped(ServerStoppedEvent event) {
+        // After a crash only the stopped event fires; stop the bridge here too.
+        shutdownBridge(false);
         var descriptor = FileWatcher.class.getModule().getDescriptor();
         String version = descriptor == null ? "" : descriptor.rawVersion().orElse("");
         ConfigWatcherShutdown.afterServerExit(MC.isDedicatedServer(event.getServer()), version,

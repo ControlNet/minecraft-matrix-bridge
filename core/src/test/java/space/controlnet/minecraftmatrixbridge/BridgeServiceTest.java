@@ -85,6 +85,37 @@ public class BridgeServiceTest {
     }
 
     @Test
+    void workerThreadsAreDaemonSoACrashedServerCanExit() throws Exception {
+        // Forge/NeoForge skip ServerStoppingEvent when the tick loop crashes; bridge
+        // threads must not keep the JVM alive in that case.
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            server.enqueueSyncResponse(roomId, "s0", new JsonArray());
+            BridgeSettings settings = new BridgeSettings(
+                    server.homeserverUrl(), roomId, "token", true, true, false,
+                    "[MC] ", "[Matrix] ", "!mc", 1000, 20, 10, 64
+            );
+            BridgeService service = new BridgeService();
+            service.start(settings, worldRoot, text -> { });
+            try {
+                waitUntil(service::isReady, Duration.ofSeconds(2));
+                List<String> names = new ArrayList<>();
+                for (Thread thread : Thread.getAllStackTraces().keySet()) {
+                    if (thread.getName().startsWith("MatrixBridge-") && thread.isAlive()) {
+                        names.add(thread.getName());
+                        assertTrue(thread.isDaemon(), thread.getName() + " must be a daemon thread");
+                    }
+                }
+                assertTrue(names.contains("MatrixBridge-Sender"), names.toString());
+                assertTrue(names.contains("MatrixBridge-Sync"), names.toString());
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
     void forwardsMatrixMessagesAndPersistsSince() throws Exception {
         String roomId = "!room:example.com";
         String selfUserId = "@bot:example.com";

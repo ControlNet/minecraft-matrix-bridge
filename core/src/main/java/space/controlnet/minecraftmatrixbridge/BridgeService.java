@@ -83,7 +83,7 @@ public final class BridgeService {
 
             running.set(true);
 
-            this.bootstrapThread = new Thread(this::bootstrap, "MatrixBridge-Bootstrap");
+            this.bootstrapThread = workerThread(this::bootstrap, "MatrixBridge-Bootstrap");
             this.bootstrapThread.start();
         }
     }
@@ -211,11 +211,11 @@ public final class BridgeService {
                 activeSettings = settings;
                 activeCallbacks = callbacks;
                 if (activeSettings.enableMcToMatrix) {
-                    senderThread = new Thread(this::senderLoop, "MatrixBridge-Sender");
+                    senderThread = workerThread(this::senderLoop, "MatrixBridge-Sender");
                     senderThread.start();
                 }
                 if (activeSettings.enableMatrixToMc) {
-                    syncThread = new Thread(this::syncLoop, "MatrixBridge-Sync");
+                    syncThread = workerThread(this::syncLoop, "MatrixBridge-Sync");
                     syncThread.start();
                 }
                 ready.set(true);
@@ -888,6 +888,16 @@ public final class BridgeService {
         }
         JsonElement e = obj.get(key);
         return (e != null && e.isJsonArray()) ? e.getAsJsonArray() : null;
+    }
+
+    /**
+     * Bridge workers never hold state that must outlive the server, and loaders skip
+     * the stopping event when the tick loop crashes. Daemon threads let the JVM exit.
+     */
+    private static Thread workerThread(Runnable task, String name) {
+        Thread thread = new Thread(task, name);
+        thread.setDaemon(true);
+        return thread;
     }
 
     private static void interrupt(Thread t) {
