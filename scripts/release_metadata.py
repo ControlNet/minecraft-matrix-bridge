@@ -32,7 +32,9 @@ def fetch_json(url, headers=None):
             if attempt == 2 or (error.code != 429 and error.code < 500):
                 # Never print request headers, credentials, or server response bodies.
                 raise ValueError(f"Metadata request failed: {url} (HTTP {error.code})") from None
-        except URLError:
+        except (URLError, TimeoutError, ConnectionError):
+            # URLError covers DNS/connect failures; read timeouts and resets surface
+            # as TimeoutError/ConnectionError instead.
             if attempt == 2:
                 raise ValueError(f"Metadata request failed: {url} (network error)") from None
         time.sleep(2 ** attempt)
@@ -101,9 +103,20 @@ def resolve_curseforge(family, versions, loader, java, catalog, types):
         return unique_id(label, matches)
 
     ids = [version_id(version) for version in versions]
-    for name in [f"Java {java}", LOADERS[loader], "Server"]:
+    for name in [*(f"Java {value}" for value in java_versions(java)), LOADERS[loader], "Server"]:
         ids.append(unique_id(name, [row for row in catalog if row["name"] == name]))
     return ids
+
+
+def java_versions(java):
+    """A target may need several Java versions across its patch releases."""
+    return [java] if type(java) is int else list(java)
+
+
+def valid_java(java):
+    values = [java] if type(java) is int else java
+    return (isinstance(values, list) and values and len(set(values)) == len(values)
+            and all(type(value) is int and value >= 17 for value in values))
 
 
 def load_targets(path):
@@ -115,7 +128,7 @@ def load_targets(path):
         if (set(target) != {"module", "family", "loader", "java", "group"}
                 or target["loader"] not in LOADERS
                 or target["group"] not in {"legacy", "modern"}
-                or type(target["java"]) is not int or target["java"] < 17
+                or not valid_java(target["java"])
                 or not re.fullmatch(r"\d+\.\d+", target["family"])
                 or target["module"] != f"{target['loader']}-{target['family']}"):
             raise ValueError(f"Invalid release target: {target}")
@@ -178,6 +191,16 @@ def verify_modrinth(actual, expected_versions, loader, version, channel, filenam
         raise ValueError(f"Published Modrinth file missing: {filename}")
 
 
+def find_modrinth_version(versions, version, filename):
+    """Return the ID of an already published version carrying ``filename``, if any."""
+    matches = [row["id"] for row in versions
+               if row.get("version_number") == version
+               and filename in [file.get("filename") for file in row.get("files", [])]]
+    if len(matches) > 1:
+        raise ValueError(f"Multiple Modrinth versions already carry {filename}: {', '.join(matches)}")
+    return matches[0] if matches else ""
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server-targets", type=Path,
@@ -192,7 +215,22 @@ def main():
     parser.add_argument("--check-curseforge", action="store_true",
                         help="Resolve all CurseForge IDs using CURSEFORGE_TOKEN from the environment")
     parser.add_argument("--verify-modrinth", metavar="VERSION_ID")
+    parser.add_argument("--find-modrinth", action="store_true",
+                        help="Print the ID of an existing version with EXPECTED_VERSION and EXPECTED_FILENAME")
     args = parser.parse_args()
+    if args.find_modrinth:
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", args.modrinth_project):
+            raise ValueError("Invalid Modrinth project ID or slug")
+        token = os.environ.get("MODRINTH_TOKEN")
+        # Authenticated listing also includes unlisted/draft versions from earlier attempts.
+        versions = fetch_json(f"{MODRINTH}/project/{args.modrinth_project}/version",
+                              {"Authorization": token} if token else None)
+        found = find_modrinth_version(versions, os.environ["EXPECTED_VERSION"], os.environ["EXPECTED_FILENAME"])
+        if os.environ.get("GITHUB_OUTPUT"):
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                output.write(f"version_id={found}\n")
+        print(found or "not published")
+        return
     if args.verify_modrinth is not None:
         if not re.fullmatch(r"[A-Za-z0-9]+", args.verify_modrinth):
             raise ValueError("Invalid Modrinth version ID")

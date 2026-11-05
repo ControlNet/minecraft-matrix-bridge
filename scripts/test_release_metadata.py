@@ -127,6 +127,56 @@ class ReleaseMetadataTests(unittest.TestCase):
                 metadata.resolve_curseforge("26.1", ["26.1"], "forge", 25,
                                             [v for v in versions if v["name"] != missing], types)
 
+    def test_target_can_require_several_java_versions(self):
+        versions, types = self.cf_catalog()
+        versions.append({"id": 19, "name": "Java 21", "gameVersionTypeID": 3})
+        ids = metadata.resolve_curseforge("26.1", ["26.1"], "forge", [21, 25], versions, types)
+        self.assertEqual(ids, [11, 19, 14, 15, 17])
+
+    def test_java_requirement_validation(self):
+        for java in [17, [17, 21]]:
+            self.assertTrue(metadata.valid_java(java))
+        for java in [16, [], [17, 17], [17, "21"], "17", True, [16, 21]]:
+            with self.subTest(java=java):
+                self.assertFalse(metadata.valid_java(java))
+
+    def test_forge_120_advertises_java_21_for_1_20_5_and_later(self):
+        root = Path(__file__).resolve().parents[1]
+        targets = {t["module"]: t for t in metadata.load_targets(root / "scripts/release-targets.json")}
+        self.assertEqual(targets["forge-1.20"]["java"], [17, 21])
+
+    def test_existing_modrinth_upload_is_found_by_version_and_filename(self):
+        versions = [
+            {"id": "old", "version_number": "0.1.5", "files": [{"filename": "m-forge-1.20.x-0.1.5.jar"}]},
+            {"id": "neo", "version_number": "0.1.6", "files": [{"filename": "m-neoforge-1.21.x-0.1.6.jar"}]},
+            {"id": "hit", "version_number": "0.1.6", "files": [{"filename": "m-forge-1.20.x-0.1.6.jar"}]},
+        ]
+        self.assertEqual(metadata.find_modrinth_version(versions, "0.1.6", "m-forge-1.20.x-0.1.6.jar"), "hit")
+        self.assertEqual(metadata.find_modrinth_version(versions, "0.1.6", "m-forge-1.18.x-0.1.6.jar"), "")
+        with self.assertRaisesRegex(ValueError, "Multiple"):
+            metadata.find_modrinth_version(versions + [dict(versions[2], id="dup")], "0.1.6",
+                                           "m-forge-1.20.x-0.1.6.jar")
+
+    def test_read_timeouts_are_retried(self):
+        calls = []
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_urlopen(request, timeout):
+            calls.append(request.full_url)
+            if len(calls) == 1:
+                raise TimeoutError("read timed out")
+            return Response(b'{"ok": true}')
+
+        with patch.object(metadata, "urlopen", fake_urlopen), patch.object(metadata.time, "sleep"):
+            self.assertEqual(metadata.fetch_json("https://example.invalid/x"), {"ok": True})
+        self.assertEqual(len(calls), 2)
+
     def test_repository_targets_cover_nine_modules(self):
         root = Path(__file__).resolve().parents[1]
         targets = metadata.load_targets(root / "scripts/release-targets.json")

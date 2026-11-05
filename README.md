@@ -25,7 +25,7 @@ Bridges chat between a Minecraft server and **one Matrix room** (unencrypted onl
 - **Event Taps**: dynamically subscribe to Forge/NeoForge events and forward them to Matrix for debugging/monitoring.
 
 ## Requirements
-- Java 17 (Forge 1.18–1.20), Java 21 (Forge/NeoForge 1.21.x), or Java 25 (Forge/NeoForge 26.1 and 26.2)
+- Java 17 (Forge 1.18–1.20.4), Java 21 (Forge 1.20.5–1.20.6, Forge/NeoForge 1.21.x), or Java 25 (Forge/NeoForge 26.1 and 26.2)
 - Minecraft Forge/NeoForge server matching the versions. I only manually test it in popular minor versions, and hopefully it works in other minor versions.
     - 1.18.2
     - 1.19.2
