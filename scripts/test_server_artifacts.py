@@ -240,5 +240,23 @@ class ArtifactTests(unittest.TestCase):
         self.assertNotIn("./gradlew", matrix)
 
 
+
+class ServerEnvironmentTests(unittest.TestCase):
+    def test_gradle_uses_its_own_default_user_home(self):
+        # A repo-local default forced a cold cache where ForgeGradle 7 must download JDK 8.
+        env = system_test_all.server_environment({"PATH": "/usr/bin"}, "token")
+        self.assertNotIn("GRADLE_USER_HOME", env)
+        self.assertEqual("token", env["MATRIX_ACCESS_TOKEN"])
+        self.assertEqual("/usr/bin", env["PATH"])
+
+    def test_explicit_gradle_user_home_is_kept(self):
+        env = system_test_all.server_environment({"GRADLE_USER_HOME": "/isolated"}, "token")
+        self.assertEqual("/isolated", env["GRADLE_USER_HOME"])
+
+    def test_caller_environment_is_not_mutated(self):
+        original = {"PATH": "/usr/bin"}
+        system_test_all.server_environment(original, "token")
+        self.assertEqual({"PATH": "/usr/bin"}, original)
+
 if __name__ == "__main__":
     unittest.main()

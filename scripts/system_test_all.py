@@ -394,6 +394,18 @@ def event_tap_alias_for_module(module: str) -> str:
         raise ValueError(f"No event tap probe configured for module: {module}") from None
 
 
+def server_environment(environ, token: str) -> dict:
+    """Environment for the server process.
+
+    GRADLE_USER_HOME is left to the caller (Gradle defaults to ~/.gradle). Forcing a
+    repo-local home meant a cold cache, where ForgeGradle 7 must download a JDK 8 and
+    fails offline. Set GRADLE_USER_HOME=.gradle-user-home explicitly for an isolated run.
+    """
+    env = dict(environ)
+    env["MATRIX_ACCESS_TOKEN"] = token
+    return env
+
+
 def tap_message_body(raw: str) -> str:
     try:
         return str(json.loads(raw).get("body", ""))[:300]
@@ -628,9 +640,7 @@ def run_one(module: str, timeout_s: int, packaged: bool = False,
     try:
         write_systemtest_config(run_dir, homeserver, room_alias)
 
-        env = dict(os.environ)
-        env["MATRIX_ACCESS_TOKEN"] = token
-        env.setdefault("GRADLE_USER_HOME", str(root / ".gradle-user-home"))
+        env = server_environment(os.environ, token)
 
         cmd = [str(gradlew), f":{module}:runServer", "--console=plain"]
         if modern_26:
