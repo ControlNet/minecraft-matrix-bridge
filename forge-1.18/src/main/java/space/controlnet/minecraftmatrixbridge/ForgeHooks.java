@@ -18,6 +18,7 @@ import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.entity.player.PlayerEvent;
 import net.minecraftforge.event.server.ServerStartedEvent;
 import net.minecraftforge.event.server.ServerStoppingEvent;
+import net.minecraftforge.event.server.ServerStoppedEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -168,6 +169,14 @@ public final class ForgeHooks {
 
     @SubscribeEvent
     public void onServerStopping(ServerStoppingEvent event) {
+        shutdownBridge(true);
+    }
+
+    /**
+     * Stops the bridge and releases event taps. Idempotent: the stopped handler calls it
+     * again because loaders skip ServerStoppingEvent when the server crashes.
+     */
+    private void shutdownBridge(boolean announceStopping) {
         BridgeService service = bridgeService;
         bridgeService = null;
         closeEventTapManager();
@@ -175,7 +184,8 @@ public final class ForgeHooks {
         connectedRoomIdOrAlias = "";
         pendingConnectedNoticeTicks.clear();
         if (service != null) {
-            if (MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get() && MatrixBridgeConfig.ENABLE_SERVER_LIFECYCLE_TO_MATRIX.get()) {
+            if (announceStopping && MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get()
+                    && MatrixBridgeConfig.ENABLE_SERVER_LIFECYCLE_TO_MATRIX.get()) {
                 String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "* Server stopping.";
                 service.enqueueMcMessage(formatted);
                 Thread t = new Thread(() -> {
@@ -192,6 +202,12 @@ public final class ForgeHooks {
             }
         }
         callbacks = null;
+    }
+
+    @SubscribeEvent
+    public void onServerStopped(ServerStoppedEvent event) {
+        // After a crash only the stopped event fires; stop the bridge here too.
+        shutdownBridge(false);
     }
 
     @SubscribeEvent

@@ -12,6 +12,7 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.players.PlayerList;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.storage.LevelResource;
+import net.minecraftforge.event.ServerChatEvent;
 
 import java.lang.reflect.Method;
 import java.nio.file.Path;
@@ -38,6 +39,9 @@ final class Forge1206MinecraftCompat extends ForgeMinecraftCompat {
     private final Method uuid = method(ServerPlayer.class, "getUUID", UUID.class, false);
     private final Method message = method(ServerPlayer.class, "sendSystemMessage", void.class, false, Component.class);
     private final Method broadcast = method(PlayerList.class, "broadcastSystemMessage", void.class, false, Component.class, boolean.class);
+    // ServerChatEvent is a Forge class (never obfuscated); Component.getString is Mojmap at runtime.
+    private final Method chatMessage = method(ServerChatEvent.class, "getMessage", Component.class, false);
+    private final Method componentText = method(Component.class, "getString", String.class, false);
     private final LevelResource root;
 
     Forge1206MinecraftCompat() {
@@ -123,5 +127,10 @@ final class Forge1206MinecraftCompat extends ForgeMinecraftCompat {
     @Override
     void broadcast(MinecraftServer value, String text) {
         invoke(broadcast, invoke(playerList, value), text(text), false);
+    }
+
+    @Override
+    String chatMessage(ServerChatEvent event) {
+        return (String) invoke(componentText, invoke(chatMessage, event));
     }
 }

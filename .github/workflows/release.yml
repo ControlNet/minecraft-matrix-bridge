@@ -3,21 +3,132 @@ name: Release
 on:
   push:
     branches: [master]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and test the release from any branch without tagging or publishing
+        type: boolean
+        default: false
+
+# One release at a time; a queued run resumes from whatever the previous one published.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  plan:
+    name: Plan release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      should_release: ${{ steps.plan.outputs.should_release }}
+      build: ${{ steps.plan.outputs.build }}
+      resume: ${{ steps.plan.outputs.resume }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      channel: ${{ steps.plan.outputs.channel }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+      make_latest: ${{ steps.plan.outputs.make_latest }}
+      mod_id: ${{ steps.plan.outputs.mod_id }}
+      has_modrinth: ${{ steps.plan.outputs.has_modrinth }}
+      has_curseforge: ${{ steps.plan.outputs.has_curseforge }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Test release planner
+        run: python3 -m unittest discover -s scripts -p 'test_release_plan.py'
+      - name: Decide whether to release (SemVer, master only, resumable)
+        id: plan
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+          MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+          MODRINTH_PROJECT_ID: ${{ secrets.MODRINTH_PROJECT_ID }}
+          CURSEFORGE_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
+          CURSEFORGE_PROJECT_ID: ${{ secrets.CURSEFORGE_PROJECT_ID }}
+        run: |
+          git fetch --tags --force
+          python3 scripts/release_plan.py
+
+  build-26-dist:
+    needs: plan
+    if: ${{ needs.plan.outputs.build == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          # ForgeGradle 7 runs `modifyAccess` on Java 8; providing it avoids a flaky
+          # download from GitHub. 25 is listed last so it stays the default JAVA_HOME.
+          java-version: |
+            8
+            25
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Make Gradle wrappers executable
+        run: chmod +x ./gradlew ./gradlew-26 ./scripts/build_dist_26.sh
+
+      - name: Build 26.x dist
+        env:
+          JDK8: ${{ env.JAVA_HOME_8_X64 }}
+        run: ./scripts/build_dist_26.sh
+
+      - name: Upload 26.x dist
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist-26
+          path: dist/*
+          if-no-files-found: error
+
+  build-and-release:
+    needs: plan
+    if: ${{ needs.plan.outputs.build == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Build jars
+        run: |
+          chmod +x ./gradlew ./gradlew-26 ./scripts/build_dist.sh
+          ./scripts/build_dist.sh --legacy-only
+
+      - name: Upload dist for publisher jobs
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
+
   test-servers:
-    needs: [build-and-release, build-26-dist]
-    if: ${{ needs.build-and-release.outputs.should_release == 'true' && needs.build-26-dist.outputs.should_release == 'true' }}
+    needs: [plan, build-and-release, build-26-dist]
+    if: ${{ needs.plan.outputs.build == 'true' }}
     uses: ./.github/workflows/server-tests.yml
 
   release-metadata:
     name: Resolve and validate release tags
-    needs: [build-and-release, build-26-dist, test-servers]
-    if: ${{ needs.build-and-release.outputs.should_release == 'true' && needs.build-26-dist.outputs.should_release == 'true' }}
+    needs: [plan, test-servers]
+    if: ${{ needs.plan.outputs.build == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -30,9 +141,9 @@ jobs:
       - name: Resolve all platform tags before publishing
         id: metadata
         env:
-          CHECK_MODRINTH: ${{ needs.build-and-release.outputs.has_modrinth }}
+          CHECK_MODRINTH: ${{ needs.plan.outputs.has_modrinth }}
           MODRINTH_PROJECT_ID: ${{ secrets.MODRINTH_PROJECT_ID }}
-          CHECK_CURSEFORGE: ${{ needs.build-and-release.outputs.has_curseforge }}
+          CHECK_CURSEFORGE: ${{ needs.plan.outputs.has_curseforge }}
           CURSEFORGE_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
         run: |
           args=()
@@ -46,309 +157,21 @@ jobs:
           path: release-metadata.json
           if-no-files-found: error
 
-  build-26-dist:
+  # The tag and GitHub release exist before any third-party upload, so a failed
+  # publisher can be finished by rerunning the workflow on the same commit.
+  create-release:
+    name: Create tag and GitHub release
+    needs: [plan, release-metadata]
+    if: ${{ needs.plan.outputs.should_release == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    outputs:
-      should_release: ${{ steps.version.outputs.should_release }}
-      version: ${{ steps.version.outputs.version }}
-      tag: ${{ steps.version.outputs.tag }}
-      channel: ${{ steps.version.outputs.channel }}
-      mod_id: ${{ steps.version.outputs.mod_id }}
-
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-
-      - name: Determine version + whether to release
-        id: version
-        shell: bash
-        run: |
-          MOD_ID="$(grep -E '^mod_id=' gradle.properties | head -n1 | cut -d= -f2- | tr -d '\r' | xargs)"
-          if [[ -z "$MOD_ID" ]]; then
-            echo "ERROR: mod_id not found in gradle.properties" >&2
-            exit 1
-          fi
-
-          VERSION="$(grep -E '^mod_version=' gradle.properties | head -n1 | cut -d= -f2- | tr -d '\r' | xargs)"
-          if [[ -z "$VERSION" ]]; then
-            echo "ERROR: mod_version not found in gradle.properties" >&2
-            exit 1
-          fi
-
-          CHANNEL="release"
-          if echo "$VERSION" | grep -qi 'alpha'; then
-            CHANNEL="alpha"
-          elif echo "$VERSION" | grep -Eqi 'beta|rc|pre'; then
-            CHANNEL="beta"
-          fi
-
-          git fetch --tags --force
-          LATEST_TAG="$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -n1 || true)"
-          LATEST_VER="${LATEST_TAG#v}"
-
-          SHOULD_RELEASE="false"
-          if [[ -z "$LATEST_TAG" ]]; then
-            SHOULD_RELEASE="true"
-          else
-            TOP="$(printf '%s\n' "$LATEST_VER" "$VERSION" | sort -V | tail -n1)"
-            if [[ "$TOP" == "$VERSION" && "$VERSION" != "$LATEST_VER" ]]; then
-              SHOULD_RELEASE="true"
-            fi
-          fi
-
-          echo "mod_id=$MOD_ID" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
-          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
-          echo "should_release=$SHOULD_RELEASE" >> "$GITHUB_OUTPUT"
-
-      - name: Set up Java
-        uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: "25"
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v6
-
-      - name: Make Gradle wrappers executable
-        run: chmod +x ./gradlew ./gradlew-26 ./scripts/build_dist_26.sh
-
-      - name: Build 26.x dist
-        run: ./scripts/build_dist_26.sh
-
-      - name: Upload 26.x dist
-        uses: actions/upload-artifact@v7
-        with:
-          name: dist-26
-          path: dist/*
-          if-no-files-found: error
-
-  build-and-release:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    outputs:
-      should_release: ${{ steps.version.outputs.should_release }}
-      version: ${{ steps.version.outputs.version }}
-      tag: ${{ steps.version.outputs.tag }}
-      channel: ${{ steps.version.outputs.channel }}
-      mod_id: ${{ steps.version.outputs.mod_id }}
-      has_modrinth: ${{ steps.version.outputs.has_modrinth }}
-      has_curseforge: ${{ steps.version.outputs.has_curseforge }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Set up Java
-        uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: "21"
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v6
-
-      - name: Make Gradle wrapper executable
-        run: chmod +x ./gradlew ./gradlew-26
-
-      - name: Determine version + whether to release
-        id: version
-        shell: bash
-        env:
-          MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
-          MODRINTH_PROJECT_ID: ${{ secrets.MODRINTH_PROJECT_ID }}
-          CURSEFORGE_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
-          CURSEFORGE_PROJECT_ID: ${{ secrets.CURSEFORGE_PROJECT_ID }}
-        run: |
-          MOD_ID="$(grep -E '^mod_id=' gradle.properties | head -n1 | cut -d= -f2- | tr -d '\r' | xargs)"
-          if [[ -z "$MOD_ID" ]]; then
-            echo "ERROR: mod_id not found in gradle.properties" >&2
-            exit 1
-          fi
-
-          VERSION="$(grep -E '^mod_version=' gradle.properties | head -n1 | cut -d= -f2- | tr -d '\r' | xargs)"
-          if [[ -z "$VERSION" ]]; then
-            echo "ERROR: mod_version not found in gradle.properties" >&2
-            exit 1
-          fi
-
-          CHANNEL="release"
-          if echo "$VERSION" | grep -qi 'alpha'; then
-            CHANNEL="alpha"
-          elif echo "$VERSION" | grep -Eqi 'beta|rc|pre'; then
-            CHANNEL="beta"
-          fi
-
-          git fetch --tags --force
-          LATEST_TAG="$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -n1 || true)"
-          LATEST_VER="${LATEST_TAG#v}"
-
-          SHOULD_RELEASE="false"
-          if [[ -z "$LATEST_TAG" ]]; then
-            SHOULD_RELEASE="true"
-          else
-            TOP="$(printf '%s\n' "$LATEST_VER" "$VERSION" | sort -V | tail -n1)"
-            if [[ "$TOP" == "$VERSION" && "$VERSION" != "$LATEST_VER" ]]; then
-              SHOULD_RELEASE="true"
-            fi
-          fi
-
-          HAS_MODRINTH="false"
-          if [[ -n "${MODRINTH_TOKEN:-}" && -n "${MODRINTH_PROJECT_ID:-}" ]]; then
-            HAS_MODRINTH="true"
-          fi
-
-          HAS_CURSEFORGE="false"
-          if [[ -n "${CURSEFORGE_TOKEN:-}" && -n "${CURSEFORGE_PROJECT_ID:-}" ]]; then
-            HAS_CURSEFORGE="true"
-          fi
-
-          echo "mod_id=$MOD_ID" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
-          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
-          echo "should_release=$SHOULD_RELEASE" >> "$GITHUB_OUTPUT"
-          echo "has_modrinth=$HAS_MODRINTH" >> "$GITHUB_OUTPUT"
-          echo "has_curseforge=$HAS_CURSEFORGE" >> "$GITHUB_OUTPUT"
-
-          echo "MOD_ID=$MOD_ID" >> "$GITHUB_ENV"
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          echo "TAG=v$VERSION" >> "$GITHUB_ENV"
-          echo "CHANNEL=$CHANNEL" >> "$GITHUB_ENV"
-          echo "LATEST_TAG=$LATEST_TAG" >> "$GITHUB_ENV"
-          echo "SHOULD_RELEASE=$SHOULD_RELEASE" >> "$GITHUB_ENV"
-
-      - name: Skip (version not newer than latest tag)
-        if: ${{ steps.version.outputs.should_release != 'true' }}
-        run: |
-          echo "No release: mod_version=${{ steps.version.outputs.version }} is not newer than latest tag '${{ env.LATEST_TAG }}'."
-
-      - name: Build jars
-        if: ${{ steps.version.outputs.should_release == 'true' }}
-        run: |
-          chmod +x ./scripts/build_dist.sh
-          ./scripts/build_dist.sh --legacy-only
-
-      - name: Upload dist for publisher jobs
-        if: ${{ steps.version.outputs.should_release == 'true' }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: dist
-          path: dist/*
-          if-no-files-found: error
-
-  publish-modrinth:
-    name: Publish to Modrinth (${{ matrix.module }})
-    needs: [build-and-release, release-metadata]
-    runs-on: ubuntu-latest
-    if: ${{ needs.build-and-release.outputs.should_release == 'true' && needs.build-and-release.outputs.has_modrinth == 'true' }}
-    timeout-minutes: 20
-    env:
-      MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
-      MODRINTH_PROJECT_ID: ${{ secrets.MODRINTH_PROJECT_ID }}
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.release-metadata.outputs.legacy) }}
-    steps:
-      - uses: actions/checkout@v7
-      - name: Download dist
-        uses: actions/download-artifact@v8
-        with:
-          name: dist
-          path: dist
-
-      - name: Publish
-        id: publish
-        uses: cloudnode-pro/modrinth-publish@v2
-        with:
-          token: ${{ env.MODRINTH_TOKEN }}
-          project: ${{ env.MODRINTH_PROJECT_ID }}
-          version: ${{ needs.build-and-release.outputs.version }}
-          name: "${{ needs.build-and-release.outputs.version }} (${{ matrix.loader }} ${{ matrix.mc }})"
-          channel: ${{ needs.build-and-release.outputs.channel }}
-          environment: ${{ matrix.environment }}
-          changelog: "Automated release ${{ needs.build-and-release.outputs.tag }} (${{ matrix.loader }} ${{ matrix.mc }})."
-          loaders: |-
-            ${{ matrix.loader }}
-          game-versions: ${{ matrix.game_versions }}
-          files: dist/${{ needs.build-and-release.outputs.mod_id }}-${{ matrix.jar_suffix }}-${{ needs.build-and-release.outputs.version }}.jar
-
-      - name: Verify published tags
-        env:
-          VERSION_ID: ${{ steps.publish.outputs.version-id }}
-          EXPECTED_GAME_VERSIONS: ${{ matrix.game_versions }}
-          EXPECTED_LOADER: ${{ matrix.loader }}
-          EXPECTED_VERSION: ${{ needs.build-and-release.outputs.version }}
-          EXPECTED_CHANNEL: ${{ needs.build-and-release.outputs.channel }}
-          EXPECTED_FILENAME: ${{ needs.build-and-release.outputs.mod_id }}-${{ matrix.jar_suffix }}-${{ needs.build-and-release.outputs.version }}.jar
-        run: |
-          printf 'Modrinth version ID: `%s`\n' "$VERSION_ID" >> "$GITHUB_STEP_SUMMARY"
-          python3 scripts/release_metadata.py --verify-modrinth "$VERSION_ID"
-
-  publish-curseforge:
-    name: Publish to CurseForge (${{ matrix.module }})
-    needs: [build-and-release, release-metadata]
-    runs-on: ubuntu-latest
-    if: ${{ needs.build-and-release.outputs.should_release == 'true' && needs.build-and-release.outputs.has_curseforge == 'true' }}
-    timeout-minutes: 30
-    env:
-      CURSEFORGE_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
-      CURSEFORGE_PROJECT_ID: ${{ secrets.CURSEFORGE_PROJECT_ID }}
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.release-metadata.outputs.legacy) }}
-
-    steps:
-      - name: Download dist
-        uses: actions/download-artifact@v8
-        with:
-          name: dist
-          path: dist
-
-      - name: Upload
-        id: publish
-        uses: itsmeow/curseforge-upload@v3
-        with:
-          token: ${{ env.CURSEFORGE_TOKEN }}
-          project_id: ${{ env.CURSEFORGE_PROJECT_ID }}
-          game_endpoint: minecraft
-          file_path: dist/${{ needs.build-and-release.outputs.mod_id }}-${{ matrix.jar_suffix }}-${{ needs.build-and-release.outputs.version }}.jar
-          game_versions: ${{ matrix.curseforge_ids }}
-          release_type: ${{ needs.build-and-release.outputs.channel }}
-          changelog: "Automated release ${{ needs.build-and-release.outputs.tag }}."
-          changelog_type: markdown
-
-      - name: Record uploaded file ID
-        env:
-          FILE_ID: ${{ steps.publish.outputs.id }}
-        run: |
-          [[ "$FILE_ID" =~ ^[0-9]+$ ]]
-          printf 'CurseForge file ID: `%s` (tags validated before upload; moderation may be pending)\n' "$FILE_ID" >> "$GITHUB_STEP_SUMMARY"
-
-  publish-github-release-26:
-    name: Publish GitHub Release (26.x)
-    needs: [build-26-dist, release-metadata]
-    runs-on: ubuntu-latest
-    if: ${{ needs.build-26-dist.outputs.should_release == 'true' }}
-    timeout-minutes: 20
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Download 26.x dist
-        uses: actions/download-artifact@v8
-        with:
-          name: dist-26
-          path: dist
 
       - name: Download release metadata
         uses: actions/download-artifact@v8
@@ -356,49 +179,79 @@ jobs:
           name: release-metadata
           path: release-metadata
 
-      - name: Create tag
-        shell: bash
+      - name: Create or verify tag
         env:
-          TAG: ${{ needs.build-26-dist.outputs.tag }}
+          TAG: ${{ needs.plan.outputs.tag }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          if git rev-parse "${TAG}" >/dev/null 2>&1; then
-            echo "Tag ${TAG} already exists locally; continuing."
+          git fetch --tags --force
+          head="$(git rev-parse HEAD)"
+          if tagged="$(git rev-list -n 1 "refs/tags/${TAG}" 2>/dev/null)"; then
+            if [[ "$tagged" != "$head" ]]; then
+              echo "ERROR: ${TAG} points at ${tagged}, not ${head}" >&2
+              exit 1
+            fi
+            echo "Tag ${TAG} already points at HEAD; resuming."
           else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
             git tag -a "${TAG}" -m "Release ${TAG}"
+            git push origin "refs/tags/${TAG}"
           fi
 
-          git push origin "${TAG}"
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+          MAKE_LATEST: ${{ needs.plan.outputs.make_latest }}
+        run: |
+          flags=(--prerelease="${PRERELEASE}" --latest="${MAKE_LATEST}")
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" "${flags[@]}"
+          else
+            gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes "${flags[@]}"
+          fi
+          gh release upload "$TAG" release-metadata/release-metadata.json --clobber
 
-      - name: Rename 26 checksum asset
-        shell: bash
-        run: mv dist/SHA256SUMS.txt dist/SHA256SUMS-26.txt
-
-      - name: Publish GitHub Release (attach 26.x jars)
-        uses: softprops/action-gh-release@v3
+  publish-github-release-26:
+    name: Attach 26.x jars to GitHub release
+    needs: [plan, build-26-dist, create-release]
+    if: ${{ needs.plan.outputs.should_release == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Download 26.x dist
+        uses: actions/download-artifact@v8
         with:
-          tag_name: ${{ needs.build-26-dist.outputs.tag }}
-          name: ${{ needs.build-26-dist.outputs.tag }}
-          generate_release_notes: true
-          files: |
-            dist/${{ needs.build-26-dist.outputs.mod_id }}-forge-26.1.x-${{ needs.build-26-dist.outputs.version }}.jar
-            dist/${{ needs.build-26-dist.outputs.mod_id }}-forge-26.2.x-${{ needs.build-26-dist.outputs.version }}.jar
-            dist/${{ needs.build-26-dist.outputs.mod_id }}-neoforge-26.1.x-${{ needs.build-26-dist.outputs.version }}.jar
-            dist/${{ needs.build-26-dist.outputs.mod_id }}-neoforge-26.2.x-${{ needs.build-26-dist.outputs.version }}.jar
+          name: dist-26
+          path: dist
+
+      - name: Upload assets (idempotent)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          MOD_ID: ${{ needs.plan.outputs.mod_id }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          mv dist/SHA256SUMS.txt dist/SHA256SUMS-26.txt
+          gh release upload "$TAG" --clobber \
+            "dist/${MOD_ID}-forge-26.1.x-${VERSION}.jar" \
+            "dist/${MOD_ID}-forge-26.2.x-${VERSION}.jar" \
+            "dist/${MOD_ID}-neoforge-26.1.x-${VERSION}.jar" \
+            "dist/${MOD_ID}-neoforge-26.2.x-${VERSION}.jar" \
             dist/SHA256SUMS-26.txt
-            release-metadata/release-metadata.json
 
   publish-github-release-legacy:
-    name: Publish GitHub Release (legacy jars)
-    needs:
-      - build-and-release
-      - publish-github-release-26
+    name: Attach legacy jars to GitHub release
+    needs: [plan, build-and-release, create-release]
+    if: ${{ needs.plan.outputs.should_release == 'true' }}
     runs-on: ubuntu-latest
-    if: ${{ needs.build-and-release.outputs.should_release == 'true' }}
     timeout-minutes: 20
-
+    permissions:
+      contents: write
     steps:
       - name: Download legacy dist
         uses: actions/download-artifact@v8
@@ -406,35 +259,161 @@ jobs:
           name: dist
           path: dist
 
-      - name: Publish GitHub Release (attach legacy jars)
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ needs.build-and-release.outputs.tag }}
-          name: ${{ needs.build-and-release.outputs.tag }}
-          files: |
-            dist/${{ needs.build-and-release.outputs.mod_id }}-forge-1.18.x-${{ needs.build-and-release.outputs.version }}.jar
-            dist/${{ needs.build-and-release.outputs.mod_id }}-forge-1.19.x-${{ needs.build-and-release.outputs.version }}.jar
-            dist/${{ needs.build-and-release.outputs.mod_id }}-forge-1.20.x-${{ needs.build-and-release.outputs.version }}.jar
-            dist/${{ needs.build-and-release.outputs.mod_id }}-forge-1.21.x-${{ needs.build-and-release.outputs.version }}.jar
-            dist/${{ needs.build-and-release.outputs.mod_id }}-neoforge-1.21.x-${{ needs.build-and-release.outputs.version }}.jar
+      - name: Upload assets (idempotent)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          MOD_ID: ${{ needs.plan.outputs.mod_id }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          gh release upload "$TAG" --clobber \
+            "dist/${MOD_ID}-forge-1.18.x-${VERSION}.jar" \
+            "dist/${MOD_ID}-forge-1.19.x-${VERSION}.jar" \
+            "dist/${MOD_ID}-forge-1.20.x-${VERSION}.jar" \
+            "dist/${MOD_ID}-forge-1.21.x-${VERSION}.jar" \
+            "dist/${MOD_ID}-neoforge-1.21.x-${VERSION}.jar" \
             dist/SHA256SUMS.txt
 
-  publish-modrinth-26:
+  publish-modrinth:
     name: Publish to Modrinth (${{ matrix.module }})
-    needs: [build-26-dist, build-and-release, release-metadata]
+    needs: [plan, release-metadata, create-release]
+    if: ${{ needs.plan.outputs.should_release == 'true' && needs.plan.outputs.has_modrinth == 'true' }}
     runs-on: ubuntu-latest
-    if: ${{ needs.build-26-dist.outputs.should_release == 'true' && needs.build-and-release.outputs.has_modrinth == 'true' }}
     timeout-minutes: 20
     env:
       MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
       MODRINTH_PROJECT_ID: ${{ secrets.MODRINTH_PROJECT_ID }}
+      EXPECTED_VERSION: ${{ needs.plan.outputs.version }}
+      EXPECTED_FILENAME: ${{ needs.plan.outputs.mod_id }}-${{ matrix.jar_suffix }}-${{ needs.plan.outputs.version }}.jar
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.release-metadata.outputs.legacy) }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check for an earlier upload of this file
+        id: existing
+        run: python3 scripts/release_metadata.py --find-modrinth
+
+      - name: Download dist
+        if: ${{ steps.existing.outputs.version_id == '' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+
+      - name: Publish
+        id: publish
+        if: ${{ steps.existing.outputs.version_id == '' }}
+        uses: cloudnode-pro/modrinth-publish@v2
+        with:
+          token: ${{ env.MODRINTH_TOKEN }}
+          project: ${{ env.MODRINTH_PROJECT_ID }}
+          version: ${{ needs.plan.outputs.version }}
+          name: "${{ needs.plan.outputs.version }} (${{ matrix.loader }} ${{ matrix.mc }})"
+          channel: ${{ needs.plan.outputs.channel }}
+          environment: ${{ matrix.environment }}
+          changelog: "Automated release ${{ needs.plan.outputs.tag }} (${{ matrix.loader }} ${{ matrix.mc }})."
+          loaders: |-
+            ${{ matrix.loader }}
+          game-versions: ${{ matrix.game_versions }}
+          files: dist/${{ env.EXPECTED_FILENAME }}
+
+      - name: Verify published tags
+        env:
+          VERSION_ID: ${{ steps.existing.outputs.version_id || steps.publish.outputs.version-id }}
+          EXPECTED_GAME_VERSIONS: ${{ matrix.game_versions }}
+          EXPECTED_LOADER: ${{ matrix.loader }}
+          EXPECTED_CHANNEL: ${{ needs.plan.outputs.channel }}
+        run: |
+          printf 'Modrinth version ID: `%s`\n' "$VERSION_ID" >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/release_metadata.py --verify-modrinth "$VERSION_ID"
+
+  publish-curseforge:
+    name: Publish to CurseForge (${{ matrix.module }})
+    needs: [plan, release-metadata, create-release]
+    if: ${{ needs.plan.outputs.should_release == 'true' && needs.plan.outputs.has_curseforge == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Uploads a marker asset to the GitHub release; CurseForge cannot list files with an upload token.
+    permissions:
+      contents: write
+    env:
+      CURSEFORGE_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
+      CURSEFORGE_PROJECT_ID: ${{ secrets.CURSEFORGE_PROJECT_ID }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      MARKER: curseforge-${{ matrix.module }}.json
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.release-metadata.outputs.legacy) }}
+    steps:
+      - name: Check for an earlier upload of this file
+        id: existing
+        run: |
+          # Fail the step if the release cannot be read rather than risk a duplicate upload.
+          assets="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+          if grep -Fxq "$MARKER" <<< "$assets"; then
+            echo "uploaded=true" >> "$GITHUB_OUTPUT"
+            echo "Already uploaded to CurseForge (marker $MARKER); skipping." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "uploaded=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download dist
+        if: ${{ steps.existing.outputs.uploaded != 'true' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+
+      - name: Upload
+        id: publish
+        if: ${{ steps.existing.outputs.uploaded != 'true' }}
+        uses: itsmeow/curseforge-upload@v3
+        with:
+          token: ${{ env.CURSEFORGE_TOKEN }}
+          project_id: ${{ env.CURSEFORGE_PROJECT_ID }}
+          game_endpoint: minecraft
+          file_path: dist/${{ needs.plan.outputs.mod_id }}-${{ matrix.jar_suffix }}-${{ needs.plan.outputs.version }}.jar
+          game_versions: ${{ matrix.curseforge_ids }}
+          release_type: ${{ needs.plan.outputs.channel }}
+          changelog: "Automated release ${{ needs.plan.outputs.tag }}."
+          changelog_type: markdown
+
+      - name: Record uploaded file ID
+        if: ${{ steps.existing.outputs.uploaded != 'true' }}
+        env:
+          FILE_ID: ${{ steps.publish.outputs.id }}
+        run: |
+          [[ "$FILE_ID" =~ ^[0-9]+$ ]]
+          printf '{"file_id": %s}\n' "$FILE_ID" > "$MARKER"
+          gh release upload "$TAG" "$MARKER" --clobber
+          printf 'CurseForge file ID: `%s` (tags validated before upload; moderation may be pending)\n' "$FILE_ID" >> "$GITHUB_STEP_SUMMARY"
+
+  publish-modrinth-26:
+    name: Publish to Modrinth (${{ matrix.module }})
+    needs: [plan, release-metadata, create-release]
+    if: ${{ needs.plan.outputs.should_release == 'true' && needs.plan.outputs.has_modrinth == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+      MODRINTH_PROJECT_ID: ${{ secrets.MODRINTH_PROJECT_ID }}
+      EXPECTED_VERSION: ${{ needs.plan.outputs.version }}
+      EXPECTED_FILENAME: ${{ needs.plan.outputs.mod_id }}-${{ matrix.jar_suffix }}-${{ needs.plan.outputs.version }}.jar
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.release-metadata.outputs.modern) }}
-
     steps:
       - uses: actions/checkout@v7
+      - name: Check for an earlier upload of this file
+        id: existing
+        run: python3 scripts/release_metadata.py --find-modrinth
+
       - name: Download 26.x dist
+        if: ${{ steps.existing.outputs.version_id == '' }}
         uses: actions/download-artifact@v8
         with:
           name: dist-26
@@ -442,48 +421,65 @@ jobs:
 
       - name: Publish
         id: publish
-        if: ${{ env.MODRINTH_TOKEN != '' && env.MODRINTH_PROJECT_ID != '' }}
+        if: ${{ steps.existing.outputs.version_id == '' }}
         uses: cloudnode-pro/modrinth-publish@v2
         with:
           token: ${{ env.MODRINTH_TOKEN }}
           project: ${{ env.MODRINTH_PROJECT_ID }}
-          version: ${{ needs.build-26-dist.outputs.version }}
-          name: "${{ needs.build-26-dist.outputs.version }} (${{ matrix.loader }} ${{ matrix.mc }})"
-          channel: ${{ needs.build-26-dist.outputs.channel }}
+          version: ${{ needs.plan.outputs.version }}
+          name: "${{ needs.plan.outputs.version }} (${{ matrix.loader }} ${{ matrix.mc }})"
+          channel: ${{ needs.plan.outputs.channel }}
           environment: ${{ matrix.environment }}
-          changelog: "Automated release ${{ needs.build-26-dist.outputs.tag }} (${{ matrix.loader }} ${{ matrix.mc }})."
+          changelog: "Automated release ${{ needs.plan.outputs.tag }} (${{ matrix.loader }} ${{ matrix.mc }})."
           loaders: |-
             ${{ matrix.loader }}
           game-versions: ${{ matrix.game_versions }}
-          files: dist/${{ needs.build-26-dist.outputs.mod_id }}-${{ matrix.jar_suffix }}-${{ needs.build-26-dist.outputs.version }}.jar
+          files: dist/${{ env.EXPECTED_FILENAME }}
 
       - name: Verify published tags
         env:
-          VERSION_ID: ${{ steps.publish.outputs.version-id }}
+          VERSION_ID: ${{ steps.existing.outputs.version_id || steps.publish.outputs.version-id }}
           EXPECTED_GAME_VERSIONS: ${{ matrix.game_versions }}
           EXPECTED_LOADER: ${{ matrix.loader }}
-          EXPECTED_VERSION: ${{ needs.build-26-dist.outputs.version }}
-          EXPECTED_CHANNEL: ${{ needs.build-26-dist.outputs.channel }}
-          EXPECTED_FILENAME: ${{ needs.build-26-dist.outputs.mod_id }}-${{ matrix.jar_suffix }}-${{ needs.build-26-dist.outputs.version }}.jar
+          EXPECTED_CHANNEL: ${{ needs.plan.outputs.channel }}
         run: |
           printf 'Modrinth version ID: `%s`\n' "$VERSION_ID" >> "$GITHUB_STEP_SUMMARY"
           python3 scripts/release_metadata.py --verify-modrinth "$VERSION_ID"
 
   publish-curseforge-26:
     name: Publish to CurseForge (${{ matrix.module }})
-    needs: [build-26-dist, build-and-release, release-metadata]
+    needs: [plan, release-metadata, create-release]
+    if: ${{ needs.plan.outputs.should_release == 'true' && needs.plan.outputs.has_curseforge == 'true' }}
     runs-on: ubuntu-latest
-    if: ${{ needs.build-26-dist.outputs.should_release == 'true' && needs.build-and-release.outputs.has_curseforge == 'true' }}
     timeout-minutes: 30
+    # Uploads a marker asset to the GitHub release; CurseForge cannot list files with an upload token.
+    permissions:
+      contents: write
     env:
       CURSEFORGE_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
       CURSEFORGE_PROJECT_ID: ${{ secrets.CURSEFORGE_PROJECT_ID }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      MARKER: curseforge-${{ matrix.module }}.json
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.release-metadata.outputs.modern) }}
-
     steps:
+      - name: Check for an earlier upload of this file
+        id: existing
+        run: |
+          # Fail the step if the release cannot be read rather than risk a duplicate upload.
+          assets="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+          if grep -Fxq "$MARKER" <<< "$assets"; then
+            echo "uploaded=true" >> "$GITHUB_OUTPUT"
+            echo "Already uploaded to CurseForge (marker $MARKER); skipping." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "uploaded=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download 26.x dist
+        if: ${{ steps.existing.outputs.uploaded != 'true' }}
         uses: actions/download-artifact@v8
         with:
           name: dist-26
@@ -491,21 +487,24 @@ jobs:
 
       - name: Upload
         id: publish
-        if: ${{ env.CURSEFORGE_TOKEN != '' && env.CURSEFORGE_PROJECT_ID != '' }}
+        if: ${{ steps.existing.outputs.uploaded != 'true' }}
         uses: itsmeow/curseforge-upload@v3
         with:
           token: ${{ env.CURSEFORGE_TOKEN }}
           project_id: ${{ env.CURSEFORGE_PROJECT_ID }}
           game_endpoint: minecraft
-          file_path: dist/${{ needs.build-26-dist.outputs.mod_id }}-${{ matrix.jar_suffix }}-${{ needs.build-26-dist.outputs.version }}.jar
+          file_path: dist/${{ needs.plan.outputs.mod_id }}-${{ matrix.jar_suffix }}-${{ needs.plan.outputs.version }}.jar
           game_versions: ${{ matrix.curseforge_ids }}
-          release_type: ${{ needs.build-26-dist.outputs.channel }}
-          changelog: "Automated release ${{ needs.build-26-dist.outputs.tag }}."
+          release_type: ${{ needs.plan.outputs.channel }}
+          changelog: "Automated release ${{ needs.plan.outputs.tag }}."
           changelog_type: markdown
 
       - name: Record uploaded file ID
+        if: ${{ steps.existing.outputs.uploaded != 'true' }}
         env:
           FILE_ID: ${{ steps.publish.outputs.id }}
         run: |
           [[ "$FILE_ID" =~ ^[0-9]+$ ]]
+          printf '{"file_id": %s}\n' "$FILE_ID" > "$MARKER"
+          gh release upload "$TAG" "$MARKER" --clobber
           printf 'CurseForge file ID: `%s` (tags validated before upload; moderation may be pending)\n' "$FILE_ID" >> "$GITHUB_STEP_SUMMARY"

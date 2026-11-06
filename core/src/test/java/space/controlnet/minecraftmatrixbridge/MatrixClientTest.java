@@ -198,4 +198,73 @@ public class MatrixClientTest {
     private static String urlEncode(String value) {
         return URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20");
     }
+
+    @Test
+    void sentMessagesDisableLegacyBodyMentions() throws Exception {
+        try (space.controlnet.minecraftmatrixbridge.testutil.MockMatrixServer server =
+                     new space.controlnet.minecraftmatrixbridge.testutil.MockMatrixServer("token", "@bot:example.com")) {
+            new MatrixClient(server.homeserverUrl(), "token").sendText("!room:example.com", "@room hi", "txn");
+            com.google.gson.JsonObject body = com.google.gson.JsonParser.parseString(
+                    server.getSendRequests().get(0).body()).getAsJsonObject();
+            // An empty m.mentions turns off the push rules that scan the body for @room / display names.
+            assertTrue(body.has("m.mentions"));
+            assertEquals(0, body.getAsJsonObject("m.mentions").size());
+        }
+    }
+
+    @Test
+    void roomVersion12CreatorsHaveInfinitePower() throws Exception {
+        String roomId = "!createhash";
+        try (space.controlnet.minecraftmatrixbridge.testutil.MockMatrixServer server =
+                     new space.controlnet.minecraftmatrixbridge.testutil.MockMatrixServer("token", "@bot:example.com")) {
+            server.setStateContent(roomId, "m.room.power_levels", "", json("{\"users\":{\"@mod:x\":50},\"users_default\":0}"));
+            server.setStateContent(roomId, "m.room.create", "", json("{\"room_version\":\"12\",\"additional_creators\":[\"@co:x\"]}"));
+            server.setRoomEvent(roomId, "$createhash", json("{\"type\":\"m.room.create\",\"sender\":\"@owner:x\",\"content\":{\"room_version\":\"12\",\"additional_creators\":[\"@co:x\"]}}"));
+            MatrixClient client = new MatrixClient(server.homeserverUrl(), "token");
+
+            assertEquals(Integer.MAX_VALUE, client.getUserPowerLevel(roomId, "@owner:x"));
+            assertEquals(Integer.MAX_VALUE, client.getUserPowerLevel(roomId, "@co:x"));
+            assertEquals(50, client.getUserPowerLevel(roomId, "@mod:x"));
+            assertEquals(0, client.getUserPowerLevel(roomId, "@guest:x"));
+        }
+    }
+
+    @Test
+    void legacyRoomCreatorsUseThePowerLevelsEvent() throws Exception {
+        String roomId = "!legacy:example.com";
+        try (space.controlnet.minecraftmatrixbridge.testutil.MockMatrixServer server =
+                     new space.controlnet.minecraftmatrixbridge.testutil.MockMatrixServer("token", "@bot:example.com")) {
+            server.setStateContent(roomId, "m.room.power_levels", "", json("{\"users\":{},\"users_default\":0}"));
+            server.setStateContent(roomId, "m.room.create", "", json("{\"room_version\":\"10\",\"creator\":\"@owner:x\"}"));
+            assertEquals(0, new MatrixClient(server.homeserverUrl(), "token").getUserPowerLevel(roomId, "@owner:x"));
+        }
+    }
+
+    @Test
+    void creatorLookupFailureFailsClosed() throws Exception {
+        String roomId = "!createhash";
+        try (space.controlnet.minecraftmatrixbridge.testutil.MockMatrixServer server =
+                     new space.controlnet.minecraftmatrixbridge.testutil.MockMatrixServer("token", "@bot:example.com")) {
+            server.setStateContent(roomId, "m.room.power_levels", "", json("{\"users\":{},\"users_default\":0}"));
+            server.setStateError(roomId, "m.room.create", "", 500);
+            assertEquals(0, new MatrixClient(server.homeserverUrl(), "token").getUserPowerLevel(roomId, "@owner:x"));
+        }
+    }
+
+    @Test
+    void legacyCreatorHas100WhenTheRoomHasNoPowerLevels() throws Exception {
+        String roomId = "!nopl:example.com";
+        try (space.controlnet.minecraftmatrixbridge.testutil.MockMatrixServer server =
+                     new space.controlnet.minecraftmatrixbridge.testutil.MockMatrixServer("token", "@bot:example.com")) {
+            server.setStateError(roomId, "m.room.power_levels", "", 404);
+            server.setStateContent(roomId, "m.room.create", "", json("{\"room_version\":\"10\",\"creator\":\"@owner:x\"}"));
+            MatrixClient client = new MatrixClient(server.homeserverUrl(), "token");
+            assertEquals(100, client.getUserPowerLevel(roomId, "@owner:x"));
+            assertEquals(0, client.getUserPowerLevel(roomId, "@guest:x"));
+        }
+    }
+
+    private static com.google.gson.JsonObject json(String value) {
+        return com.google.gson.JsonParser.parseString(value).getAsJsonObject();
+    }
 }

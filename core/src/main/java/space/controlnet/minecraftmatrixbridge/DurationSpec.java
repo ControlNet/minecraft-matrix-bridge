@@ -155,7 +155,11 @@ public final class DurationSpec {
      */
     public long calculateExpiresAtMs(long nowMs) {
         if (mode == Mode.TIMED) {
-            return nowMs + durationMs;
+            try {
+                return Math.addExact(nowMs, durationMs);
+            } catch (ArithmeticException e) {
+                return Long.MAX_VALUE; // A huge duration means "effectively never expires".
+            }
         }
         return 0;
     }

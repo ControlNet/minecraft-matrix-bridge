@@ -78,6 +78,32 @@ class ArtifactTests(unittest.TestCase):
         output.get_nowait()  # Bridge readiness may consume the log before the event probe.
         system_test_all.wait_for_event_index_ready("forge-1.18", None, output, timeout_s=1, probe=probe)
 
+    def test_matrix_probe_arrives_after_the_discarded_initial_sync(self):
+        import json as _json
+        from urllib.request import Request, urlopen
+        mock = system_test_all.MockMatrix("t", "@bot:x", "!r:x", "#r:x")
+        base = mock.start()
+        try:
+            bodies = []
+            for _ in range(3):
+                request = Request(f"{base}/_matrix/client/v3/sync", headers={"Authorization": "Bearer t"})
+                with urlopen(request, timeout=5) as response:
+                    events = _json.load(response)["rooms"]["join"]["!r:x"]["timeline"]["events"]
+                bodies.append([event["event_id"] for event in events])
+        finally:
+            mock.stop()
+        # Sync #1 is the initial catch-up that the bridge discards by design.
+        self.assertEqual(bodies[system_test_all.MATRIX_PROBE_SYNC - 1], [f"$e{system_test_all.MATRIX_PROBE_SYNC}"])
+        self.assertEqual(bodies[2], [])
+
+    def test_broadcast_probe_is_seen_even_if_readiness_consumed_the_line(self):
+        probe = system_test_all.LogProbe(system_test_all.MATRIX_PROBE_EXPECTED)
+        output = queue.Queue()
+        system_test_all._reader_thread(io.StringIO("[Server thread/INFO]: " + system_test_all.MATRIX_PROBE_EXPECTED + "\n"),
+                                       output, None, probe)
+        output.get_nowait()
+        system_test_all.wait_for_log_probe("forge-1.19", probe, None, output, timeout_s=1)
+
     def test_empty_event_index_is_rejected(self):
         probe = system_test_all.EventIndexProbe()
         probe.record("Event index built in 5 ms: scanned 0 jars, 0 classes, found 0 events\n")
@@ -213,6 +239,78 @@ class ArtifactTests(unittest.TestCase):
         self.assertNotIn("max-parallel", matrix)
         self.assertNotIn("./gradlew", matrix)
 
+
+
+class ServerEnvironmentTests(unittest.TestCase):
+    def test_gradle_uses_its_own_default_user_home(self):
+        # A repo-local default forced a cold cache where ForgeGradle 7 must download JDK 8.
+        env = system_test_all.server_environment({"PATH": "/usr/bin"}, "token")
+        self.assertNotIn("GRADLE_USER_HOME", env)
+        self.assertEqual("token", env["MATRIX_ACCESS_TOKEN"])
+        self.assertEqual("/usr/bin", env["PATH"])
+
+    def test_explicit_gradle_user_home_is_kept(self):
+        env = system_test_all.server_environment({"GRADLE_USER_HOME": "/isolated"}, "token")
+        self.assertEqual("/isolated", env["GRADLE_USER_HOME"])
+
+    def test_caller_environment_is_not_mutated(self):
+        original = {"PATH": "/usr/bin"}
+        system_test_all.server_environment(original, "token")
+        self.assertEqual({"PATH": "/usr/bin"}, original)
+
+
+class HeadlessClientTests(unittest.TestCase):
+    """Synthetic mock-Matrix bodies and client results; no Minecraft server is started."""
+
+    def body(self, text):
+        return json.dumps({"msgtype": "m.text", "body": text, "m.mentions": {}})
+
+    def test_player_messages_are_all_required(self):
+        bodies = [self.body(text) for text in system_test_all.EXPECTED_PLAYER_BODIES]
+        self.assertEqual([], system_test_all.missing_player_messages(bodies))
+        self.assertEqual([system_test_all.EXPECTED_PLAYER_BODIES[2]],
+                         system_test_all.missing_player_messages(bodies[:2]))
+
+    def test_expected_messages_cover_join_chat_and_leave(self):
+        joined, chat, left = system_test_all.EXPECTED_PLAYER_BODIES
+        self.assertIn("joined the game", joined)
+        self.assertIn(system_test_all.CLIENT_CHAT, chat)
+        self.assertIn("left the game", left)
+
+    def test_client_expects_the_localized_connected_notice(self):
+        lang = json.loads((system_test_all.ROOT / "core/src/main/resources/assets/minecraftmatrixbridge/lang"
+                           / f"{system_test_all.CLIENT_LOCALE}.json").read_text(encoding="utf-8"))
+        template = lang["minecraftmatrixbridge.connected"]
+        self.assertTrue(template.startswith(system_test_all.CLIENT_EXPECT))
+        self.assertNotIn("Matrix room connected", system_test_all.CLIENT_EXPECT, "must not match the English text")
+
+    def test_systemtest_config_enables_join_and_leave_notices(self):
+        with tempfile.TemporaryDirectory() as run_dir:
+            system_test_all.write_systemtest_config(Path(run_dir), "http://127.0.0.1:1", "#room:example.com")
+            config = (Path(run_dir) / "config/minecraftmatrixbridge.toml").read_text(encoding="utf-8")
+        self.assertIn("enableJoinLeaveToMatrix=true", config.splitlines())
+
+    def test_server_test_workflow_installs_the_locked_client(self):
+        workflow = (system_test_all.ROOT / ".github/workflows/server-tests.yml").read_text(encoding="utf-8")
+        self.assertIn("uses: actions/setup-node@", workflow)
+        self.assertIn("cache-dependency-path: scripts/headless-client/package-lock.json", workflow)
+        # `npm ci` installs exactly the lockfile (with integrity hashes), never newer versions.
+        self.assertIn("npm ci --prefix scripts/headless-client", workflow)
+        self.assertLess(workflow.index("npm ci --prefix scripts/headless-client"),
+                        workflow.index("python3 scripts/system_test_all.py --packaged"))
+
+    def test_missing_client_dependencies_fail_loudly(self):
+        with tempfile.TemporaryDirectory() as empty:
+            with patch.object(system_test_all, "HEADLESS_CLIENT_DIR", Path(empty)):
+                with self.assertRaisesRegex(RuntimeError, "npm ci"):
+                    system_test_all.headless_client_command(25565)
+
+    def test_unsupported_protocol_is_reported_not_hidden(self):
+        result = system_test_all.interpret_client_exit("forge-26.2", 3, ['{"event":"unsupported","protocol":999}'])
+        self.assertFalse(result)
+        with self.assertRaisesRegex(RuntimeError, "timeout"):
+            system_test_all.interpret_client_exit("forge-1.20", 1, ['{"event":"timeout"}'])
+        self.assertTrue(system_test_all.interpret_client_exit("forge-1.20", 0, ['{"event":"done"}']))
 
 if __name__ == "__main__":
     unittest.main()

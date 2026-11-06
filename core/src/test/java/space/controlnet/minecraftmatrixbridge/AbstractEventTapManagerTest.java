@@ -15,6 +15,17 @@ class AbstractEventTapManagerTest {
     public static class ParentEvent {}
     public static class ChildEvent extends ParentEvent {}
 
+    /** Name contains "Tick" like the loaders' tick events; counts serializations. */
+    public static class CountingTickEvent extends ParentEvent {
+        static final java.util.concurrent.atomic.AtomicInteger SERIALIZED = new java.util.concurrent.atomic.AtomicInteger();
+
+        @Override
+        public String toString() {
+            SERIALIZED.incrementAndGet();
+            return "tick";
+        }
+    }
+
     private static final AtomicBoolean NON_EVENT_INITIALIZED = new AtomicBoolean(false);
 
     public static class InitializingNonEvent {
@@ -31,6 +42,7 @@ class AbstractEventTapManagerTest {
     private static class TestManager extends AbstractEventTapManager<Object> {
         final TestBus bus;
         final Map<Class<?>, Consumer<Object>> listeners;
+        final java.util.List<String> forwarded = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
 
         TestManager() {
             this(new TestBus(), CompletableFuture.completedFuture(EventIndex.empty()));
@@ -49,6 +61,7 @@ class AbstractEventTapManagerTest {
             bus.registrations++;
             bus.listeners.put(type, listener);
         }
+        @Override void forward(String message) { forwarded.add(message); }
 
         void subscribe(Class<?> type) {
             assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
@@ -201,5 +214,93 @@ class AbstractEventTapManagerTest {
         assertFalse(bucket.isEmpty());
         assertEquals(1, bucket.disableAll());
         assertTrue(bucket.isEmpty());
+    }
+
+    private static void waitForIndex(TestManager manager) {
+        assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
+            while (!manager.isIndexReady()) Thread.sleep(10);
+        });
+    }
+
+    private static void runConcurrently(int threads, Runnable task) throws InterruptedException {
+        java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+        java.util.List<Thread> workers = new java.util.ArrayList<>();
+        for (int t = 0; t < threads; t++) {
+            Thread worker = new Thread(() -> {
+                try {
+                    start.await();
+                } catch (InterruptedException e) {
+                    return;
+                }
+                task.run();
+            });
+            worker.start();
+            workers.add(worker);
+        }
+        start.countDown();
+        for (Thread worker : workers) {
+            worker.join(5_000);
+        }
+    }
+
+    @Test
+    void onceSubscriptionForwardsExactlyOnceUnderConcurrentDispatch() throws InterruptedException {
+        for (int trial = 0; trial < 50; trial++) {
+            var manager = new TestManager();
+            manager.subscribe(ParentEvent.class);
+            Consumer<Object> listener = manager.listeners.get(ParentEvent.class);
+            runConcurrently(8, () -> {
+                for (int i = 0; i < 50; i++) listener.accept(new ParentEvent());
+            });
+            assertEquals(1, manager.forwarded.size(), "trial " + trial);
+            manager.close();
+        }
+    }
+
+    @Test
+    void concurrentEnableCommandsRespectTheTapLimit() throws InterruptedException {
+        var manager = new TestManager();
+        waitForIndex(manager);
+        java.util.concurrent.atomic.AtomicInteger enabled = new java.util.concurrent.atomic.AtomicInteger();
+        runConcurrently(32, () -> {
+            String reply = manager.handleCommand(new String[]{"on", ParentEvent.class.getName(), "", "10m"});
+            if (reply.startsWith("Enabled tap")) enabled.incrementAndGet();
+        });
+        assertEquals(10, enabled.get());
+    }
+
+    @Test
+    void tickEventsAreEvaluatedAtMostOncePerSecondEvenWhenTheFilterNeverMatches() {
+        var manager = new TestManager();
+        waitForIndex(manager);
+        assertTrue(manager.handleCommand(new String[]{"on", CountingTickEvent.class.getName(), "never-matches", "10m"})
+                .startsWith("Enabled tap"));
+        CountingTickEvent.SERIALIZED.set(0);
+        Consumer<Object> listener = manager.listeners.get(CountingTickEvent.class);
+        for (int i = 0; i < 200; i++) listener.accept(new CountingTickEvent());
+        assertEquals(1, CountingTickEvent.SERIALIZED.get());
+        assertTrue(manager.forwarded.isEmpty());
+    }
+
+    @Test
+    void permanentSupertypeTapsSkipTickEvents() {
+        var manager = new TestManager();
+        waitForIndex(manager);
+        assertTrue(manager.handleCommand(new String[]{"on", ParentEvent.class.getName(), "", "permanent"})
+                .startsWith("Enabled tap"));
+        Consumer<Object> listener = manager.listeners.get(ParentEvent.class);
+        listener.accept(new CountingTickEvent());
+        assertTrue(manager.forwarded.isEmpty(), "a permanent tap must not stream tick events");
+        listener.accept(new ChildEvent());
+        assertEquals(1, manager.forwarded.size());
+    }
+
+    @Test
+    void timedTickTapsAreCappedAtOneDay() {
+        var manager = new TestManager();
+        waitForIndex(manager);
+        String name = CountingTickEvent.class.getName();
+        assertTrue(manager.handleCommand(new String[]{"on", name, "", "2d"}).contains("24h"));
+        assertTrue(manager.handleCommand(new String[]{"on", name, "", "24h"}).startsWith("Enabled tap"));
     }
 }

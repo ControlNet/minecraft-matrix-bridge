@@ -5,11 +5,16 @@ import net.minecraftforge.eventbus.api.bus.EventBus;
 import net.minecraftforge.eventbus.api.listener.Priority;
 import net.minecraftforge.eventbus.internal.Event;
 
-import java.lang.reflect.Field;
 import java.util.function.Consumer;
 
-public final class EventTapManager extends AbstractEventTapManager<Event> {
+/**
+ * Forge 26 (EventBus 7) taps. Shares {@link ModernEventBus} with Forge 1.21 so that
+ * sealed event families such as {@code TickEvent$ServerTickEvent}, which are interfaces
+ * rather than Event subtypes, can be tapped, and each event's own BUS is used.
+ */
+public final class EventTapManager extends AbstractEventTapManager<Object> {
     private final EventBusMigrationHelper eventBus;
+    private final ModernEventBus bus = new ModernEventBus(Event.class, EventBus.class, Priority.NORMAL);
 
     public EventTapManager(BridgeService bridgeService, EventBusMigrationHelper eventBus, int maxActiveTaps, long defaultThrottleMs) {
         super(bridgeService, maxActiveTaps, defaultThrottleMs);
@@ -22,8 +27,23 @@ public final class EventTapManager extends AbstractEventTapManager<Event> {
     }
 
     @Override
-    protected Class<Event> getEventBaseClass() {
-        return Event.class;
+    public String handleCommand(String[] args) {
+        if (args != null && args.length > 1 && ("on".equalsIgnoreCase(args[0]) || "off".equalsIgnoreCase(args[0]))) {
+            args = args.clone();
+            args[1] = ModernEventBus.eventName(args[1]);
+        }
+        return super.handleCommand(args);
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    protected Class<Object> getEventBaseClass() {
+        return (Class<Object>) bus.eventBaseClass();
+    }
+
+    @Override
+    protected boolean isEventClass(Class<?> eventClass) {
+        return bus.isEventClass(eventClass);
     }
 
     @Override
@@ -31,20 +51,8 @@ public final class EventTapManager extends AbstractEventTapManager<Event> {
         return eventBus;
     }
 
-    @SuppressWarnings("unchecked")
     @Override
-    protected void registerEventListener(Class<Event> eventClass, Consumer<Event> listener) {
-        try {
-            Field busField = eventClass.getField("BUS");
-            Object busObject = busField.get(null);
-            if (busObject instanceof EventBus<?> typedBus) {
-                ((EventBus<Event>) typedBus).addListener(Priority.NORMAL, listener);
-                return;
-            }
-        } catch (ReflectiveOperationException ignored) {
-            // Fall through to the explicit failure below.
-        }
-
-        throw new IllegalStateException("Forge 26 event class does not expose a compatible BUS field: " + eventClass.getName());
+    protected void registerEventListener(Class<Object> eventClass, Consumer<Object> listener) {
+        bus.listen(eventClass, listener);
     }
 }

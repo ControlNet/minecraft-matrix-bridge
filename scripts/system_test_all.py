@@ -12,7 +12,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Optional
@@ -22,8 +22,10 @@ from urllib.request import Request, urlopen
 
 
 MODERN_MODULE_EVENT_ALIASES = {
-    "forge-26.1": "TickEvent.ServerTickEvent.Post",
-    "forge-26.2": "TickEvent.ServerTickEvent.Post",
+    # Forge 26's ServerTickEvent is a sealed interface over Pre/Post, not an Event
+    # subtype; tapping the family exercises the sealed-family path.
+    "forge-26.1": "TickEvent.ServerTickEvent",
+    "forge-26.2": "TickEvent.ServerTickEvent",
     "neoforge-26.1": "ServerTickEvent.Post",
     "neoforge-26.2": "ServerTickEvent.Post",
 }
@@ -34,6 +36,28 @@ MODULE_EVENT_ALIASES = {
        for family in ("1.18", "1.19", "1.20", "1.21")},
     "neoforge-1.21": "net.neoforged.neoforge.event.tick.ServerTickEvent$Post",
 }
+
+ROOT = Path(__file__).resolve().parents[1]
+HEADLESS_CLIENT_DIR = ROOT / "scripts" / "headless-client"
+CLIENT_USERNAME = "Probe"
+# A non-English locale also checks that the connected notice is localized per player.
+CLIENT_LOCALE = "zh_cn"
+CLIENT_EXPECT = "Matrix 房间已连接"
+CLIENT_CHAT = "hello from the headless client"
+EXPECTED_PLAYER_BODIES = (
+    f"[MC] * {CLIENT_USERNAME} joined the game",
+    f"[MC] <{CLIENT_USERNAME}> {CLIENT_CHAT}",
+    f"[MC] * {CLIENT_USERNAME} left the game",
+)
+CLIENT_UNSUPPORTED_EXIT = 3
+
+MATRIX_PROBE_SYNC = 2
+MATRIX_PROBE_SENDER = "@alice:example.com"
+# Include a formatting code so the sanitizing path runs. Minecraft strips
+# formatting codes from its own console log, so this probe cannot prove the
+# bridge removed them; core unit tests cover that.
+MATRIX_PROBE_BODY = "hello \u00a7cfrom mock"
+MATRIX_PROBE_EXPECTED = f"[Matrix] <{MATRIX_PROBE_SENDER}> hello from mock"
 
 EVENT_INDEX_SUMMARY = re.compile(
     r"Event index built in \d+ ms: scanned (\d+) jars, (\d+) classes, found (\d+) events"
@@ -68,6 +92,7 @@ class MatrixCounters:
     sync_calls: int = 0
     send_calls: int = 0
     last_send_body: str = ""
+    send_bodies: list = field(default_factory=list)
 
 
 class MockMatrix:
@@ -153,15 +178,18 @@ class MockMatrix:
                     next_batch = f"s{outer._sync_next_batch}"
 
                     events = []
-                    if outer._sync_next_batch == 1:
+                    # Sync #1 is the initial catch-up, which the bridge discards by
+                    # design. Deliver the probe message on the first incremental sync
+                    # so the Matrix -> Minecraft broadcast path actually executes.
+                    if outer._sync_next_batch in (1, MATRIX_PROBE_SYNC):
                         events = [
                             {
                                 "type": "m.room.message",
                                 "event_id": f"$e{outer._sync_next_batch}",
-                                "sender": "@alice:example.com",
+                                "sender": MATRIX_PROBE_SENDER,
                                 "content": {
                                     "msgtype": "m.text",
-                                    "body": "hello from mock",
+                                    "body": MATRIX_PROBE_BODY,
                                 },
                             }
                         ]
@@ -197,6 +225,7 @@ class MockMatrix:
                     length = int(self.headers.get("Content-Length", "0") or "0")
                     body = self.rfile.read(length).decode("utf-8", errors="replace")
                     counters.last_send_body = body
+                    counters.send_bodies.append(body)
                     self._send_json(200, {"event_id": "$mock"})
                     return
 
@@ -244,7 +273,8 @@ def write_systemtest_config(
                 "enableMcToMatrix=true",
                 "enableMatrixToMc=true",
                 "announceConnected=true",
-                "enableJoinLeaveToMatrix=false",
+                # The headless client checks join/leave notices.
+                "enableJoinLeaveToMatrix=true",
                 "enableServerLifecycleToMatrix=false",
                 'mcToMatrixPrefix="[MC] "',
                 'matrixToMcPrefix="[Matrix] "',
@@ -338,11 +368,123 @@ def wait_for_bridge_ready(
     )
 
 
+class LogProbe:
+    """Records whether a server output line contains the expected text."""
+
+    def __init__(self, needle: str) -> None:
+        self.needle = needle
+        self.done = threading.Event()
+
+    def record(self, line: str) -> None:
+        if self.needle in line:
+            self.done.set()
+
+
+def wait_for_log_probe(
+    module: str,
+    probe: LogProbe,
+    proc: subprocess.Popen[str],
+    out_queue: "queue.Queue[str]",
+    timeout_s: int,
+) -> None:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if probe.done.is_set():
+            return
+        try:
+            line = out_queue.get(timeout=0.5)
+        except queue.Empty:
+            if proc.poll() is not None:
+                break
+            continue
+        if not line.startswith("Downloading: "):
+            sys.stdout.write(f"[{module}] {line}")
+    raise RuntimeError(f"{module}: Matrix message was not broadcast to Minecraft: expected {probe.needle!r}")
+
+
 def event_tap_alias_for_module(module: str) -> str:
     try:
         return MODULE_EVENT_ALIASES[module]
     except KeyError:
         raise ValueError(f"No event tap probe configured for module: {module}") from None
+
+
+def server_environment(environ, token: str) -> dict:
+    """Environment for the server process.
+
+    GRADLE_USER_HOME is left to the caller (Gradle defaults to ~/.gradle). Forcing a
+    repo-local home meant a cold cache, where ForgeGradle 7 must download a JDK 8 and
+    fails offline. Set GRADLE_USER_HOME=.gradle-user-home explicitly for an isolated run.
+    """
+    env = dict(environ)
+    env["MATRIX_ACCESS_TOKEN"] = token
+    return env
+
+
+def headless_client_command(server_port: int) -> list[str]:
+    script = HEADLESS_CLIENT_DIR / "client.js"
+    if not (HEADLESS_CLIENT_DIR / "node_modules" / "minecraft-protocol").is_dir():
+        raise RuntimeError(
+            f"headless client dependencies are missing; run: npm ci --prefix {HEADLESS_CLIENT_DIR}")
+    node = shutil.which("node")
+    if node is None:
+        raise RuntimeError("node is required for the headless client player checks")
+    return [node, str(script), "--port", str(server_port), "--username", CLIENT_USERNAME,
+            "--locale", CLIENT_LOCALE, "--expect", CLIENT_EXPECT, "--chat", CLIENT_CHAT,
+            "--timeout-ms", "90000"]
+
+
+def interpret_client_exit(module: str, returncode: int, lines: list[str]) -> bool:
+    """True when the player checks ran; False only for a protocol the client cannot speak."""
+    if returncode == 0:
+        return True
+    if returncode == CLIENT_UNSUPPORTED_EXIT:
+        # Visible in the log and summary; not a pass for the player checks.
+        print(f"[{module}] SKIP player checks: minecraft-protocol cannot speak this server's protocol "
+              f"({lines[-1] if lines else 'no output'})", flush=True)
+        return False
+    raise RuntimeError(f"{module}: headless client failed (exit {returncode}): {lines[-1] if lines else 'no output'}")
+
+
+def run_headless_client(module: str, server_port: int) -> bool:
+    result = subprocess.run(headless_client_command(server_port), capture_output=True, text=True, timeout=150)
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    for line in lines:
+        print(f"[{module}] client: {line}", flush=True)
+    for line in result.stderr.splitlines()[-20:]:
+        print(f"[{module}] client stderr: {line}", flush=True)
+    return interpret_client_exit(module, result.returncode, lines)
+
+
+def missing_player_messages(bodies: list[str]) -> list[str]:
+    texts = [tap_message_body(body) for body in bodies]
+    return [expected for expected in EXPECTED_PLAYER_BODIES if expected not in texts]
+
+
+def wait_for_player_messages(module: str, mock: "MockMatrix", proc: subprocess.Popen[str],
+                             out_queue: "queue.Queue[str]", timeout_s: int) -> None:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            while True:
+                line = out_queue.get_nowait()
+                if not line.startswith("Downloading: "):
+                    sys.stdout.write(f"[{module}] {line}")
+        except queue.Empty:
+            pass
+        if not missing_player_messages(mock.counters.send_bodies):
+            return
+        if proc.poll() is not None:
+            break
+        time.sleep(0.2)
+    raise RuntimeError(f"{module}: Matrix never received {missing_player_messages(mock.counters.send_bodies)}")
+
+
+def tap_message_body(raw: str) -> str:
+    try:
+        return str(json.loads(raw).get("body", ""))[:300]
+    except (ValueError, AttributeError):
+        return raw[:300]
 
 
 def wait_for_send_count(
@@ -403,10 +545,13 @@ def wait_for_event_index_ready(
     raise RuntimeError(f"{module}: event index did not finish building before timeout")
 
 
-def _reader_thread(stream, out_queue: "queue.Queue[str]", event_index_probe: EventIndexProbe | None = None) -> None:
+def _reader_thread(stream, out_queue: "queue.Queue[str]", event_index_probe: EventIndexProbe | None = None,
+                   log_probe: LogProbe | None = None) -> None:
     for line in iter(stream.readline, ""):
         if event_index_probe is not None and "Event index built in" in line:
             event_index_probe.record(line)
+        if log_probe is not None:
+            log_probe.record(line)
         out_queue.put(line)
     stream.close()
 
@@ -552,7 +697,8 @@ def run_one(module: str, timeout_s: int, packaged: bool = False,
     if run_dir.exists():
         shutil.rmtree(run_dir)
     ensure_eula(run_dir)
-    write_server_properties(run_dir, pick_free_port())
+    server_port = pick_free_port()
+    write_server_properties(run_dir, server_port)
     (run_dir / "jna").mkdir(parents=True, exist_ok=True)
     packaged_cmd = packaged_server_command(root, module, run_dir, loader_coordinate, artifact_dir) if packaged else None
 
@@ -569,9 +715,7 @@ def run_one(module: str, timeout_s: int, packaged: bool = False,
     try:
         write_systemtest_config(run_dir, homeserver, room_alias)
 
-        env = dict(os.environ)
-        env["MATRIX_ACCESS_TOKEN"] = token
-        env.setdefault("GRADLE_USER_HOME", str(root / ".gradle-user-home"))
+        env = server_environment(os.environ, token)
 
         cmd = [str(gradlew), f":{module}:runServer", "--console=plain"]
         if modern_26:
@@ -594,7 +738,9 @@ def run_one(module: str, timeout_s: int, packaged: bool = False,
 
         q: "queue.Queue[str]" = queue.Queue()
         event_index_probe = EventIndexProbe()
-        t = threading.Thread(target=_reader_thread, args=(proc.stdout, q, event_index_probe), daemon=True)
+        broadcast_probe = LogProbe(MATRIX_PROBE_EXPECTED)
+        t = threading.Thread(target=_reader_thread, args=(proc.stdout, q, event_index_probe, broadcast_probe),
+                             daemon=True)
         t.start()
 
         started = False
@@ -620,6 +766,7 @@ def run_one(module: str, timeout_s: int, packaged: bool = False,
             )
 
         state = wait_for_bridge_ready(module, run_dir, mock, proc, q, timeout_s=30)
+        wait_for_log_probe(module, broadcast_probe, proc, q, timeout_s=30)
 
         if module in MODULE_EVENT_ALIASES:
             wait_for_event_index_ready(module, proc, q, timeout_s=60, probe=event_index_probe)
@@ -628,6 +775,8 @@ def run_one(module: str, timeout_s: int, packaged: bool = False,
             proc.stdin.write(f"matrix event on {event_alias}\n")
             proc.stdin.flush()
             wait_for_send_count(module, mock, proc, q, expected_count=1, timeout_s=15)
+            # Diagnostic: show how the tapped event was serialized on this loader.
+            print(f"[{module}] event tap message: {tap_message_body(mock.counters.send_bodies[0])}", flush=True)
             proc.stdin.write(f"matrix event off {event_alias}\n")
             proc.stdin.flush()
 
@@ -642,6 +791,13 @@ def run_one(module: str, timeout_s: int, packaged: bool = False,
             expected_count=2,
             timeout_s=15,
         )
+
+        # A real (headless) player: login/logout events, the localized connected
+        # notice, and in-game chat through ServerChatEvent to Matrix.
+        if run_headless_client(module, server_port):
+            wait_for_player_messages(module, mock, proc, q, timeout_s=15)
+            print(f"[{module}] player checks OK: join, localized notice, chat, leave", flush=True)
+
         proc.stdin.write("stop\n")
         proc.stdin.flush()
 

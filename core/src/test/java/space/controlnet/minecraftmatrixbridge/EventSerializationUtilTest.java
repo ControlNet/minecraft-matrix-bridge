@@ -288,4 +288,54 @@ public class EventSerializationUtilTest {
         String result = EventSerializationUtil.formatForMatrix("test", 100);
         assertTrue(result.contains("String"));
     }
+
+    // -------------------------------------------------------------------------
+    // Getter fallback (synthetic stand-ins for loader events, test-only)
+    // -------------------------------------------------------------------------
+
+    /** Stands in for a loader's Event base: bus plumbing getters, no toString. */
+    public static class SyntheticEventBase {
+        public boolean isCanceled() { return false; }
+        public Object getListenerList() { return "LISTENERS"; }
+        public boolean isCancelable() { return true; }
+    }
+
+    public static class SyntheticLoginEvent extends SyntheticEventBase {
+        public String getPlayer() { return "ServerPlayer['Steve']"; }
+        public boolean isEndConquered() { return true; }
+        public String getLong() { return "y".repeat(500); }
+        public String getBroken() { throw new IllegalStateException("boom"); }
+        public static String getStatic() { return "static-value"; }
+        public String getWithArg(int ignored) { return "arg-value"; }
+        public int[] getCoords() { return new int[]{1, 2, 3}; }
+    }
+
+    public record SyntheticRecordEvent(String player) {}
+
+    @Test
+    void eventsWithoutToStringAreDescribedByTheirGetters() {
+        String result = EventSerializationUtil.serialize(new SyntheticLoginEvent());
+        assertEquals("coords=[1, 2, 3], endConquered=true, long=" + "y".repeat(197) + "..., player=ServerPlayer['Steve']",
+                result);
+    }
+
+    @Test
+    void getterFallbackSkipsBusPlumbingFailuresAndNonGetters() {
+        String result = EventSerializationUtil.serialize(new SyntheticLoginEvent());
+        for (String excluded : new String[]{"LISTENERS", "canceled", "cancelable", "static-value", "arg-value", "boom", "broken"}) {
+            assertFalse(result.contains(excluded), excluded + " leaked into " + result);
+        }
+    }
+
+    @Test
+    void recordEventsKeepTheirGeneratedToString() {
+        assertEquals("SyntheticRecordEvent[player=Steve]",
+                EventSerializationUtil.serialize(new SyntheticRecordEvent("Steve")));
+    }
+
+    @Test
+    void formatForMatrixReusesAnAlreadySerializedPayload() {
+        assertEquals("[EVT] SyntheticLoginEvent: payload",
+                EventSerializationUtil.formatForMatrix(new SyntheticLoginEvent(), "payload", 100));
+    }
 }

@@ -65,3 +65,6 @@ dist/
 /META-INF/
 **/META-INF/gradle-plugins/
 .eclipse
+
+# Test-only headless Minecraft client dependencies
+scripts/headless-client/node_modules/

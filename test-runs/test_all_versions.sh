@@ -1,116 +1,51 @@
-#!/bin/bash
-# Test all Minecraft server versions and capture logs
-# Usage: ./test_all_versions.sh
+#!/usr/bin/env bash
+# Start every module's dev server against a local mock Matrix homeserver and keep
+# one log per module. Delegates to scripts/system_test_all.py, which owns the server
+# process (no pattern-based pkill), uses each module's real run directory, and fails
+# when the bridge, event taps, or Matrix -> Minecraft broadcast do not work.
+# A headless player (scripts/headless-client) then checks join/leave, the localized
+# connected notice and in-game chat; install it once with:
+#   npm ci --prefix scripts/headless-client
+#
+# Usage: ./test-runs/test_all_versions.sh [module ...]
+# Exit status is non-zero if any module failed; all modules are still attempted.
 
-set -e
+set -uo pipefail
 
 cd "$(dirname "$0")/.."
 
-VERSIONS=("forge-1.18" "forge-1.19" "forge-1.20" "forge-1.21" "forge-26.1" "forge-26.2" "neoforge-1.21" "neoforge-26.1" "neoforge-26.2")
+if [[ $# -gt 0 ]]; then
+    VERSIONS=("$@")
+else
+    VERSIONS=("forge-1.18" "forge-1.19" "forge-1.20" "forge-1.21" "forge-26.1" "forge-26.2" "neoforge-1.21" "neoforge-26.1" "neoforge-26.2")
+fi
 LOG_DIR="test-runs/logs"
-TIMEOUT=180  # 3 minutes max per server
+TIMEOUT_S=600
 
 mkdir -p "$LOG_DIR"
 
-# Clean up any existing server processes
-cleanup() {
-    echo "Cleaning up..."
-    pkill -f "runServer" 2>/dev/null || true
-    pkill -f "minecraft" 2>/dev/null || true
-}
-
-trap cleanup EXIT
-
+failed=()
 for VERSION in "${VERSIONS[@]}"; do
     echo ""
     echo "=========================================="
     echo "Testing $VERSION"
     echo "=========================================="
-    
     LOG_FILE="$LOG_DIR/${VERSION}.log"
-    
-    # Accept EULA
-    if [[ "$VERSION" == "forge-26."* || "$VERSION" == "neoforge-26."* ]]; then
-        RUN_DIR="${VERSION}/run-systemtest"
-        GRADLEW="./gradlew-26"
-        GRADLE_ARGS=("-Pomx_modern_26=true")
+    if python3 scripts/system_test_all.py --modules "$VERSION" --timeout-s "$TIMEOUT_S" > "$LOG_FILE" 2>&1; then
+        echo "PASS $VERSION"
     else
-        RUN_DIR="${VERSION}/run"
-        GRADLEW="./gradlew"
-        GRADLE_ARGS=()
+        echo "FAIL $VERSION (see $LOG_FILE)"
+        failed+=("$VERSION")
     fi
-    mkdir -p "$RUN_DIR"
-    echo "eula=true" > "$RUN_DIR/eula.txt"
-    
-    # Create minimal server.properties to speed up startup
-    cat > "$RUN_DIR/server.properties" << EOF
-online-mode=false
-level-type=flat
-generate-structures=false
-spawn-npcs=false
-spawn-animals=false
-spawn-monsters=false
-max-tick-time=-1
-EOF
-    
-    # Create config directory with minimal config
-    mkdir -p "$RUN_DIR/config"
-    cat > "$RUN_DIR/config/minecraftmatrixbridge.toml" << EOF
-[matrix]
-homeserver = "http://localhost:9999"
-roomId = "!test:localhost"
-accessToken = "test_token"
-
-[bridge]
-enableMcToMatrix = true
-enableMatrixToMc = true
-enableEventTaps = true
-EOF
-    
-    echo "Starting $VERSION server..."
-    
-    # Run server with timeout, capturing output
-    timeout $TIMEOUT "$GRADLEW" "${GRADLE_ARGS[@]}" :${VERSION}:runServer --no-daemon 2>&1 | tee "$LOG_FILE" &
-    SERVER_PID=$!
-    
-    # Wait for server to fully start or fail
-    STARTED=false
-    for i in $(seq 1 60); do
-        sleep 3
-        if grep -q "Event index built in" "$LOG_FILE" 2>/dev/null; then
-            STARTED=true
-            echo "Event index built - checking results..."
-            break
-        fi
-        if grep -q "Done\|For help, type" "$LOG_FILE" 2>/dev/null; then
-            STARTED=true
-            echo "Server started successfully"
-            break
-        fi
-        if ! kill -0 $SERVER_PID 2>/dev/null; then
-            echo "Server process exited"
-            break
-        fi
-        echo "  Waiting... ($i)"
-    done
-    
-    # Give it a moment to finish logging
-    sleep 2
-    
-    # Kill the server
-    echo "Stopping server..."
-    kill $SERVER_PID 2>/dev/null || true
-    wait $SERVER_PID 2>/dev/null || true
-    
-    # Extract event indexing info
-    echo ""
-    echo "--- Event Index Results for $VERSION ---"
-    grep -i "event.*index\|indexed\|scanning\|MatrixBridge" "$LOG_FILE" 2>/dev/null | head -20 || echo "No event index logs found"
-    echo ""
-    
+    grep -E "Event index built in|MatrixBridge started|\[Matrix\] <|player checks|SKIP player|OK: " "$LOG_FILE" | head -6 || true
 done
 
 echo ""
 echo "=========================================="
-echo "All tests complete. Logs saved in $LOG_DIR"
+if [[ ${#failed[@]} -gt 0 ]]; then
+    echo "Failed modules: ${failed[*]}. Logs saved in $LOG_DIR"
+    echo "=========================================="
+    exit 1
+fi
+echo "All ${#VERSIONS[@]} modules passed. Logs saved in $LOG_DIR"
 echo "=========================================="

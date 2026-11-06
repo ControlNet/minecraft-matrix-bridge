@@ -30,6 +30,37 @@ public class SinceStoreTest {
     }
 
     @Test
+    void bindOwnerDiscardsSinceFromAnotherHomeserverOrAccount() {
+        SinceStore store = new SinceStore(worldRoot);
+        store.bindOwner("https://old.example|@bot:old.example");
+        store.saveSince("s_old");
+
+        assertFalse(store.bindOwner("https://new.example|@bot:new.example"));
+        assertEquals("", store.loadSince());
+        assertTrue(store.bindOwner("https://new.example|@bot:new.example"));
+    }
+
+    @Test
+    void bindOwnerKeepsSinceForTheSameOwner() {
+        SinceStore store = new SinceStore(worldRoot);
+        store.bindOwner("https://hs.example|@bot:hs.example");
+        store.saveSince("s1");
+
+        assertTrue(store.bindOwner("https://hs.example|@bot:hs.example"));
+        assertEquals("s1", store.loadSince());
+    }
+
+    @Test
+    void bindOwnerAdoptsLegacyStateWithoutAnOwner() {
+        // State written by earlier versions has a since token but no owner.
+        SinceStore store = new SinceStore(worldRoot);
+        store.saveSince("s_legacy");
+
+        assertTrue(store.bindOwner("https://hs.example|@bot:hs.example"));
+        assertEquals("s_legacy", store.loadSince());
+    }
+
+    @Test
     void loadSinceReturnsEmptyWhenNoFile() {
         SinceStore store = new SinceStore(worldRoot);
 

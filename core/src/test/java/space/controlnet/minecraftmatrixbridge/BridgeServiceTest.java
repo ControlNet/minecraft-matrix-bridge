@@ -85,6 +85,37 @@ public class BridgeServiceTest {
     }
 
     @Test
+    void workerThreadsAreDaemonSoACrashedServerCanExit() throws Exception {
+        // Forge/NeoForge skip ServerStoppingEvent when the tick loop crashes; bridge
+        // threads must not keep the JVM alive in that case.
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            server.enqueueSyncResponse(roomId, "s0", new JsonArray());
+            BridgeSettings settings = new BridgeSettings(
+                    server.homeserverUrl(), roomId, "token", true, true, false,
+                    "[MC] ", "[Matrix] ", "!mc", 1000, 20, 10, 64
+            );
+            BridgeService service = new BridgeService();
+            service.start(settings, worldRoot, text -> { });
+            try {
+                waitUntil(service::isReady, Duration.ofSeconds(2));
+                List<String> names = new ArrayList<>();
+                for (Thread thread : Thread.getAllStackTraces().keySet()) {
+                    if (thread.getName().startsWith("MatrixBridge-") && thread.isAlive()) {
+                        names.add(thread.getName());
+                        assertTrue(thread.isDaemon(), thread.getName() + " must be a daemon thread");
+                    }
+                }
+                assertTrue(names.contains("MatrixBridge-Sender"), names.toString());
+                assertTrue(names.contains("MatrixBridge-Sync"), names.toString());
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
     void forwardsMatrixMessagesAndPersistsSince() throws Exception {
         String roomId = "!room:example.com";
         String selfUserId = "@bot:example.com";
@@ -531,6 +562,196 @@ public class BridgeServiceTest {
                 assertTrue(successCount >= maxQueueSize, "expected at least maxQueueSize successful enqueues");
                 assertTrue(failCount > 0, "expected some messages to be dropped after queue is full");
                 assertEquals(maxQueueSize, service.getQueueSize());
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    private BridgeSettings syncOnlySettings(MockMatrixServer server, String roomId) {
+        return new BridgeSettings(server.homeserverUrl(), roomId, "token", false, true, false,
+                "[MC] ", "[Matrix] ", "!mc", 0, 20, 100, 64);
+    }
+
+    private void writeState(JsonObject state) throws Exception {
+        Path statePath = worldRoot.resolve("data").resolve("minecraftmatrixbridge").resolve("state.json");
+        Files.createDirectories(statePath.getParent());
+        Files.writeString(statePath, state.toString(), StandardCharsets.UTF_8);
+    }
+
+    private static String queryParam(String rawQuery, String name) {
+        for (String part : rawQuery.split("&")) {
+            int eq = part.indexOf('=');
+            if (eq > 0 && part.substring(0, eq).equals(name)) {
+                return java.net.URLDecoder.decode(part.substring(eq + 1), StandardCharsets.UTF_8);
+            }
+        }
+        return null;
+    }
+
+    @Test
+    void rejectedSinceTokenFallsBackToAFreshSync() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            JsonObject state = new JsonObject();
+            state.addProperty("since", "s_stale");
+            writeState(state);
+            // The homeserver no longer accepts the stored token (e.g. after a database reset).
+            server.setSyncError(1, 400, "M_INVALID_PARAM");
+            server.enqueueSyncResponse(roomId, "s0", new JsonArray());
+            JsonArray events = new JsonArray();
+            events.add(matrixTextEvent("$fresh", "@alice:example.com", "after reset"));
+            server.enqueueSyncResponse(roomId, "s1", events);
+
+            CountDownLatch latch = new CountDownLatch(1);
+            BridgeService service = new BridgeService();
+            try {
+                service.start(syncOnlySettings(server, roomId), worldRoot, text -> {
+                    if (text.endsWith("after reset")) {
+                        latch.countDown();
+                    }
+                });
+                assertTrue(latch.await(5, TimeUnit.SECONDS), "sync must recover from a rejected since token");
+                List<MockMatrixServer.RecordedRequest> syncs = server.getSyncRequests();
+                assertEquals("s_stale", queryParam(syncs.get(0).query(), "since"));
+                assertEquals(null, queryParam(syncs.get(1).query(), "since"), "the retry must be a fresh initial sync");
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void storedSinceFromAnotherAccountIsNotReused() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            JsonObject state = new JsonObject();
+            state.addProperty("since", "s_other");
+            state.addProperty("owner", "https://other.example|@bot:other.example");
+            writeState(state);
+            server.enqueueSyncResponse(roomId, "s0", new JsonArray());
+
+            BridgeService service = new BridgeService();
+            try {
+                service.start(syncOnlySettings(server, roomId), worldRoot, text -> { });
+                waitUntil(() -> !server.getSyncRequests().isEmpty(), Duration.ofSeconds(2));
+                assertEquals(null, queryParam(server.getSyncRequests().get(0).query(), "since"));
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void syncFilterOnlyRequestsTheRoomTimeline() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            server.enqueueSyncResponse(roomId, "s0", new JsonArray());
+            BridgeService service = new BridgeService();
+            try {
+                service.start(syncOnlySettings(server, roomId), worldRoot, text -> { });
+                waitUntil(() -> !server.getSyncRequests().isEmpty(), Duration.ofSeconds(2));
+                JsonObject filter = JsonParser.parseString(
+                        queryParam(server.getSyncRequests().get(0).query(), "filter")).getAsJsonObject();
+                JsonObject room = filter.getAsJsonObject("room");
+                for (JsonObject section : List.of(filter.getAsJsonObject("presence"), filter.getAsJsonObject("account_data"),
+                        room.getAsJsonObject("ephemeral"), room.getAsJsonObject("account_data"), room.getAsJsonObject("state"))) {
+                    assertEquals("[\"*\"]", section.getAsJsonArray("not_types").toString());
+                }
+                assertEquals("[\"" + roomId + "\"]", room.getAsJsonArray("rooms").toString());
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void minecraftFormattingCodesAreStrippedFromMatrixMessages() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            server.setRoomMemberDisplayName(roomId, "@alice:example.com", "§kAl§cice");
+            server.enqueueSyncResponse(roomId, "s0", new JsonArray());
+            JsonArray events = new JsonArray();
+            events.add(matrixTextEvent("$fmt", "@alice:example.com", "hi §lbold\u0007 §"));
+            server.enqueueSyncResponse(roomId, "s1", events);
+
+            List<String> received = Collections.synchronizedList(new ArrayList<>());
+            BridgeService service = new BridgeService();
+            try {
+                service.start(syncOnlySettings(server, roomId), worldRoot, received::add);
+                waitUntil(() -> !received.isEmpty(), Duration.ofSeconds(2));
+                assertEquals("[Matrix] <Alice> hi bold", received.get(0));
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void eventCommandArgumentsHonourQuotes() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            server.setStateContent(roomId, "m.room.power_levels", "",
+                    JsonParser.parseString("{\"users\":{\"@admin:example.com\":100}}").getAsJsonObject());
+            server.enqueueSyncResponse(roomId, "s0", new JsonArray());
+            JsonArray events = new JsonArray();
+            events.add(matrixTextEvent("$c1", "@admin:example.com", "!mc event on PlayerLoggedInEvent \"\" 10m"));
+            events.add(matrixTextEvent("$c2", "@admin:example.com", "!mc event on ServerChatEvent \"two words\" 10m"));
+            server.enqueueSyncResponse(roomId, "s1", events);
+
+            List<List<String>> commands = Collections.synchronizedList(new ArrayList<>());
+            McCallbacks callbacks = new McCallbacks() {
+                @Override
+                public void broadcast(String text) {
+                }
+
+                @Override
+                public CompletableFuture<String> handleEventTapCommand(String senderMxid, String[] args) {
+                    commands.add(List.of(args));
+                    return CompletableFuture.completedFuture("ok");
+                }
+            };
+            BridgeService service = new BridgeService();
+            try {
+                service.start(syncOnlySettings(server, roomId), worldRoot, callbacks);
+                waitUntil(() -> commands.size() >= 2, Duration.ofSeconds(2));
+                assertEquals(List.of("on", "PlayerLoggedInEvent", "", "10m"), commands.get(0));
+                assertEquals(List.of("on", "ServerChatEvent", "two words", "10m"), commands.get(1));
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void commandTokenizerHandlesQuotesAndWhitespace() {
+        assertEquals(List.of(), BridgeService.tokenizeCommand("   "));
+        assertEquals(List.of("a", "b c", "", "d"), BridgeService.tokenizeCommand(" a  \"b c\" \"\"\td "));
+        // An unterminated quote keeps the rest of the line as one argument.
+        assertEquals(List.of("on", "x y"), BridgeService.tokenizeCommand("on \"x y"));
+        // Mobile keyboards often turn straight quotes into curly ones.
+        assertEquals(List.of("on", "two words"), BridgeService.tokenizeCommand("on \u201ctwo words\u201d"));
+    }
+
+    @Test
+    void mcMessagesAreRejectedWhenMcToMatrixIsDisabled() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            server.enqueueSyncResponse(roomId, "s0", new JsonArray());
+            BridgeService service = new BridgeService();
+            try {
+                service.start(syncOnlySettings(server, roomId), worldRoot, text -> { });
+                waitUntil(service::isReady, Duration.ofSeconds(2));
+                assertTrue(service.isMcToMatrixDisabledByConfig());
+                assertTrue(!service.enqueueMcMessage("[MC] would never be sent"),
+                        "no sender thread runs, so queued messages would pile up silently");
+                assertEquals(0, service.getQueueSize());
             } finally {
                 service.stop();
             }

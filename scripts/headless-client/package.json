@@ -1,0 +1,12 @@
+{
+  "name": "minecraftmatrixbridge-headless-client",
+  "private": true,
+  "description": "Test-only offline-mode Minecraft client for scripts/system_test_all.py",
+  "license": "AGPL-3.0",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "minecraft-protocol": "1.68.0"
+  }
+}

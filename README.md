@@ -25,7 +25,7 @@ Bridges chat between a Minecraft server and **one Matrix room** (unencrypted onl
 - **Event Taps**: dynamically subscribe to Forge/NeoForge events and forward them to Matrix for debugging/monitoring.
 
 ## Requirements
-- Java 17 (Forge 1.18–1.20), Java 21 (Forge/NeoForge 1.21.x), or Java 25 (Forge/NeoForge 26.1 and 26.2)
+- Java 17 (Forge 1.18–1.20.4), Java 21 (Forge 1.20.5–1.20.6, Forge/NeoForge 1.21.x), or Java 25 (Forge/NeoForge 26.1 and 26.2)
 - Minecraft Forge/NeoForge server matching the versions. I only manually test it in popular minor versions, and hopefully it works in other minor versions.
     - 1.18.2
     - 1.19.2
@@ -129,7 +129,9 @@ Same commands available via Matrix (requires `bridge.enableMatrixToMc=true` and 
 - `!mc event search <query>`
 - `!mc event help`
 
-Matrix event commands require the sender to have a power level >= `bridge.eventCommandMinPowerLevel` (default 50).
+Matrix event commands require the sender to have a power level >= `bridge.eventCommandMinPowerLevel` (default 50). In room version 12 and later, room creators always qualify.
+
+Arguments may be quoted in both places: `"two words"` is one filter and `""` means no filter. Event taps also need `bridge.enableMcToMatrix=true`, because their output is sent to the Matrix room.
 
 ### Safety Features
 - Master switch (`enableEventTaps`) - Disable entirely to skip event indexing at startup
@@ -153,6 +155,7 @@ Matrix event commands require the sender to have a power level >= `bridge.eventC
 
 # From Matrix
 !mc event on ServerChatEvent
+!mc event on PlayerLoggedInEvent "" 10m
 !mc event list
 !mc event off ServerChatEvent
 ```
