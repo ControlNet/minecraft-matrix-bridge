@@ -3,6 +3,9 @@
 # one log per module. Delegates to scripts/system_test_all.py, which owns the server
 # process (no pattern-based pkill), uses each module's real run directory, and fails
 # when the bridge, event taps, or Matrix -> Minecraft broadcast do not work.
+# A headless player (scripts/headless-client) then checks join/leave, the localized
+# connected notice and in-game chat; install it once with:
+#   npm ci --prefix scripts/headless-client
 #
 # Usage: ./test-runs/test_all_versions.sh [module ...]
 # Exit status is non-zero if any module failed; all modules are still attempted.
@@ -34,7 +37,7 @@ for VERSION in "${VERSIONS[@]}"; do
         echo "FAIL $VERSION (see $LOG_FILE)"
         failed+=("$VERSION")
     fi
-    grep -E "Event index built in|MatrixBridge started|\[Matrix\] <|OK: " "$LOG_FILE" | head -5 || true
+    grep -E "Event index built in|MatrixBridge started|\[Matrix\] <|player checks|SKIP player|OK: " "$LOG_FILE" | head -6 || true
 done
 
 echo ""

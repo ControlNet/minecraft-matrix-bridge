@@ -258,5 +258,59 @@ class ServerEnvironmentTests(unittest.TestCase):
         system_test_all.server_environment(original, "token")
         self.assertEqual({"PATH": "/usr/bin"}, original)
 
+
+class HeadlessClientTests(unittest.TestCase):
+    """Synthetic mock-Matrix bodies and client results; no Minecraft server is started."""
+
+    def body(self, text):
+        return json.dumps({"msgtype": "m.text", "body": text, "m.mentions": {}})
+
+    def test_player_messages_are_all_required(self):
+        bodies = [self.body(text) for text in system_test_all.EXPECTED_PLAYER_BODIES]
+        self.assertEqual([], system_test_all.missing_player_messages(bodies))
+        self.assertEqual([system_test_all.EXPECTED_PLAYER_BODIES[2]],
+                         system_test_all.missing_player_messages(bodies[:2]))
+
+    def test_expected_messages_cover_join_chat_and_leave(self):
+        joined, chat, left = system_test_all.EXPECTED_PLAYER_BODIES
+        self.assertIn("joined the game", joined)
+        self.assertIn(system_test_all.CLIENT_CHAT, chat)
+        self.assertIn("left the game", left)
+
+    def test_client_expects_the_localized_connected_notice(self):
+        lang = json.loads((system_test_all.ROOT / "core/src/main/resources/assets/minecraftmatrixbridge/lang"
+                           / f"{system_test_all.CLIENT_LOCALE}.json").read_text(encoding="utf-8"))
+        template = lang["minecraftmatrixbridge.connected"]
+        self.assertTrue(template.startswith(system_test_all.CLIENT_EXPECT))
+        self.assertNotIn("Matrix room connected", system_test_all.CLIENT_EXPECT, "must not match the English text")
+
+    def test_systemtest_config_enables_join_and_leave_notices(self):
+        with tempfile.TemporaryDirectory() as run_dir:
+            system_test_all.write_systemtest_config(Path(run_dir), "http://127.0.0.1:1", "#room:example.com")
+            config = (Path(run_dir) / "config/minecraftmatrixbridge.toml").read_text(encoding="utf-8")
+        self.assertIn("enableJoinLeaveToMatrix=true", config.splitlines())
+
+    def test_server_test_workflow_installs_the_locked_client(self):
+        workflow = (system_test_all.ROOT / ".github/workflows/server-tests.yml").read_text(encoding="utf-8")
+        self.assertIn("uses: actions/setup-node@", workflow)
+        self.assertIn("cache-dependency-path: scripts/headless-client/package-lock.json", workflow)
+        # `npm ci` installs exactly the lockfile (with integrity hashes), never newer versions.
+        self.assertIn("npm ci --prefix scripts/headless-client", workflow)
+        self.assertLess(workflow.index("npm ci --prefix scripts/headless-client"),
+                        workflow.index("python3 scripts/system_test_all.py --packaged"))
+
+    def test_missing_client_dependencies_fail_loudly(self):
+        with tempfile.TemporaryDirectory() as empty:
+            with patch.object(system_test_all, "HEADLESS_CLIENT_DIR", Path(empty)):
+                with self.assertRaisesRegex(RuntimeError, "npm ci"):
+                    system_test_all.headless_client_command(25565)
+
+    def test_unsupported_protocol_is_reported_not_hidden(self):
+        result = system_test_all.interpret_client_exit("forge-26.2", 3, ['{"event":"unsupported","protocol":999}'])
+        self.assertFalse(result)
+        with self.assertRaisesRegex(RuntimeError, "timeout"):
+            system_test_all.interpret_client_exit("forge-1.20", 1, ['{"event":"timeout"}'])
+        self.assertTrue(system_test_all.interpret_client_exit("forge-1.20", 0, ['{"event":"done"}']))
+
 if __name__ == "__main__":
     unittest.main()

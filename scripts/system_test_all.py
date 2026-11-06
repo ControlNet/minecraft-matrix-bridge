@@ -37,6 +37,20 @@ MODULE_EVENT_ALIASES = {
     "neoforge-1.21": "net.neoforged.neoforge.event.tick.ServerTickEvent$Post",
 }
 
+ROOT = Path(__file__).resolve().parents[1]
+HEADLESS_CLIENT_DIR = ROOT / "scripts" / "headless-client"
+CLIENT_USERNAME = "Probe"
+# A non-English locale also checks that the connected notice is localized per player.
+CLIENT_LOCALE = "zh_cn"
+CLIENT_EXPECT = "Matrix 房间已连接"
+CLIENT_CHAT = "hello from the headless client"
+EXPECTED_PLAYER_BODIES = (
+    f"[MC] * {CLIENT_USERNAME} joined the game",
+    f"[MC] <{CLIENT_USERNAME}> {CLIENT_CHAT}",
+    f"[MC] * {CLIENT_USERNAME} left the game",
+)
+CLIENT_UNSUPPORTED_EXIT = 3
+
 MATRIX_PROBE_SYNC = 2
 MATRIX_PROBE_SENDER = "@alice:example.com"
 # Include a formatting code so the sanitizing path runs. Minecraft strips
@@ -259,7 +273,8 @@ def write_systemtest_config(
                 "enableMcToMatrix=true",
                 "enableMatrixToMc=true",
                 "announceConnected=true",
-                "enableJoinLeaveToMatrix=false",
+                # The headless client checks join/leave notices.
+                "enableJoinLeaveToMatrix=true",
                 "enableServerLifecycleToMatrix=false",
                 'mcToMatrixPrefix="[MC] "',
                 'matrixToMcPrefix="[Matrix] "',
@@ -404,6 +419,65 @@ def server_environment(environ, token: str) -> dict:
     env = dict(environ)
     env["MATRIX_ACCESS_TOKEN"] = token
     return env
+
+
+def headless_client_command(server_port: int) -> list[str]:
+    script = HEADLESS_CLIENT_DIR / "client.js"
+    if not (HEADLESS_CLIENT_DIR / "node_modules" / "minecraft-protocol").is_dir():
+        raise RuntimeError(
+            f"headless client dependencies are missing; run: npm ci --prefix {HEADLESS_CLIENT_DIR}")
+    node = shutil.which("node")
+    if node is None:
+        raise RuntimeError("node is required for the headless client player checks")
+    return [node, str(script), "--port", str(server_port), "--username", CLIENT_USERNAME,
+            "--locale", CLIENT_LOCALE, "--expect", CLIENT_EXPECT, "--chat", CLIENT_CHAT,
+            "--timeout-ms", "90000"]
+
+
+def interpret_client_exit(module: str, returncode: int, lines: list[str]) -> bool:
+    """True when the player checks ran; False only for a protocol the client cannot speak."""
+    if returncode == 0:
+        return True
+    if returncode == CLIENT_UNSUPPORTED_EXIT:
+        # Visible in the log and summary; not a pass for the player checks.
+        print(f"[{module}] SKIP player checks: minecraft-protocol cannot speak this server's protocol "
+              f"({lines[-1] if lines else 'no output'})", flush=True)
+        return False
+    raise RuntimeError(f"{module}: headless client failed (exit {returncode}): {lines[-1] if lines else 'no output'}")
+
+
+def run_headless_client(module: str, server_port: int) -> bool:
+    result = subprocess.run(headless_client_command(server_port), capture_output=True, text=True, timeout=150)
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    for line in lines:
+        print(f"[{module}] client: {line}", flush=True)
+    for line in result.stderr.splitlines()[-20:]:
+        print(f"[{module}] client stderr: {line}", flush=True)
+    return interpret_client_exit(module, result.returncode, lines)
+
+
+def missing_player_messages(bodies: list[str]) -> list[str]:
+    texts = [tap_message_body(body) for body in bodies]
+    return [expected for expected in EXPECTED_PLAYER_BODIES if expected not in texts]
+
+
+def wait_for_player_messages(module: str, mock: "MockMatrix", proc: subprocess.Popen[str],
+                             out_queue: "queue.Queue[str]", timeout_s: int) -> None:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            while True:
+                line = out_queue.get_nowait()
+                if not line.startswith("Downloading: "):
+                    sys.stdout.write(f"[{module}] {line}")
+        except queue.Empty:
+            pass
+        if not missing_player_messages(mock.counters.send_bodies):
+            return
+        if proc.poll() is not None:
+            break
+        time.sleep(0.2)
+    raise RuntimeError(f"{module}: Matrix never received {missing_player_messages(mock.counters.send_bodies)}")
 
 
 def tap_message_body(raw: str) -> str:
@@ -623,7 +697,8 @@ def run_one(module: str, timeout_s: int, packaged: bool = False,
     if run_dir.exists():
         shutil.rmtree(run_dir)
     ensure_eula(run_dir)
-    write_server_properties(run_dir, pick_free_port())
+    server_port = pick_free_port()
+    write_server_properties(run_dir, server_port)
     (run_dir / "jna").mkdir(parents=True, exist_ok=True)
     packaged_cmd = packaged_server_command(root, module, run_dir, loader_coordinate, artifact_dir) if packaged else None
 
@@ -716,6 +791,13 @@ def run_one(module: str, timeout_s: int, packaged: bool = False,
             expected_count=2,
             timeout_s=15,
         )
+
+        # A real (headless) player: login/logout events, the localized connected
+        # notice, and in-game chat through ServerChatEvent to Matrix.
+        if run_headless_client(module, server_port):
+            wait_for_player_messages(module, mock, proc, q, timeout_s=15)
+            print(f"[{module}] player checks OK: join, localized notice, chat, leave", flush=True)
+
         proc.stdin.write("stop\n")
         proc.stdin.flush()
 
