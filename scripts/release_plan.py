@@ -66,6 +66,18 @@ def latest_version(tags):
     return max(versions)[1] if versions else None
 
 
+def latest_final_version(tags):
+    """Newest non-prerelease version; prereleases never become GitHub's Latest."""
+    return latest_version([tag for tag in tags if tag.startswith("v") and _is_final(tag[1:])])
+
+
+def _is_final(version):
+    try:
+        return not parse_semver(version)[3]
+    except ValueError:
+        return False
+
+
 def plan(version, tags, head, tag_commit, ref, dry_run=False):
     """Return the release decision for ``version`` at commit ``head``."""
     channel = channel_for(version)
@@ -80,6 +92,10 @@ def plan(version, tags, head, tag_commit, ref, dry_run=False):
         "should_release": "false",
     }
     latest = latest_version(tags)
+    latest_final = latest_final_version(tags)
+    if channel == "release" and latest_final is not None and precedence(version) < precedence(latest_final):
+        # Resuming an older release may finish its uploads but must not take Latest back.
+        result["make_latest"] = "false"
 
     if tag_commit:
         if tag_commit == head:

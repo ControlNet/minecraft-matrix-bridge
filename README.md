@@ -17,9 +17,10 @@ Bridges chat between a Minecraft server and **one Matrix room** (unencrypted onl
 
 ## Features
 - **MC → Matrix**: forwards player chat into a Matrix room.
-- **Matrix → MC**: forwards Matrix `m.text` room messages into Minecraft server chat. Edits are shown as the new text with ` (edited)`, replies without the quoted original, and messages longer than 512 characters are cut off.
+- **Matrix → MC**: forwards Matrix `m.text` room messages into Minecraft server chat. Edits are shown as the new text with ` (edited)`, replies without the quoted original, and messages longer than 512 characters are cut off. After a disconnect, messages the homeserver left out of a sync are fetched and shown in order (up to 1000).
+- Sync state stored in the **world save** (prevents replay spam on restart). The position is saved only after its messages were shown, so a restart never skips messages; old history is skipped only on the very first start.
+- The "Matrix room connected: …" notice is sent once the initial sync is done, so messages sent after it are not lost.
 - **Server-only**: vanilla clients can join without installing anything (no client mod).
-- Sync state stored in the **world save** (prevents replay spam on restart).
 - The "Matrix room connected: …" notice is localized server-side based on each player's reported client language (currently includes `en_us` and `zh_cn`).
 - If the bot is **invited** to the configured room but not joined yet, it will **auto-accept the invite** and join on startup.
 - **Event Taps**: dynamically subscribe to Forge/NeoForge events and forward them to Matrix for debugging/monitoring.

@@ -36,6 +36,9 @@ public final class MockMatrixServer implements AutoCloseable {
     private final List<RecordedRequest> joinedRoomsRequests = Collections.synchronizedList(new ArrayList<>());
     private final List<RecordedRequest> joinRequests = Collections.synchronizedList(new ArrayList<>());
     private final List<RecordedRequest> syncRequests = Collections.synchronizedList(new ArrayList<>());
+    private final List<RecordedRequest> messagesRequests = Collections.synchronizedList(new ArrayList<>());
+    /** /rooms/{id}/messages pages keyed by their {@code from} token. */
+    private final Map<String, JsonObject> messagesPages = new ConcurrentHashMap<>();
     private final Map<String, JsonObject> stateContents = new ConcurrentHashMap<>();
     private final Map<String, Integer> stateErrors = new ConcurrentHashMap<>();
     private final Map<String, JsonObject> roomEvents = new ConcurrentHashMap<>();
@@ -94,8 +97,17 @@ public final class MockMatrixServer implements AutoCloseable {
     }
 
     public void enqueueSyncResponse(String roomId, String nextBatch, JsonArray events) {
+        enqueueSyncResponse(roomId, nextBatch, events, false, "");
+    }
+
+    /** A sync whose timeline was cut to the newest events ({@code limited}), with its gap token. */
+    public void enqueueSyncResponse(String roomId, String nextBatch, JsonArray events, boolean limited, String prevBatch) {
         JsonObject timeline = new JsonObject();
         timeline.add("events", events == null ? new JsonArray() : events);
+        if (limited) {
+            timeline.addProperty("limited", true);
+            timeline.addProperty("prev_batch", prevBatch);
+        }
 
         JsonObject roomObj = new JsonObject();
         roomObj.add("timeline", timeline);
@@ -162,6 +174,23 @@ public final class MockMatrixServer implements AutoCloseable {
         syncErrorStatus = status;
         syncErrorCode = errcode == null ? "" : errcode;
         syncErrorRemaining = Math.max(0, times);
+    }
+
+    /** Serves one backwards page of {@code /messages} for {@code from}: newest first, {@code end} blank for the last page. */
+    public void setMessagesPage(String from, JsonArray newestFirst, String end) {
+        JsonObject page = new JsonObject();
+        page.add("chunk", newestFirst);
+        page.addProperty("start", from);
+        if (end != null && !end.isBlank()) {
+            page.addProperty("end", end);
+        }
+        messagesPages.put(from, page);
+    }
+
+    public List<RecordedRequest> getMessagesRequests() {
+        synchronized (messagesRequests) {
+            return List.copyOf(messagesRequests);
+        }
     }
 
     public List<RecordedRequest> getSyncRequests() {
@@ -520,6 +549,10 @@ public final class MockMatrixServer implements AutoCloseable {
         }
 
         String path = exchange.getRequestURI().getRawPath();
+        if ("GET".equalsIgnoreCase(exchange.getRequestMethod()) && path != null && path.endsWith("/messages")) {
+            handleMessages(exchange);
+            return;
+        }
         if ("GET".equalsIgnoreCase(exchange.getRequestMethod())) {
             handleRoomMemberState(exchange, path);
             return;
@@ -561,6 +594,24 @@ public final class MockMatrixServer implements AutoCloseable {
         JsonObject ok = new JsonObject();
         ok.addProperty("event_id", "$mock");
         respondJson(exchange, 200, ok);
+    }
+
+    private void handleMessages(HttpExchange exchange) throws IOException {
+        String query = exchange.getRequestURI().getRawQuery();
+        messagesRequests.add(new RecordedRequest("GET", exchange.getRequestURI().getRawPath(), query, null, ""));
+        String from = "";
+        for (String part : (query == null ? "" : query).split("&")) {
+            if (part.startsWith("from=")) {
+                from = java.net.URLDecoder.decode(part.substring(5), StandardCharsets.UTF_8);
+            }
+        }
+        JsonObject page = messagesPages.get(from);
+        if (page == null) {
+            page = new JsonObject();
+            page.add("chunk", new JsonArray());
+            page.addProperty("start", from);
+        }
+        respondJson(exchange, 200, page);
     }
 
     private void handleRoomMemberState(HttpExchange exchange, String path) throws IOException {

@@ -43,6 +43,8 @@ class AbstractEventTapManagerTest {
         final TestBus bus;
         final Map<Class<?>, Consumer<Object>> listeners;
         final java.util.List<String> forwarded = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+        /** False models a full outgoing queue: the tap output is rejected. */
+        volatile boolean queueAccepts = true;
 
         TestManager() {
             this(new TestBus(), CompletableFuture.completedFuture(EventIndex.empty()));
@@ -61,7 +63,11 @@ class AbstractEventTapManagerTest {
             bus.registrations++;
             bus.listeners.put(type, listener);
         }
-        @Override void forward(String message) { forwarded.add(message); }
+        @Override boolean forward(String message) {
+            if (!queueAccepts) return false;
+            forwarded.add(message);
+            return true;
+        }
 
         void subscribe(Class<?> type) {
             assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
@@ -255,6 +261,21 @@ class AbstractEventTapManagerTest {
             assertEquals(1, manager.forwarded.size(), "trial " + trial);
             manager.close();
         }
+    }
+
+    @Test
+    void onceTapSurvivesARejectedForward() {
+        var manager = new TestManager();
+        manager.subscribe(ParentEvent.class);
+        Consumer<Object> listener = manager.listeners.get(ParentEvent.class);
+        manager.queueAccepts = false;
+        listener.accept(new ParentEvent());
+        assertTrue(manager.handleCommand(new String[]{"list"}).contains("ParentEvent"),
+                "a one-shot tap whose output was dropped must stay active");
+        manager.queueAccepts = true;
+        listener.accept(new ParentEvent());
+        assertEquals(1, manager.forwarded.size());
+        assertFalse(manager.handleCommand(new String[]{"list"}).contains("ParentEvent"));
     }
 
     @Test

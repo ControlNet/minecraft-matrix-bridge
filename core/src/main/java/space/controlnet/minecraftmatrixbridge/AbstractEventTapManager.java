@@ -510,7 +510,8 @@ public abstract class AbstractEventTapManager<E> {
             if (!sub.tryClaimForward(nowMs)) {
                 continue;
             }
-            forward(EventSerializationUtil.formatForMatrix(event, serialized, MAX_MESSAGE_LEN));
+            boolean queued = forward(EventSerializationUtil.formatForMatrix(event, serialized, MAX_MESSAGE_LEN));
+            sub.completeForward(queued, nowMs);
         }
 
         bucket.cleanupExpired(nowMs);
@@ -521,9 +522,9 @@ public abstract class AbstractEventTapManager<E> {
         return fqcn.contains("Tick");
     }
 
-    /** Sends one tap message; overridden in tests. */
-    void forward(String message) {
-        bridgeService.enqueueTapMessage(message);
+    /** Queues one tap message; false when the queue refused it. Overridden in tests. */
+    boolean forward(String message) {
+        return bridgeService.enqueueTapMessage(message);
     }
 
     private Class<?> tryLoadClass(String fqcn) {
@@ -647,6 +648,8 @@ public abstract class AbstractEventTapManager<E> {
         final AtomicLong evaluationWindowStartMs = new AtomicLong(Long.MIN_VALUE);
         final AtomicInteger evaluationsInWindow = new AtomicInteger();
         final AtomicBoolean enabled = new AtomicBoolean(true);
+        /** A one-shot tap's single forward is in flight or done; it is disabled once queued. */
+        final AtomicBoolean onceClaimed = new AtomicBoolean(false);
 
         Subscription(UUID id, String fqcn, String filterLower, DurationSpec.Mode mode, long expiresAtMs, long minIntervalMs) {
             this.id = id;
@@ -700,11 +703,28 @@ public abstract class AbstractEventTapManager<E> {
                     break;
                 }
             }
-            if (mode == DurationSpec.Mode.ONCE && !enabled.compareAndSet(true, false)) {
+            if (mode == DurationSpec.Mode.ONCE && !onceClaimed.compareAndSet(false, true)) {
                 return false;
             }
             matchCount.incrementAndGet();
             return true;
+        }
+
+        /**
+         * Settles a claim from {@link #tryClaimForward}. A one-shot tap is used up only when its
+         * output was queued; when the queue refused it, the claim is undone so a later event can
+         * still be captured.
+         */
+        void completeForward(boolean queued, long claimedAtMs) {
+            if (queued) {
+                if (mode == DurationSpec.Mode.ONCE) {
+                    enabled.set(false);
+                }
+                return;
+            }
+            matchCount.decrementAndGet();
+            lastForwardedAtMs.compareAndSet(claimedAtMs, 0);
+            onceClaimed.set(false);
         }
     }
 }

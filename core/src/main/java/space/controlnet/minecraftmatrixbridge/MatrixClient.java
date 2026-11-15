@@ -589,6 +589,34 @@ public final class MatrixClient {
         return 0;
     }
 
+    /**
+     * One page of {@code GET /rooms/{roomId}/messages} walking backwards from {@code from}
+     * and stopping at {@code to} (a sync token, as the spec allows). Events are newest first.
+     */
+    public MessagesPage roomMessagesBackwards(String roomId, String from, String to, int limit, String filterJson)
+            throws IOException, InterruptedException, MatrixException {
+        String uri = roomPath(roomId) + "/messages?dir=b"
+                + "&from=" + urlEncodeQuery(from)
+                + "&to=" + urlEncodeQuery(to)
+                + "&limit=" + limit
+                + "&filter=" + urlEncodeQuery(filterJson);
+        JsonObject response = getJson(uri, "messages");
+        JsonElement chunk = response.get("chunk");
+        return new MessagesPage(chunk != null && chunk.isJsonArray() ? chunk.getAsJsonArray() : new JsonArray(),
+                getString(response, "end"));
+    }
+
+    public static final class MessagesPage {
+        public final JsonArray chunk;
+        /** Token for the next (older) page; empty when there is none. */
+        public final String end;
+
+        MessagesPage(JsonArray chunk, String end) {
+            this.chunk = chunk;
+            this.end = end == null ? "" : end;
+        }
+    }
+
     public static final class SyncResult {
         public final String nextBatch;
         public final JsonObject joinedRooms;

@@ -7,6 +7,8 @@ import com.google.gson.JsonObject;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
@@ -31,6 +33,10 @@ public final class BridgeService {
     private static final int MAX_BATCH_CHARS = 16_000;
     /** Longer Matrix messages are cut so one remote user cannot flood Minecraft chat. */
     static final int MAX_MATRIX_TO_MC_CHARS = 512;
+    /** A sync gap (limited timeline) is filled with at most this many pages of history. */
+    private static final int MAX_BACKFILL_PAGES = 10;
+    private static final int BACKFILL_PAGE_SIZE = 100;
+    private static final int REPLY_QUEUE_SIZE = 32;
 
     private final Object lifecycleLock = new Object();
     private final AtomicBoolean running = new AtomicBoolean(false);
@@ -43,10 +49,13 @@ public final class BridgeService {
     private McCallbacks callbacks;
 
     private BlockingQueue<String> outgoingQueue;
+    /** Bot replies; sent by their own thread so a rate-limited reply never blocks /sync. */
+    private volatile BlockingQueue<String> replyQueue;
 
     private Thread bootstrapThread;
     private Thread senderThread;
     private Thread syncThread;
+    private Thread replyThread;
 
     private volatile String selfUserId = "";
     private volatile String resolvedRoomId = "";
@@ -61,7 +70,7 @@ public final class BridgeService {
                 return;
             }
             reapTerminatedThreads();
-            if (bootstrapThread != null || senderThread != null || syncThread != null) {
+            if (bootstrapThread != null || senderThread != null || syncThread != null || replyThread != null) {
                 LOGGER.warning("MatrixBridge start ignored because the previous lifecycle is still stopping.");
                 return;
             }
@@ -90,6 +99,7 @@ public final class BridgeService {
             this.sinceStore = new SinceStore(worldRoot);
             this.dedup = new EventDeduplicator(settings.dedupSize);
             this.outgoingQueue = new ArrayBlockingQueue<>(settings.maxQueueSize);
+            this.replyQueue = new ArrayBlockingQueue<>(REPLY_QUEUE_SIZE);
 
             running.set(true);
 
@@ -102,8 +112,10 @@ public final class BridgeService {
         Thread bt;
         Thread st;
         Thread syt;
+        Thread rt;
         synchronized (lifecycleLock) {
-            if (!running.get() && bootstrapThread == null && senderThread == null && syncThread == null) {
+            if (!running.get() && bootstrapThread == null && senderThread == null && syncThread == null
+                    && replyThread == null) {
                 return;
             }
             running.set(false);
@@ -111,19 +123,22 @@ public final class BridgeService {
             bt = bootstrapThread;
             st = senderThread;
             syt = syncThread;
+            rt = replyThread;
         }
 
         interrupt(bt);
         interrupt(st);
         interrupt(syt);
+        interrupt(rt);
 
         join(bt);
         join(st);
         join(syt);
+        join(rt);
 
         synchronized (lifecycleLock) {
             reapTerminatedThreads();
-            if (bootstrapThread == null && senderThread == null && syncThread == null) {
+            if (bootstrapThread == null && senderThread == null && syncThread == null && replyThread == null) {
                 clearLifecycleState();
             } else {
                 LOGGER.warning("MatrixBridge worker threads did not stop within 2 seconds; retaining lifecycle state until they exit.");
@@ -141,10 +156,14 @@ public final class BridgeService {
         if (syncThread != null && !syncThread.isAlive()) {
             syncThread = null;
         }
+        if (replyThread != null && !replyThread.isAlive()) {
+            replyThread = null;
+        }
     }
 
     private void clearLifecycleState() {
         outgoingQueue = null;
+        replyQueue = null;
         matrixClient = null;
         sinceStore = null;
         dedup = null;
@@ -241,43 +260,58 @@ public final class BridgeService {
                 return;
             }
 
-            BridgeSettings activeSettings;
-            McCallbacks activeCallbacks;
+            boolean receiving;
             synchronized (lifecycleLock) {
                 if (!running.get() || settings == null) {
                     return;
                 }
-                activeSettings = settings;
-                activeCallbacks = callbacks;
-                if (activeSettings.enableMcToMatrix) {
+                if (settings.enableMcToMatrix) {
                     senderThread = workerThread(this::senderLoop, "MatrixBridge-Sender");
                     senderThread.start();
                 }
-                if (activeSettings.enableMatrixToMc) {
+                receiving = settings.enableMatrixToMc;
+                if (receiving) {
                     syncThread = workerThread(this::syncLoop, "MatrixBridge-Sync");
                     syncThread.start();
+                    replyThread = workerThread(this::replyLoop, "MatrixBridge-Reply");
+                    replyThread.start();
                 }
-                ready.set(true);
             }
-
-            if (!running.get()) {
-                return;
+            if (!receiving) {
+                markReady();
             }
-            if (activeSettings.roomId != null && activeSettings.roomId.startsWith("#") && !activeSettings.roomId.equals(roomId)) {
-                LOGGER.info("MatrixBridge started as " + userId + " (room alias " + activeSettings.roomId + " -> " + roomId + ").");
-            } else {
-                LOGGER.info("MatrixBridge started as " + userId + " (room " + roomId + ").");
-            }
-
-            if (activeCallbacks != null && activeSettings.announceConnected && !announcedConnected) {
-                announcedConnected = true;
-                String displayRoom = activeSettings.roomId != null && activeSettings.roomId.startsWith("#")
-                        ? activeSettings.roomId
-                        : roomId;
-                activeCallbacks.announceMatrixConnected(displayRoom);
-            }
+            // Otherwise the sync thread marks the bridge ready after its initial sync, which skips
+            // the room history: a message sent after the "connected" notice must not be skipped.
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "MatrixBridge bootstrap failed: " + e, e);
+        }
+    }
+
+    private void markReady() {
+        BridgeSettings activeSettings;
+        McCallbacks activeCallbacks;
+        synchronized (lifecycleLock) {
+            if (!running.get() || settings == null || ready.get()) {
+                return;
+            }
+            activeSettings = settings;
+            activeCallbacks = callbacks;
+            ready.set(true);
+        }
+        String userId = selfUserId;
+        String roomId = resolvedRoomId;
+        if (activeSettings.roomId != null && activeSettings.roomId.startsWith("#") && !activeSettings.roomId.equals(roomId)) {
+            LOGGER.info("MatrixBridge started as " + userId + " (room alias " + activeSettings.roomId + " -> " + roomId + ").");
+        } else {
+            LOGGER.info("MatrixBridge started as " + userId + " (room " + roomId + ").");
+        }
+
+        if (activeCallbacks != null && activeSettings.announceConnected && !announcedConnected) {
+            announcedConnected = true;
+            String displayRoom = activeSettings.roomId != null && activeSettings.roomId.startsWith("#")
+                    ? activeSettings.roomId
+                    : roomId;
+            activeCallbacks.announceMatrixConnected(displayRoom);
         }
     }
 
@@ -603,17 +637,24 @@ public final class BridgeService {
         if (since == null || since.isBlank()) {
             since = initialCatchup(filterJson);
         }
+        if (!running.get()) {
+            return;
+        }
+        markReady();
 
         long backoffMs = 1_000;
         while (running.get()) {
             try {
                 MatrixClient.SyncResult result = matrixClient.syncOnce(since, settings.syncTimeoutMs, filterJson);
+                // Save the token only after its messages went out, so a stop or a failed
+                // backfill replays this batch instead of skipping the rest of it.
+                if (!forwardMatrixMessages(result, since)) {
+                    continue;
+                }
                 if (result.nextBatch != null && !result.nextBatch.isBlank()) {
                     since = result.nextBatch;
                     sinceStore.saveSince(since);
                 }
-
-                forwardMatrixMessages(result);
                 backoffMs = 1_000;
             } catch (MatrixClient.MatrixException e) {
                 if (e.statusCode == 401 || e.statusCode == 403) {
@@ -700,113 +741,163 @@ public final class BridgeService {
         return "";
     }
 
-    private void forwardMatrixMessages(MatrixClient.SyncResult result) {
+    /**
+     * Forwards the room's timeline from one sync response, first filling a gap the homeserver
+     * left by cutting the timeline ({@code limited}). Returns false when stopped part-way.
+     */
+    private boolean forwardMatrixMessages(MatrixClient.SyncResult result, String previousSince)
+            throws IOException, InterruptedException, MatrixClient.MatrixException {
         if (!settings.enableMatrixToMc) {
-            return;
+            return true;
         }
         if (selfUserId == null || selfUserId.isBlank()) {
-            return;
+            return true;
         }
 
         String roomId = resolvedRoomId;
         if (roomId == null || roomId.isBlank()) {
-            return;
+            return true;
         }
 
         JsonElement roomEntry = result.joinedRooms.get(roomId);
         if (roomEntry == null || !roomEntry.isJsonObject()) {
             // Normal: /sync only includes rooms that have updates in that specific response.
-            return;
+            return true;
         }
         JsonObject roomObj = roomEntry.getAsJsonObject();
         JsonObject timeline = getObject(roomObj, "timeline");
         if (timeline == null) {
-            return;
+            return true;
         }
-        JsonArray events = getArray(timeline, "events");
-        if (events == null || events.isEmpty()) {
-            return;
+        List<JsonElement> events = new ArrayList<>();
+        JsonElement limited = timeline.get("limited");
+        String prevBatch = getString(timeline, "prev_batch");
+        if (limited != null && limited.isJsonPrimitive() && limited.getAsBoolean()
+                && !prevBatch.isBlank() && previousSince != null && !previousSince.isBlank()) {
+            events.addAll(backfill(roomId, prevBatch, previousSince));
+        }
+        JsonArray timelineEvents = getArray(timeline, "events");
+        if (timelineEvents != null) {
+            timelineEvents.forEach(events::add);
         }
 
         for (JsonElement el : events) {
             if (!running.get()) {
+                return false;
+            }
+            if (el != null && el.isJsonObject()) {
+                forwardMatrixEvent(roomId, el.getAsJsonObject());
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Fetches the messages between the previous sync token and the start of a cut timeline,
+     * oldest first. Duplicates of timeline events are dropped later by event ID.
+     */
+    private List<JsonElement> backfill(String roomId, String prevBatch, String previousSince)
+            throws IOException, InterruptedException, MatrixClient.MatrixException {
+        String filter = "{\"types\":[\"m.room.message\"]}";
+        List<JsonElement> newestFirst = new ArrayList<>();
+        String from = prevBatch;
+        for (int page = 0; page < MAX_BACKFILL_PAGES; page++) {
+            MatrixClient.MessagesPage result;
+            try {
+                result = matrixClient.roomMessagesBackwards(roomId, from, previousSince, BACKFILL_PAGE_SIZE, filter);
+            } catch (MatrixClient.MatrixException e) {
+                if (e.statusCode >= 400 && e.statusCode < 500 && e.statusCode != 429) {
+                    // Not retryable: forward what the sync returned rather than stall on the gap.
+                    LOGGER.warning("MatrixBridge could not fetch messages missed during a sync gap (" + e.getMessage() + ").");
+                    break;
+                }
+                throw e;
+            }
+            result.chunk.forEach(newestFirst::add);
+            if (result.chunk.isEmpty() || result.end.isBlank() || result.end.equals(from)) {
+                Collections.reverse(newestFirst);
+                return newestFirst;
+            }
+            from = result.end;
+        }
+        if (!newestFirst.isEmpty()) {
+            LOGGER.warning("MatrixBridge sync gap exceeded " + (MAX_BACKFILL_PAGES * BACKFILL_PAGE_SIZE)
+                    + " messages; older missed messages were not forwarded.");
+        }
+        Collections.reverse(newestFirst);
+        return newestFirst;
+    }
+
+    private void forwardMatrixEvent(String roomId, JsonObject evt) {
+        String type = getString(evt, "type");
+        if (!"m.room.message".equals(type)) {
+            return;
+        }
+        String eventId = getString(evt, "event_id");
+        if (dedup.seenOrAdd(eventId)) {
+            return;
+        }
+
+        String sender = getString(evt, "sender");
+        if (sender.isBlank() || sender.equals(selfUserId)) {
+            return;
+        }
+
+        JsonObject content = getObject(evt, "content");
+        if (content == null) {
+            return;
+        }
+        JsonObject relatesTo = getObject(content, "m.relates_to");
+        boolean edit = relatesTo != null && "m.replace".equals(getString(relatesTo, "rel_type"));
+        if (edit) {
+            // An edit's body is "* new text"; the replacement lives in m.new_content.
+            content = getObject(content, "m.new_content");
+            if (content == null) {
                 return;
             }
-            if (el == null || !el.isJsonObject()) {
-                continue;
-            }
-            JsonObject evt = el.getAsJsonObject();
+        }
+        String msgType = getString(content, "msgtype");
+        if (!"m.text".equals(msgType)) {
+            return;
+        }
+        String rawBody = getString(content, "body");
+        if (!edit && relatesTo != null && getObject(relatesTo, "m.in_reply_to") != null) {
+            rawBody = stripReplyFallback(rawBody);
+        }
+        String body = sanitizeForMinecraft(rawBody);
+        if (body.isBlank()) {
+            return;
+        }
 
-            String type = getString(evt, "type");
-            if (!"m.room.message".equals(type)) {
-                continue;
+        if (edit) {
+            // Editing a message into a command must not run it (again).
+            if (isBotCommand(body)) {
+                return;
             }
-            String eventId = getString(evt, "event_id");
-            if (dedup.seenOrAdd(eventId)) {
-                continue;
-            }
+        } else if (maybeHandleMatrixBotCommand(sender, body)) {
+            return;
+        }
+        body = EventSerializationUtil.truncate(body, MAX_MATRIX_TO_MC_CHARS);
+        if (edit) {
+            body = body + " (edited)";
+        }
 
-            String sender = getString(evt, "sender");
-            if (sender.isBlank() || sender.equals(selfUserId)) {
-                continue;
-            }
-
-            JsonObject content = getObject(evt, "content");
-            if (content == null) {
-                continue;
-            }
-            JsonObject relatesTo = getObject(content, "m.relates_to");
-            boolean edit = relatesTo != null && "m.replace".equals(getString(relatesTo, "rel_type"));
-            if (edit) {
-                // An edit's body is "* new text"; the replacement lives in m.new_content.
-                content = getObject(content, "m.new_content");
-                if (content == null) {
-                    continue;
+        String displaySender = sender;
+        MatrixClient client = matrixClient;
+        if (client != null) {
+            try {
+                String dn = sanitizeForMinecraft(client.getRoomMemberDisplayName(roomId, sender));
+                if (!dn.isBlank()) {
+                    displaySender = dn;
                 }
+            } catch (Exception ignored) {
             }
-            String msgType = getString(content, "msgtype");
-            if (!"m.text".equals(msgType)) {
-                continue;
-            }
-            String rawBody = getString(content, "body");
-            if (!edit && relatesTo != null && getObject(relatesTo, "m.in_reply_to") != null) {
-                rawBody = stripReplyFallback(rawBody);
-            }
-            String body = sanitizeForMinecraft(rawBody);
-            if (body.isBlank()) {
-                continue;
-            }
+        }
 
-            if (edit) {
-                // Editing a message into a command must not run it (again).
-                if (isBotCommand(body)) {
-                    continue;
-                }
-            } else if (maybeHandleMatrixBotCommand(sender, body)) {
-                continue;
-            }
-            body = EventSerializationUtil.truncate(body, MAX_MATRIX_TO_MC_CHARS);
-            if (edit) {
-                body = body + " (edited)";
-            }
-
-            String displaySender = sender;
-            MatrixClient client = matrixClient;
-            if (client != null) {
-                try {
-                    String dn = sanitizeForMinecraft(client.getRoomMemberDisplayName(roomId, sender));
-                    if (!dn.isBlank()) {
-                        displaySender = dn;
-                    }
-                } catch (Exception ignored) {
-                }
-            }
-
-            String line = settings.matrixToMcPrefix + "<" + sanitizeForMinecraft(displaySender) + "> " + body;
-            McCallbacks cb = callbacks;
-            if (cb != null) {
-                cb.broadcast(line);
-            }
+        String line = settings.matrixToMcPrefix + "<" + sanitizeForMinecraft(displaySender) + "> " + body;
+        McCallbacks cb = callbacks;
+        if (cb != null) {
+            cb.broadcast(line);
         }
     }
 
@@ -949,10 +1040,34 @@ public final class BridgeService {
         }
     }
 
+    /** Queues a bot reply for the reply thread; the sync thread never waits on Matrix sends. */
     private void sendMatrixBotReply(String text) {
-        if (text == null || text.isBlank()) {
+        BlockingQueue<String> q = replyQueue;
+        if (text == null || text.isBlank() || q == null) {
             return;
         }
+        if (!q.offer(text)) {
+            LOGGER.warning("MatrixBridge bot reply queue is full; dropping a reply.");
+        }
+    }
+
+    private void replyLoop() {
+        while (running.get()) {
+            BlockingQueue<String> q = replyQueue;
+            if (q == null) {
+                return;
+            }
+            String text;
+            try {
+                text = q.take();
+            } catch (InterruptedException e) {
+                continue;
+            }
+            deliverBotReply(text);
+        }
+    }
+
+    private void deliverBotReply(String text) {
         MatrixClient client = matrixClient;
         if (client == null) {
             return;

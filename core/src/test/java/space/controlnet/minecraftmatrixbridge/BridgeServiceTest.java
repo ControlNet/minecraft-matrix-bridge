@@ -995,6 +995,155 @@ public class BridgeServiceTest {
         }
     }
 
+    private JsonObject stateOnDisk() throws Exception {
+        Path statePath = worldRoot.resolve("data").resolve("minecraftmatrixbridge").resolve("state.json");
+        return JsonParser.parseString(Files.readString(statePath, StandardCharsets.UTF_8)).getAsJsonObject();
+    }
+
+    @Test
+    void sinceIsSavedOnlyAfterItsMessagesWereForwarded() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            JsonObject state = new JsonObject();
+            state.addProperty("since", "s_old");
+            writeState(state);
+            JsonArray events = new JsonArray();
+            events.add(matrixTextEvent("$a", "@alice:example.com", "first"));
+            events.add(matrixTextEvent("$b", "@alice:example.com", "second"));
+            server.enqueueSyncResponse(roomId, "s1", events);
+
+            CountDownLatch inFirst = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            List<String> received = Collections.synchronizedList(new ArrayList<>());
+            BridgeService service = new BridgeService();
+            try {
+                service.start(syncOnlySettings(server, roomId), worldRoot, text -> {
+                    if (text.endsWith("first")) {
+                        inFirst.countDown();
+                        try {
+                            release.await(5, TimeUnit.SECONDS);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                    received.add(text);
+                });
+                assertTrue(inFirst.await(3, TimeUnit.SECONDS));
+                // "second" is not delivered yet: a stop now must replay this batch next time.
+                assertEquals("s_old", stateOnDisk().get("since").getAsString());
+                release.countDown();
+                waitUntil(() -> received.stream().anyMatch(t -> t.endsWith("second")), Duration.ofSeconds(3));
+                waitUntil(() -> {
+                    try {
+                        return "s1".equals(stateOnDisk().get("since").getAsString());
+                    } catch (Exception e) {
+                        return false;
+                    }
+                }, Duration.ofSeconds(3));
+            } finally {
+                release.countDown();
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void rateLimitedBotRepliesDoNotHoldUpMatrixChat() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            JsonObject state = new JsonObject();
+            state.addProperty("since", "s_old");
+            writeState(state);
+            server.setSendRateLimit(1, 10_000);
+            JsonArray events = new JsonArray();
+            events.add(matrixTextEvent("$cmd", "@alice:example.com", "!mc help"));
+            events.add(matrixTextEvent("$chat", "@alice:example.com", "right after"));
+            server.enqueueSyncResponse(roomId, "s1", events);
+
+            CountDownLatch latch = new CountDownLatch(1);
+            BridgeService service = new BridgeService();
+            try {
+                // MC -> Matrix is off, yet the bot must still be able to reply.
+                service.start(syncOnlySettings(server, roomId), worldRoot, text -> {
+                    if (text.endsWith("right after")) {
+                        latch.countDown();
+                    }
+                });
+                assertTrue(latch.await(3, TimeUnit.SECONDS), "chat must not wait for a rate-limited bot reply");
+                waitUntil(() -> server.sendCallCount() >= 1, Duration.ofSeconds(2));
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void connectedNoticeWaitsForTheInitialSync() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            server.setSyncRateLimit(1, 1_000);
+            server.enqueueSyncResponse(roomId, "s0", new JsonArray());
+
+            List<String> received = Collections.synchronizedList(new ArrayList<>());
+            BridgeService service = new BridgeService();
+            try {
+                BridgeSettings announcing = new BridgeSettings(server.homeserverUrl(), roomId, "token", false, true, true,
+                        "[MC] ", "[Matrix] ", "!mc", 0, 20, 100, 64);
+                service.start(announcing, worldRoot, received::add);
+                waitUntil(() -> !server.getSyncRequests().isEmpty(), Duration.ofSeconds(2));
+                Thread.sleep(200);
+                // Messages sent now would land in the skipped initial sync, so do not claim readiness yet.
+                assertTrue(!service.isReady(), "ready before the initial sync finished");
+                assertTrue(received.isEmpty(), String.valueOf(received));
+                waitUntil(service::isReady, Duration.ofSeconds(4));
+                waitUntil(() -> received.stream().anyMatch(t -> t.startsWith("Matrix room connected:")), Duration.ofSeconds(2));
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void limitedTimelinesAreBackfilledInOrder() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            JsonObject state = new JsonObject();
+            state.addProperty("since", "s_old");
+            writeState(state);
+            JsonArray newest = new JsonArray();
+            newest.add(matrixTextEvent("$4", "@alice:example.com", "four"));
+            server.enqueueSyncResponse(roomId, "s1", newest, true, "p_gap");
+            // Backwards pages from the gap down to s_old, newest first. "$4" overlaps on purpose.
+            JsonArray page1 = new JsonArray();
+            page1.add(matrixTextEvent("$4", "@alice:example.com", "four"));
+            page1.add(matrixTextEvent("$3", "@alice:example.com", "three"));
+            page1.add(matrixTextEvent("$2", "@alice:example.com", "two"));
+            server.setMessagesPage("p_gap", page1, "p_more");
+            JsonArray page2 = new JsonArray();
+            page2.add(matrixTextEvent("$1", "@alice:example.com", "one"));
+            server.setMessagesPage("p_more", page2, "");
+
+            List<String> received = Collections.synchronizedList(new ArrayList<>());
+            BridgeService service = new BridgeService();
+            try {
+                service.start(syncOnlySettings(server, roomId), worldRoot, received::add);
+                waitUntil(() -> received.size() >= 4, Duration.ofSeconds(3));
+                Thread.sleep(200);
+                assertEquals(List.of("[Matrix] <@alice:example.com> one", "[Matrix] <@alice:example.com> two",
+                        "[Matrix] <@alice:example.com> three", "[Matrix] <@alice:example.com> four"), received);
+                MockMatrixServer.RecordedRequest first = server.getMessagesRequests().get(0);
+                assertEquals("b", queryParam(first.query(), "dir"));
+                assertEquals("s_old", queryParam(first.query(), "to"));
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
     @Test
     void invisibleFormattingCharactersAreStripped() {
         assertEquals("abc", BridgeService.sanitizeForMinecraft("a‮b​c﻿"));
