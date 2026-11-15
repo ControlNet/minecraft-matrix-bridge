@@ -13,6 +13,7 @@ import net.minecraftforge.event.server.ServerStartedEvent;
 import net.minecraftforge.event.server.ServerStoppingEvent;
 import net.minecraftforge.event.server.ServerStoppedEvent;
 import com.electronwill.nightconfig.core.file.FileWatcher;
+import net.minecraftforge.eventbus.api.EventPriority;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import org.slf4j.Logger;
 import net.minecraftforge.fml.ModContainer;
@@ -52,9 +53,10 @@ public final class ForgeHooks {
     private static final ConcurrentHashMap<Class<?>, Method> VIEW_DISTANCE_METHODS = new ConcurrentHashMap<>();
     private static final Set<Class<?>> MISSING_VIEW_DISTANCE_METHODS = ConcurrentHashMap.newKeySet();
 
-    private BridgeService bridgeService;
-    private McCallbacks callbacks;
-    private EventTapManager eventTapManager;
+    // Written on the server thread, read by bridge and command threads.
+    private volatile BridgeService bridgeService;
+    private volatile McCallbacks callbacks;
+    private volatile EventTapManager eventTapManager;
     private volatile MinecraftServer runningServer;
     private volatile String connectedRoomIdOrAlias = "";
     private final ConcurrentHashMap<UUID, Integer> pendingConnectedNoticeTicks = new ConcurrentHashMap<>();
@@ -218,7 +220,8 @@ public final class ForgeHooks {
                 });
     }
 
-    @SubscribeEvent
+    // Last, so chat cancelled by mute/filter mods at any other priority is not relayed.
+    @SubscribeEvent(priority = EventPriority.LOWEST)
     public void onServerChat(ServerChatEvent event) {
         if (bridgeService == null || !bridgeService.isRunning()) {
             return;
@@ -491,10 +494,10 @@ public final class ForgeHooks {
                             return fut;
                         }
                     };
-                    bridgeService.start(loadSettings(), worldRoot, callbacks);
+                    BridgeSettings settings = loadSettings();
+                    bridgeService.start(settings, worldRoot, callbacks);
 
                     // Recreate event tap manager if enabled
-                    BridgeSettings settings = loadSettings();
                     if (settings.enableEventTaps) {
                         eventTapManager = new EventTapManager(
                                 bridgeService,

@@ -53,6 +53,44 @@ public final class MatrixClient {
         return HttpRequest.newBuilder().timeout(requestTimeout);
     }
 
+    String baseUrl() {
+        return homeserver;
+    }
+
+    /**
+     * Reads {@code m.homeserver.base_url} from {@code /.well-known/matrix/client} on the
+     * configured URL, for setups where the configured URL is the server name rather than the
+     * client API. Returns an empty string when there is no usable delegation.
+     */
+    public String discoverClientBaseUrl() throws IOException, InterruptedException {
+        HttpRequest request = newRequest()
+                .uri(URI.create(homeserver + "/.well-known/matrix/client"))
+                .GET()
+                .build();
+        // Unauthenticated, so following redirects (e.g. apex -> www) cannot leak the token;
+        // NORMAL never follows https -> http.
+        HttpClient discovery = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .followRedirects(HttpClient.Redirect.NORMAL)
+                .build();
+        HttpResponse<String> response = discovery.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        if (response.statusCode() / 100 != 2) {
+            return "";
+        }
+        try {
+            JsonElement parsed = JsonParser.parseString(response.body());
+            JsonObject homeserverInfo = parsed.isJsonObject() ? getObject(parsed.getAsJsonObject(), "m.homeserver") : null;
+            String baseUrl = stripTrailingSlash(getString(homeserverInfo, "base_url"));
+            // Never let a delegation downgrade an https homeserver to plain http.
+            if (homeserver.startsWith("https://") && !baseUrl.startsWith("https://")) {
+                return "";
+            }
+            return baseUrl.startsWith("https://") || baseUrl.startsWith("http://") ? baseUrl : "";
+        } catch (RuntimeException e) {
+            return "";
+        }
+    }
+
     Duration syncRequestTimeout(int timeoutMs) {
         return requestTimeout.plusMillis(Math.max(0, timeoutMs));
     }
@@ -485,7 +523,7 @@ public final class MatrixClient {
         }
         String error = parseMatrixError(response.body());
         String msg = op + ": HTTP " + status + (error.isBlank() ? "" : (" (" + error + ")"));
-        return new MatrixException(msg, status, retryAfterMs);
+        return new MatrixException(msg, status, retryAfterMs, parseErrcode(response.body()));
     }
 
     private static long parseRetryAfterHeaderMs(HttpResponse<?> response) {
@@ -523,6 +561,15 @@ public final class MatrixClient {
         }
     }
 
+    private static String parseErrcode(String body) {
+        try {
+            JsonElement parsed = JsonParser.parseString(body == null ? "" : body);
+            return parsed.isJsonObject() ? getString(parsed.getAsJsonObject(), "errcode") : "";
+        } catch (RuntimeException ignored) {
+            return "";
+        }
+    }
+
     private static long parseRetryAfterMs(String body) {
         if (body == null || body.isBlank()) {
             return 0;
@@ -555,11 +602,18 @@ public final class MatrixClient {
     public static final class MatrixException extends Exception {
         public final int statusCode;
         public final long retryAfterMs;
+        /** Matrix {@code errcode} of the error body; empty when the body was not a Matrix error. */
+        public final String errcode;
 
         public MatrixException(String message, int statusCode, long retryAfterMs) {
+            this(message, statusCode, retryAfterMs, "");
+        }
+
+        public MatrixException(String message, int statusCode, long retryAfterMs, String errcode) {
             super(message);
             this.statusCode = statusCode;
             this.retryAfterMs = retryAfterMs;
+            this.errcode = errcode == null ? "" : errcode;
         }
     }
 

@@ -18,10 +18,15 @@ final class ModernEventBus {
             return new ModernEventBus(
                     Class.forName("net.minecraftforge.eventbus.internal.Event", true, loader),
                     Class.forName("net.minecraftforge.eventbus.api.bus.EventBus", true, loader),
-                    Class.forName("net.minecraftforge.eventbus.api.listener.Priority", true, loader).getField("NORMAL").getByte(null));
+                    priority(loader, "NORMAL"));
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("Unsupported Forge EventBus 7 API", e);
         }
+    }
+
+    /** Reads a constant of EventBus 7's {@code Priority}, e.g. "LOWEST". */
+    static byte priority(ClassLoader loader, String name) throws ReflectiveOperationException {
+        return Class.forName("net.minecraftforge.eventbus.api.listener.Priority", true, loader).getField(name).getByte(null);
     }
 
     ModernEventBus(Class<?> eventType, Class<?> busType, byte normalPriority) {
@@ -68,6 +73,10 @@ final class ModernEventBus {
     }
 
     void listen(Class<?> type, Consumer<Object> listener) {
+        listen(type, listener, normalPriority);
+    }
+
+    void listen(Class<?> type, Consumer<Object> listener, byte priority) {
         if (!isEventClass(type)) {
             throw new IllegalArgumentException("Not a Forge event: " + type.getName());
         }
@@ -77,7 +86,7 @@ final class ModernEventBus {
             for (Object bus : buses) {
                 // Normal consumers neither cancel events nor observe already-cancelled ones.
                 // EventBus 7's boolean overload means alwaysCancelling, not receiveCancelled.
-                addListener.invoke(bus, normalPriority, listener);
+                addListener.invoke(bus, priority, listener);
             }
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("Could not register Forge event: " + type.getName(), e);

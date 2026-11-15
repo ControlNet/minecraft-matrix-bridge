@@ -71,6 +71,16 @@ class ModernEventBusTest {
     }
 
     @Test
+    void listensAtTheRequestedPriority() {
+        List<Object> received = new ArrayList<>();
+        adapter.listen(Chat.class, received::add, (byte) -100);
+        assertEquals(-100, Chat.BUS.priority);
+        Chat event = new Chat();
+        Chat.BUS.fire(event);
+        assertEquals(List.of(event), received);
+    }
+
+    @Test
     void unrelatedClassesAndMissingOwnBusesAreRejected() {
         assertFalse(adapter.isEventClass(String.class));
         assertThrows(IllegalArgumentException.class, () -> adapter.listen(String.class, ignored -> {}));

@@ -62,7 +62,8 @@ public final class BridgeSettings {
         this.enableEventTaps = enableEventTaps;
         this.maxActiveEventTaps = maxActiveEventTaps > 0 ? maxActiveEventTaps : 10;
         this.defaultEventThrottleMs = defaultEventThrottleMs > 0 ? defaultEventThrottleMs : 1000;
-        this.eventCommandMinPowerLevel = eventCommandMinPowerLevel >= 0 ? eventCommandMinPowerLevel : 50;
+        // Room admins only by default: tap output can include player positions.
+        this.eventCommandMinPowerLevel = eventCommandMinPowerLevel >= 0 ? eventCommandMinPowerLevel : 100;
     }
 
     public BridgeSettings(
@@ -82,7 +83,7 @@ public final class BridgeSettings {
     ) {
         this(homeserver, roomId, accessToken, enableMcToMatrix, enableMatrixToMc, announceConnected,
                 mcToMatrixPrefix, matrixToMcPrefix, matrixBotPrefix, syncTimeoutMs, timelineLimit,
-                maxQueueSize, dedupSize, true, 10, 1000, 50);
+                maxQueueSize, dedupSize, true, 10, 1000, 100);
     }
 
     public boolean isBridgeEnabled() {

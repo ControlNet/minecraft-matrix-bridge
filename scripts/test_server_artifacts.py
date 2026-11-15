@@ -271,6 +271,14 @@ class HeadlessClientTests(unittest.TestCase):
         self.assertEqual([system_test_all.EXPECTED_PLAYER_BODIES[2]],
                          system_test_all.missing_player_messages(bodies[:2]))
 
+    def test_player_messages_may_arrive_batched_into_one_body(self):
+        joined, chat, left = system_test_all.EXPECTED_PLAYER_BODIES
+        bodies = [self.body(f"{joined}\n[MC] [TEST] now"), self.body(f"{chat}\n{left}")]
+        self.assertEqual([], system_test_all.missing_player_messages(bodies))
+        # A line must match whole; a longer line containing it does not count.
+        self.assertEqual([chat], system_test_all.missing_player_messages(
+            [self.body(joined), self.body(chat + " extra"), self.body(left)]))
+
     def test_expected_messages_cover_join_chat_and_leave(self):
         joined, chat, left = system_test_all.EXPECTED_PLAYER_BODIES
         self.assertIn("joined the game", joined)

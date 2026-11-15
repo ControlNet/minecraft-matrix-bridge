@@ -8,6 +8,7 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.storage.LevelResource;
+import net.neoforged.bus.api.EventPriority;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.event.RegisterCommandsEvent;
 import net.neoforged.neoforge.event.ServerChatEvent;
@@ -36,9 +37,10 @@ public final class NeoForgeHooks {
     private static final int MAX_WAIT_TICKS = 100;
     private static final int DEFAULT_VIEW_DISTANCE = 2;
 
-    private BridgeService bridgeService;
-    private McCallbacks callbacks;
-    private EventTapManager eventTapManager;
+    // Written on the server thread, read by bridge and command threads.
+    private volatile BridgeService bridgeService;
+    private volatile McCallbacks callbacks;
+    private volatile EventTapManager eventTapManager;
     private volatile MinecraftServer runningServer;
     private volatile String connectedRoomIdOrAlias = "";
     private final ConcurrentHashMap<UUID, Integer> pendingConnectedNoticeTicks = new ConcurrentHashMap<>();
@@ -192,7 +194,8 @@ public final class NeoForgeHooks {
         shutdownBridge(false);
     }
 
-    @SubscribeEvent
+    // Last, so chat cancelled by mute/filter mods at any other priority is not relayed.
+    @SubscribeEvent(priority = EventPriority.LOWEST)
     public void onServerChat(ServerChatEvent event) {
         if (bridgeService == null || !bridgeService.isRunning()) {
             return;
@@ -423,9 +426,9 @@ public final class NeoForgeHooks {
                             return fut;
                         }
                     };
-                    bridgeService.start(loadSettings(), worldRoot, callbacks);
-
                     BridgeSettings settings = loadSettings();
+                    bridgeService.start(settings, worldRoot, callbacks);
+
                     if (settings.enableEventTaps) {
                         eventTapManager = new EventTapManager(
                                 bridgeService,

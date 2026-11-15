@@ -59,6 +59,10 @@ public final class MockMatrixServer implements AutoCloseable {
     private volatile int syncErrorRemaining = 0;
     private volatile int syncErrorStatus = 0;
     private volatile String syncErrorCode = "";
+    private volatile boolean whoamiNotFound = false;
+    private volatile String wellKnownBaseUrl = "";
+    private volatile String wellKnownRedirect = "";
+    private final AtomicInteger wellKnownCalls = new AtomicInteger();
 
     private volatile String roomAlias = "";
     private volatile String roomIdForAlias = "";
@@ -77,6 +81,7 @@ public final class MockMatrixServer implements AutoCloseable {
         server.createContext("/_matrix/client/v3/join", this::handleJoin);
         server.createContext("/_matrix/client/v3/sync", this::handleSync);
         server.createContext("/_matrix/client/v3/rooms", this::handleRooms);
+        server.createContext("/.well-known/matrix/client", this::handleWellKnown);
         server.start();
     }
 
@@ -131,6 +136,25 @@ public final class MockMatrixServer implements AutoCloseable {
     public void setSyncRateLimit(int times, long retryAfterMs) {
         sync429Remaining = Math.max(0, times);
         syncRetryAfterMs = Math.max(0, retryAfterMs);
+    }
+
+    /** Makes whoami answer 404, like a server-name URL that does not host the client API. */
+    public void setWhoamiNotFound(boolean notFound) {
+        whoamiNotFound = notFound;
+    }
+
+    /** Serves {@code /.well-known/matrix/client} pointing at {@code baseUrl}; blank means 404. */
+    public void setWellKnownBaseUrl(String baseUrl) {
+        wellKnownBaseUrl = baseUrl == null ? "" : baseUrl;
+    }
+
+    /** Answers {@code /.well-known/matrix/client} with a 302 to {@code location} (e.g. apex -> www). */
+    public void setWellKnownRedirect(String location) {
+        wellKnownRedirect = location == null ? "" : location;
+    }
+
+    public int wellKnownCallCount() {
+        return wellKnownCalls.get();
     }
 
     /** Fail the next {@code times} sync requests with {@code status} and Matrix {@code errcode}. */
@@ -253,6 +277,11 @@ public final class MockMatrixServer implements AutoCloseable {
             return;
         }
 
+        if (whoamiNotFound) {
+            respondPlain(exchange, 404, "<html>Not Found</html>");
+            return;
+        }
+
         if (whoami429Remaining > 0) {
             whoami429Remaining--;
             JsonObject body = new JsonObject();
@@ -269,6 +298,27 @@ public final class MockMatrixServer implements AutoCloseable {
 
         JsonObject body = new JsonObject();
         body.addProperty("user_id", selfUserId);
+        respondJson(exchange, 200, body);
+    }
+
+    private void handleWellKnown(HttpExchange exchange) throws IOException {
+        wellKnownCalls.incrementAndGet();
+        String redirect = wellKnownRedirect;
+        if (!redirect.isBlank()) {
+            exchange.getResponseHeaders().set("Location", redirect);
+            exchange.sendResponseHeaders(302, -1);
+            exchange.close();
+            return;
+        }
+        String baseUrl = wellKnownBaseUrl;
+        if (baseUrl.isBlank()) {
+            respondPlain(exchange, 404, "");
+            return;
+        }
+        JsonObject homeserver = new JsonObject();
+        homeserver.addProperty("base_url", baseUrl);
+        JsonObject body = new JsonObject();
+        body.add("m.homeserver", homeserver);
         respondJson(exchange, 200, body);
     }
 

@@ -509,6 +509,26 @@ public final class EventIndex {
     }
 
     /**
+     * Lists indexed events declared directly inside {@code outerFqcn} (for example
+     * {@code BlockEvent$BreakEvent} for {@code BlockEvent}), sorted, at most {@code limit}.
+     */
+    public List<String> nestedEvents(String outerFqcn, int limit) {
+        if (outerFqcn == null || outerFqcn.isBlank() || limit <= 0) {
+            return List.of();
+        }
+        String prefix = outerFqcn + "$";
+        java.util.TreeSet<String> nested = new java.util.TreeSet<>();
+        for (List<String> fqcns : bySimpleName.values()) {
+            for (String fqcn : fqcns) {
+                if (fqcn.startsWith(prefix) && fqcn.indexOf('$', prefix.length()) < 0) {
+                    nested.add(fqcn);
+                }
+            }
+        }
+        return nested.stream().limit(limit).toList();
+    }
+
+    /**
      * Returns the loader identifier from the index.
      */
     public String getLoader() {

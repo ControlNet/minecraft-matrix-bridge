@@ -457,7 +457,8 @@ def run_headless_client(module: str, server_port: int) -> bool:
 
 
 def missing_player_messages(bodies: list[str]) -> list[str]:
-    texts = [tap_message_body(body) for body in bodies]
+    # The bridge batches lines queued together into one message, one line each.
+    texts = [line for body in bodies for line in message_body(body).split("\n")]
     return [expected for expected in EXPECTED_PLAYER_BODIES if expected not in texts]
 
 
@@ -480,11 +481,15 @@ def wait_for_player_messages(module: str, mock: "MockMatrix", proc: subprocess.P
     raise RuntimeError(f"{module}: Matrix never received {missing_player_messages(mock.counters.send_bodies)}")
 
 
-def tap_message_body(raw: str) -> str:
+def message_body(raw: str) -> str:
     try:
-        return str(json.loads(raw).get("body", ""))[:300]
+        return str(json.loads(raw).get("body", ""))
     except (ValueError, AttributeError):
-        return raw[:300]
+        return raw
+
+
+def tap_message_body(raw: str) -> str:
+    return message_body(raw)[:300]
 
 
 def wait_for_send_count(

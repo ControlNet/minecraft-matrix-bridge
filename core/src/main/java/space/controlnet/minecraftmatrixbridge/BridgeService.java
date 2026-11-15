@@ -23,12 +23,21 @@ import java.util.logging.Logger;
 public final class BridgeService {
     private static final Logger LOGGER = Logger.getLogger("MatrixBridge");
 
+    /**
+     * Lines queued while a send is in flight go out together, so a burst of chat or tap
+     * output costs one Matrix event instead of one each (homeservers rate-limit messages).
+     */
+    static final int MAX_BATCH_LINES = 20;
+    private static final int MAX_BATCH_CHARS = 16_000;
+    /** Longer Matrix messages are cut so one remote user cannot flood Minecraft chat. */
+    static final int MAX_MATRIX_TO_MC_CHARS = 512;
+
     private final Object lifecycleLock = new Object();
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean ready = new AtomicBoolean(false);
 
     private volatile BridgeSettings settings;
-    private MatrixClient matrixClient;
+    private volatile MatrixClient matrixClient;
     private SinceStore sinceStore;
     private EventDeduplicator dedup;
     private McCallbacks callbacks;
@@ -43,6 +52,7 @@ public final class BridgeService {
     private volatile String resolvedRoomId = "";
     private volatile boolean announcedConnected = false;
     private volatile long lastQueueFullLogMs = 0;
+    private volatile long lastTapQueueFullLogMs = 0;
     private volatile long lastAuthErrorLogMs = 0;
 
     public void start(BridgeSettings settings, Path worldRoot, McCallbacks callbacks) {
@@ -163,6 +173,27 @@ public final class BridgeService {
         return ok;
     }
 
+    /**
+     * Queues event-tap output. Taps may fill at most half of the queue, so a busy tap cannot
+     * crowd out player chat while the homeserver is rate-limiting the bridge.
+     */
+    public boolean enqueueTapMessage(String formattedText) {
+        BlockingQueue<String> q = outgoingQueue;
+        BridgeSettings s = settings;
+        if (!running.get() || q == null || s == null || !s.enableMcToMatrix) {
+            return false;
+        }
+        if (q.size() >= Math.max(1, s.maxQueueSize / 2)) {
+            long now = System.currentTimeMillis();
+            if (now - lastTapQueueFullLogMs > 30_000) {
+                lastTapQueueFullLogMs = now;
+                LOGGER.warning("MatrixBridge outgoing queue is half full; dropping event tap output until it drains.");
+            }
+            return false;
+        }
+        return enqueueMcMessage(formattedText);
+    }
+
     /** True when the running bridge was configured without MC -> Matrix forwarding. */
     public boolean isMcToMatrixDisabledByConfig() {
         BridgeSettings s = settings;
@@ -252,6 +283,7 @@ public final class BridgeService {
 
     private String resolveSelfUserIdWithRetry() {
         long backoffMs = 1_000;
+        boolean triedDiscovery = false;
         while (running.get()) {
             try {
                 return matrixClient.whoami();
@@ -260,6 +292,21 @@ public final class BridgeService {
                     logAuthErrorOnce("Matrix whoami failed (HTTP " + e.statusCode + "). Check access token / permissions; bridge will not run.");
                     running.set(false);
                     return null;
+                }
+                if (e.statusCode == 404 && !triedDiscovery) {
+                    // The URL may be the server name rather than the client API. It may also be
+                    // a reverse proxy whose route is not up yet, so keep retrying either way.
+                    triedDiscovery = true;
+                    if (useWellKnownClientApi()) {
+                        continue;
+                    }
+                    if (Thread.currentThread().isInterrupted()) {
+                        return null;
+                    }
+                    LOGGER.severe("Matrix whoami returned HTTP 404 at " + matrixClient.baseUrl()
+                            + ". matrix.homeserver must be the client API URL (for example https://matrix.example.com),"
+                            + " and no /.well-known/matrix/client delegation was found. Retrying in case the"
+                            + " homeserver is still starting; fix the URL and run /matrix reload otherwise.");
                 }
                 long sleepMs = (e.statusCode == 429 && e.retryAfterMs > 0) ? e.retryAfterMs : jitter(backoffMs);
                 LOGGER.warning("Matrix whoami failed (" + e.getMessage() + "); retrying in " + sleepMs + " ms.");
@@ -281,6 +328,27 @@ public final class BridgeService {
             }
         }
         return null;
+    }
+
+    /** Switches to the client API named by the configured URL's .well-known, if any. */
+    private boolean useWellKnownClientApi() {
+        MatrixClient current = matrixClient;
+        try {
+            String baseUrl = current.discoverClientBaseUrl();
+            if (baseUrl.isBlank() || baseUrl.equals(current.baseUrl())) {
+                return false;
+            }
+            LOGGER.info("MatrixBridge: " + current.baseUrl() + " delegates the client API to " + baseUrl
+                    + " (/.well-known/matrix/client); using it.");
+            matrixClient = new MatrixClient(baseUrl, settings.accessToken);
+            return true;
+        } catch (IOException e) {
+            LOGGER.warning("MatrixBridge could not read /.well-known/matrix/client from " + current.baseUrl() + ": " + e);
+            return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
     }
 
     private String resolveRoomIdWithRetry(String roomIdOrAlias) {
@@ -458,6 +526,7 @@ public final class BridgeService {
                 return;
             }
 
+            msg = appendQueuedLines(msg);
             String transactionId = UUID.randomUUID().toString();
             while (running.get()) {
                 try {
@@ -507,6 +576,23 @@ public final class BridgeService {
                 }
             }
         }
+    }
+
+    /** Joins lines already waiting in the queue onto {@code first}; this is the only consumer. */
+    private String appendQueuedLines(String first) {
+        BlockingQueue<String> q = outgoingQueue;
+        StringBuilder batch = new StringBuilder(first);
+        int lines = 1;
+        while (q != null && lines < MAX_BATCH_LINES) {
+            String next = q.peek();
+            if (next == null || batch.length() + 1 + next.length() > MAX_BATCH_CHARS) {
+                break;
+            }
+            q.poll();
+            batch.append('\n').append(next);
+            lines++;
+        }
+        return batch.toString();
     }
 
     private void syncLoop() {
@@ -565,9 +651,14 @@ public final class BridgeService {
         }
     }
 
+    /**
+     * A homeserver that does not accept a since token answers 400/404 with a Matrix error.
+     * Other 4xx (a proxy's 408 or HTML 404 while restarting) say nothing about the token, and
+     * dropping it would skip the messages sent in between.
+     */
     private static boolean isRejectedSince(MatrixClient.MatrixException e, String since) {
         return since != null && !since.isBlank()
-                && e.statusCode >= 400 && e.statusCode < 500 && e.statusCode != 429;
+                && (e.statusCode == 400 || e.statusCode == 404) && !e.errcode.isBlank();
     }
 
     private String initialCatchup(String filterJson) {
@@ -664,17 +755,39 @@ public final class BridgeService {
             if (content == null) {
                 continue;
             }
+            JsonObject relatesTo = getObject(content, "m.relates_to");
+            boolean edit = relatesTo != null && "m.replace".equals(getString(relatesTo, "rel_type"));
+            if (edit) {
+                // An edit's body is "* new text"; the replacement lives in m.new_content.
+                content = getObject(content, "m.new_content");
+                if (content == null) {
+                    continue;
+                }
+            }
             String msgType = getString(content, "msgtype");
             if (!"m.text".equals(msgType)) {
                 continue;
             }
-            String body = sanitizeForMinecraft(getString(content, "body"));
+            String rawBody = getString(content, "body");
+            if (!edit && relatesTo != null && getObject(relatesTo, "m.in_reply_to") != null) {
+                rawBody = stripReplyFallback(rawBody);
+            }
+            String body = sanitizeForMinecraft(rawBody);
             if (body.isBlank()) {
                 continue;
             }
 
-            if (maybeHandleMatrixBotCommand(sender, body)) {
+            if (edit) {
+                // Editing a message into a command must not run it (again).
+                if (isBotCommand(body)) {
+                    continue;
+                }
+            } else if (maybeHandleMatrixBotCommand(sender, body)) {
                 continue;
+            }
+            body = EventSerializationUtil.truncate(body, MAX_MATRIX_TO_MC_CHARS);
+            if (edit) {
+                body = body + " (edited)";
             }
 
             String displaySender = sender;
@@ -697,7 +810,26 @@ public final class BridgeService {
         }
     }
 
-    private boolean maybeHandleMatrixBotCommand(String senderMxid, String body) {
+    /**
+     * Drops the quoted fallback ("> <@user> original" lines and the blank line after them)
+     * that clients put in front of a reply's text.
+     */
+    static String stripReplyFallback(String body) {
+        if (body == null || !body.startsWith(">")) {
+            return body;
+        }
+        String[] lines = body.split("\n", -1);
+        int i = 0;
+        while (i < lines.length && lines[i].startsWith(">")) {
+            i++;
+        }
+        if (i < lines.length && lines[i].isBlank()) {
+            i++;
+        }
+        return String.join("\n", java.util.Arrays.copyOfRange(lines, i, lines.length));
+    }
+
+    private boolean isBotCommand(String body) {
         if (body == null) {
             return false;
         }
@@ -706,19 +838,18 @@ public final class BridgeService {
             return false;
         }
         String trimmed = body.trim();
-
         if (!trimmed.regionMatches(true, 0, prefix, 0, prefix.length())) {
             return false;
         }
-        if (trimmed.length() != prefix.length()) {
-            if (trimmed.length() < prefix.length() + 1) {
-                return false;
-            }
-            char next = trimmed.charAt(prefix.length());
-            if (!Character.isWhitespace(next)) {
-                return false;
-            }
+        return trimmed.length() == prefix.length() || Character.isWhitespace(trimmed.charAt(prefix.length()));
+    }
+
+    private boolean maybeHandleMatrixBotCommand(String senderMxid, String body) {
+        if (!isBotCommand(body)) {
+            return false;
         }
+        String prefix = settings.matrixBotPrefix;
+        String trimmed = body.trim();
 
         String rest = trimmed.substring(prefix.length()).trim();
         String[] parts = tokenizeCommand(rest).toArray(new String[0]);
@@ -930,7 +1061,8 @@ public final class BridgeService {
 
     /**
      * Makes Matrix text safe for Minecraft chat: drops section-sign formatting codes
-     * (so remote users cannot obfuscate or recolour messages) and turns control
+     * (so remote users cannot obfuscate or recolour messages) and invisible format
+     * characters (bidi overrides such as U+202E, zero-width spaces), and turns control
      * characters, including newlines, into spaces.
      */
     static String sanitizeForMinecraft(String text) {
@@ -946,6 +1078,9 @@ public final class BridgeService {
                 if (i < text.length()) {
                     i += Character.charCount(text.codePointAt(i));
                 }
+                continue;
+            }
+            if (Character.getType(cp) == Character.FORMAT) {
                 continue;
             }
             if (Character.isISOControl(cp)) {

@@ -63,8 +63,9 @@ public final class MatrixBridgeConfig {
         DEFAULT_EVENT_THROTTLE_MS = builder.comment("Default throttle interval in ms between forwarded events.")
                 .defineInRange("defaultEventThrottleMs", 1000, 100, 60_000);
         EVENT_COMMAND_MIN_POWER_LEVEL = builder.comment("Minimum Matrix power level required to use event commands from Matrix.",
-                        "Default 50 (moderator). Set to 0 to allow all room members.")
-                .defineInRange("eventCommandMinPowerLevel", 50, 0, 100);
+                        "Default 100 (room admin): tap output can include player names and coordinates.",
+                        "Set 50 for moderators or 0 to allow all room members.")
+                .defineInRange("eventCommandMinPowerLevel", 100, 0, 100);
         builder.pop();
 
         SPEC = builder.build();

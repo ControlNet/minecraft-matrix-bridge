@@ -30,6 +30,22 @@ class RealEventBusTest {
     }
 
     @Test
+    void lowestListenerSkipsChatCancelledAtLowPriority() throws ReflectiveOperationException {
+        List<Object> received = new ArrayList<>();
+        byte lowest = ModernEventBus.priority(getClass().getClassLoader(), "LOWEST");
+        assertEquals(Priority.LOWEST, lowest);
+        adapter.listen(Chat.class, received::add, lowest);
+        // A mute mod cancelling at LOW runs before the bridge and hides the message.
+        var muter = Chat.BUS.addListener(Priority.LOW, (Predicate<Chat>) ignored -> true);
+        assertTrue(Chat.BUS.post(new Chat()));
+        assertTrue(received.isEmpty());
+        Chat.BUS.removeListener(muter);
+        Chat kept = new Chat();
+        assertFalse(Chat.BUS.post(kept));
+        assertEquals(List.of(kept), received);
+    }
+
+    @Test
     void sealedParentReceivesEachRecordExactlyOnce() {
         List<Object> received = new ArrayList<>();
         adapter.listen(Tick.class, received::add);

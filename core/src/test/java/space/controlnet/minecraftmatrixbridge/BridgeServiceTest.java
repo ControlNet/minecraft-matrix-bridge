@@ -20,6 +20,10 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -756,6 +760,255 @@ public class BridgeServiceTest {
                 service.stop();
             }
         }
+    }
+
+    private BridgeSettings sendOnlySettings(String homeserver, String roomId, int maxQueueSize) {
+        return new BridgeSettings(homeserver, roomId, "token", true, false, false,
+                "[MC] ", "[Matrix] ", "!mc", 0, 20, maxQueueSize, 64);
+    }
+
+    private static String sentBody(MockMatrixServer.RecordedRequest request) {
+        return JsonParser.parseString(request.body()).getAsJsonObject().get("body").getAsString();
+    }
+
+    @Test
+    void tapMessagesCannotTakeMoreThanHalfTheQueue() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            // Keep bootstrap (and so the sender) waiting, so nothing drains the queue.
+            server.setWhoamiRateLimit(1, 10_000);
+            BridgeService service = new BridgeService();
+            try {
+                service.start(sendOnlySettings(server.homeserverUrl(), roomId, 10), worldRoot, text -> { });
+                int taps = 0;
+                for (int i = 0; i < 20; i++) {
+                    if (service.enqueueTapMessage("[EVT] tap " + i)) taps++;
+                }
+                int chats = 0;
+                for (int i = 0; i < 20; i++) {
+                    if (service.enqueueMcMessage("[MC] <Steve> chat " + i)) chats++;
+                }
+                assertEquals(5, taps, "event taps may use at most half of maxQueueSize");
+                assertEquals(5, chats, "player chat keeps the other half");
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void queuedLinesAreBatchedIntoFewMatrixMessages() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            // Bootstrap waits briefly, so all lines are queued before the sender starts.
+            server.setWhoamiRateLimit(1, 500);
+            BridgeService service = new BridgeService();
+            try {
+                service.start(sendOnlySettings(server.homeserverUrl(), roomId, 100), worldRoot, text -> { });
+                int lines = BridgeService.MAX_BATCH_LINES + 5;
+                for (int i = 0; i < lines; i++) {
+                    assertTrue(service.enqueueMcMessage("[MC] <Steve> line " + i));
+                }
+                waitUntil(() -> server.getSendRequests().size() >= 2, Duration.ofSeconds(5));
+                Thread.sleep(200);
+                List<MockMatrixServer.RecordedRequest> sends = server.getSendRequests();
+                assertEquals(2, sends.size(), "lines queued together must share Matrix events");
+                String[] first = sentBody(sends.get(0)).split("\n");
+                assertEquals(BridgeService.MAX_BATCH_LINES, first.length);
+                assertEquals("[MC] <Steve> line 0", first[0]);
+                assertEquals("[MC] <Steve> line " + (lines - 1), sentBody(sends.get(1)).split("\n")[4]);
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    private static JsonObject matrixEvent(String eventId, String sender, String contentJson) {
+        JsonObject evt = new JsonObject();
+        evt.addProperty("type", "m.room.message");
+        evt.addProperty("event_id", eventId);
+        evt.addProperty("sender", sender);
+        evt.add("content", JsonParser.parseString(contentJson).getAsJsonObject());
+        return evt;
+    }
+
+    @Test
+    void editsRepliesAndLongMessagesAreRelayedReadably() throws Exception {
+        String roomId = "!room:example.com";
+        String alice = "@alice:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            server.setRoomMemberDisplayName(roomId, alice, "Alice");
+            server.enqueueSyncResponse(roomId, "s0", new JsonArray());
+            JsonArray events = new JsonArray();
+            events.add(matrixEvent("$edit", alice, "{\"msgtype\":\"m.text\",\"body\":\"* fixed typo\","
+                    + "\"m.new_content\":{\"msgtype\":\"m.text\",\"body\":\"fixed typo\"},"
+                    + "\"m.relates_to\":{\"rel_type\":\"m.replace\",\"event_id\":\"$orig\"}}"));
+            events.add(matrixEvent("$editcmd", alice, "{\"msgtype\":\"m.text\",\"body\":\"* !mc list\","
+                    + "\"m.new_content\":{\"msgtype\":\"m.text\",\"body\":\"!mc list\"},"
+                    + "\"m.relates_to\":{\"rel_type\":\"m.replace\",\"event_id\":\"$cmd\"}}"));
+            events.add(matrixEvent("$reply", alice, "{\"msgtype\":\"m.text\","
+                    + "\"body\":\"> <@bob:example.com> original\\n> second line\\n\\nmy answer\","
+                    + "\"m.relates_to\":{\"m.in_reply_to\":{\"event_id\":\"$x\"}}}"));
+            events.add(matrixTextEvent("$long", alice, "x".repeat(5_000)));
+            server.enqueueSyncResponse(roomId, "s1", events);
+
+            List<String> received = Collections.synchronizedList(new ArrayList<>());
+            BridgeService service = new BridgeService();
+            try {
+                service.start(syncOnlySettings(server, roomId), worldRoot, received::add);
+                waitUntil(() -> received.size() >= 3, Duration.ofSeconds(3));
+                Thread.sleep(200);
+                assertEquals(3, received.size(), "an edited bot command is neither run nor relayed: " + received);
+                assertEquals("[Matrix] <Alice> fixed typo (edited)", received.get(0));
+                assertEquals("[Matrix] <Alice> my answer", received.get(1));
+                String longLine = received.get(2);
+                assertTrue(longLine.endsWith("..."), longLine);
+                assertEquals("[Matrix] <Alice> ".length() + BridgeService.MAX_MATRIX_TO_MC_CHARS, longLine.length());
+                assertEquals(0, server.sendCallCount(), "the edited command must not be answered");
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void discoversTheClientApiFromWellKnownWhenTheServerNameIsConfigured() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer api = new MockMatrixServer("token", "@bot:example.com");
+             MockMatrixServer site = new MockMatrixServer("token", "@bot:example.com")) {
+            api.setJoinedRooms(List.of(roomId));
+            site.setWhoamiNotFound(true);
+            site.setWellKnownBaseUrl(api.homeserverUrl());
+            BridgeService service = new BridgeService();
+            try {
+                service.start(sendOnlySettings(site.homeserverUrl(), roomId, 10), worldRoot, text -> { });
+                waitUntil(service::isReady, Duration.ofSeconds(3));
+                assertTrue(service.enqueueMcMessage("[MC] <Steve> via well-known"));
+                waitUntil(() -> api.sendCallCount() >= 1, Duration.ofSeconds(3));
+                assertEquals(0, site.sendCallCount());
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void followsAWellKnownRedirectToFindTheClientApi() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer api = new MockMatrixServer("token", "@bot:example.com");
+             MockMatrixServer site = new MockMatrixServer("token", "@bot:example.com")) {
+            api.setJoinedRooms(List.of(roomId));
+            api.setWellKnownBaseUrl(api.homeserverUrl());
+            site.setWhoamiNotFound(true);
+            // Like an apex domain redirecting to www, which serves the delegation.
+            site.setWellKnownRedirect(api.homeserverUrl() + "/.well-known/matrix/client");
+            BridgeService service = new BridgeService();
+            try {
+                service.start(sendOnlySettings(site.homeserverUrl(), roomId, 10), worldRoot, text -> { });
+                waitUntil(service::isReady, Duration.ofSeconds(3));
+                assertTrue(service.isReady());
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void keepsRetryingWithOneHintWhileTheHomeserverUrlAnswers404() throws Exception {
+        String roomId = "!room:example.com";
+        List<String> severe = Collections.synchronizedList(new ArrayList<>());
+        Handler capture = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                if (record.getLevel() == Level.SEVERE) {
+                    severe.add(record.getMessage());
+                }
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        Logger logger = Logger.getLogger("MatrixBridge");
+        logger.addHandler(capture);
+        // A wrong URL and a reverse proxy without a route yet (Synapse still starting) look
+        // the same, so a 404 must not stop the bridge for good.
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            server.setWhoamiNotFound(true);
+            BridgeService service = new BridgeService();
+            try {
+                service.start(sendOnlySettings(server.homeserverUrl(), roomId, 10), worldRoot, text -> { });
+                waitUntil(() -> server.whoamiCallCount() >= 2, Duration.ofSeconds(4));
+                assertTrue(service.isRunning());
+                assertTrue(server.whoamiCallCount() <= 3, "retries must back off, not spin");
+                assertEquals(1, server.wellKnownCallCount());
+                assertEquals(1, severe.stream().filter(m -> m.contains("404")).count(), String.valueOf(severe));
+
+                server.setWhoamiNotFound(false);
+                waitUntil(service::isReady, Duration.ofSeconds(6));
+                assertTrue(service.isReady());
+                assertEquals(1, server.wellKnownCallCount());
+            } finally {
+                service.stop();
+                logger.removeHandler(capture);
+            }
+        }
+    }
+
+    @Test
+    void transientHttpErrorsKeepTheSinceToken() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            JsonObject state = new JsonObject();
+            state.addProperty("since", "s_keep");
+            writeState(state);
+            // A proxy timeout carries no Matrix errcode and says nothing about the token.
+            server.setSyncError(1, 408, "");
+            JsonArray events = new JsonArray();
+            events.add(matrixTextEvent("$kept", "@alice:example.com", "still here"));
+            server.enqueueSyncResponse(roomId, "s1", events);
+
+            CountDownLatch latch = new CountDownLatch(1);
+            BridgeService service = new BridgeService();
+            try {
+                service.start(syncOnlySettings(server, roomId), worldRoot, text -> {
+                    if (text.endsWith("still here")) {
+                        latch.countDown();
+                    }
+                });
+                assertTrue(latch.await(5, TimeUnit.SECONDS), "sync must retry with the stored token");
+                List<MockMatrixServer.RecordedRequest> syncs = server.getSyncRequests();
+                assertEquals("s_keep", queryParam(syncs.get(0).query(), "since"));
+                assertEquals("s_keep", queryParam(syncs.get(1).query(), "since"));
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void invisibleFormattingCharactersAreStripped() {
+        assertEquals("abc", BridgeService.sanitizeForMinecraft("a‮b​c﻿"));
+        assertEquals("a b", BridgeService.sanitizeForMinecraft("a⁦ b⁩"));
+    }
+
+    @Test
+    void matrixEventCommandsDefaultToRoomAdmins() {
+        BridgeSettings defaults = new BridgeSettings("https://hs", "!r:hs", "t", true, true, true,
+                "[MC] ", "[Matrix] ", "!mc", 0, 20, 10, 64);
+        assertEquals(100, defaults.eventCommandMinPowerLevel);
+        BridgeSettings invalid = new BridgeSettings("https://hs", "!r:hs", "t", true, true, true,
+                "[MC] ", "[Matrix] ", "!mc", 0, 20, 10, 64, true, 10, 1000, -1);
+        assertEquals(100, invalid.eventCommandMinPowerLevel);
     }
 
     private static String urlEncode(String value) {
