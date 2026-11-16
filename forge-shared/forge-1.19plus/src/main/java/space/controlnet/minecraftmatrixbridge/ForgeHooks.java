@@ -160,10 +160,7 @@ public final class ForgeHooks {
             );
         }
 
-        if (MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get() && MatrixBridgeConfig.ENABLE_SERVER_LIFECYCLE_TO_MATRIX.get()) {
-            String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "* Server started.";
-            bridgeService.enqueueMcMessage(formatted);
-        }
+        bridgeService.enqueueServerLifecycle(true);
     }
 
     @SubscribeEvent
@@ -183,10 +180,7 @@ public final class ForgeHooks {
         connectedRoomIdOrAlias = "";
         pendingConnectedNoticeTicks.clear();
         if (service != null) {
-            if (announceStopping && MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get()
-                    && MatrixBridgeConfig.ENABLE_SERVER_LIFECYCLE_TO_MATRIX.get()) {
-                String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "* Server stopping.";
-                service.enqueueMcMessage(formatted);
+            if (announceStopping && service.enqueueServerLifecycle(false)) {
                 Thread t = new Thread(() -> {
                     try {
                         Thread.sleep(750);
@@ -226,43 +220,27 @@ public final class ForgeHooks {
         if (bridgeService == null || !bridgeService.isRunning()) {
             return;
         }
-        if (!MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get()) {
-            return;
-        }
-
         String msg = MC.chatMessage(event);
         if (msg == null || msg.isBlank()) {
             return;
         }
 
         String playerName = MC.playerName(event.getPlayer());
-        String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "<" + playerName + "> " + msg;
-        bridgeService.enqueueMcMessage(formatted);
+        bridgeService.enqueuePlayerChat(playerName, msg);
     }
 
     @SubscribeEvent
     public void onPlayerLoggedIn(PlayerEvent.PlayerLoggedInEvent event) {
         BridgeService service = bridgeService;
 
-        if (service != null && service.isRunning()
-                && MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get()
-                && MatrixBridgeConfig.ENABLE_JOIN_LEAVE_TO_MATRIX.get()) {
-            String playerName = MC.playerName(event.getEntity());
-            String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "* " + playerName + " joined the game";
-            service.enqueueMcMessage(formatted);
+        if (service != null) {
+            service.enqueuePlayerJoinLeave(MC.playerName(event.getEntity()), true);
         }
 
-        if (service == null || !service.isReady()) {
+        String room = service == null ? null : service.connectedNoticeRoom();
+        if (room == null) {
             return;
         }
-        if (!MatrixBridgeConfig.ANNOUNCE_CONNECTED.get()) {
-            return;
-        }
-        String configured = MatrixBridgeConfig.ROOM_ID.get();
-        String roomId = (configured != null && configured.startsWith("#"))
-                ? configured
-                : service.getResolvedRoomId();
-        String room = (roomId == null || roomId.isBlank()) ? "<unknown>" : roomId;
         connectedRoomIdOrAlias = room;
         scheduleConnectedNotice(event.getEntity());
     }
@@ -389,16 +367,7 @@ public final class ForgeHooks {
         if (service == null || !service.isRunning()) {
             return;
         }
-        if (!MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get()) {
-            return;
-        }
-        if (!MatrixBridgeConfig.ENABLE_JOIN_LEAVE_TO_MATRIX.get()) {
-            return;
-        }
-
-        String playerName = MC.playerName(event.getEntity());
-        String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "* " + playerName + " left the game";
-        service.enqueueMcMessage(formatted);
+        service.enqueuePlayerJoinLeave(MC.playerName(event.getEntity()), false);
     }
 
     @SubscribeEvent
@@ -515,12 +484,11 @@ public final class ForgeHooks {
                         MC.sendFailure(ctx.getSource(), MC.text("MatrixBridge is not running."));
                         return 0;
                     }
-                    if (!MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get()) {
+                    if (bridgeService.isMcToMatrixDisabledByConfig()) {
                         MC.sendFailure(ctx.getSource(), MC.text("MC → Matrix is disabled (enableMcToMatrix=false)."));
                         return 0;
                     }
-                    String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "[TEST] " + Instant.now();
-                    boolean queued = bridgeService.enqueueMcMessage(formatted);
+                    boolean queued = bridgeService.enqueuePlayerTestMessage(Instant.now().toString());
                     if (queued) {
                         MC.sendSuccess(ctx.getSource(), MC.text("Queued test message."), false);
                         return 1;
@@ -605,7 +573,9 @@ public final class ForgeHooks {
                 MatrixBridgeConfig.ENABLE_EVENT_TAPS.get(),
                 MatrixBridgeConfig.MAX_ACTIVE_EVENT_TAPS.get(),
                 MatrixBridgeConfig.DEFAULT_EVENT_THROTTLE_MS.get(),
-                MatrixBridgeConfig.EVENT_COMMAND_MIN_POWER_LEVEL.get()
+                MatrixBridgeConfig.EVENT_COMMAND_MIN_POWER_LEVEL.get(),
+                MatrixBridgeConfig.ENABLE_JOIN_LEAVE_TO_MATRIX.get(),
+                MatrixBridgeConfig.ENABLE_SERVER_LIFECYCLE_TO_MATRIX.get()
         );
     }
 

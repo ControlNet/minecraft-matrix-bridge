@@ -219,6 +219,56 @@ public final class BridgeService {
         return s != null && !s.enableMcToMatrix;
     }
 
+    /*
+     * Player-facing notices are formatted from the settings this bridge was started with, like
+     * everything else it does, so editing the config file takes effect on the next reload only.
+     */
+
+    public boolean enqueuePlayerChat(String playerName, String message) {
+        return enqueuePrefixed("<" + playerName + "> " + message);
+    }
+
+    public boolean enqueuePlayerJoinLeave(String playerName, boolean joined) {
+        BridgeSettings s = settings;
+        if (s == null || !s.enableJoinLeaveToMatrix) {
+            return false;
+        }
+        return enqueuePrefixed("* " + playerName + (joined ? " joined the game" : " left the game"));
+    }
+
+    public boolean enqueueServerLifecycle(boolean started) {
+        BridgeSettings s = settings;
+        if (s == null || !s.enableServerLifecycleToMatrix) {
+            return false;
+        }
+        return enqueuePrefixed(started ? "* Server started." : "* Server stopping.");
+    }
+
+    public boolean enqueuePlayerTestMessage(String text) {
+        return enqueuePrefixed("[TEST] " + text);
+    }
+
+    private boolean enqueuePrefixed(String line) {
+        BridgeSettings s = settings;
+        if (s == null || !s.enableMcToMatrix) {
+            return false;
+        }
+        return enqueueMcMessage(s.mcToMatrixPrefix + line);
+    }
+
+    /**
+     * The room to name in a player's login notice, or null when no notice is due: the bridge is
+     * not ready, or it was started with announceConnected off.
+     */
+    public String connectedNoticeRoom() {
+        BridgeSettings s = settings;
+        if (s == null || !s.announceConnected || !isReady()) {
+            return null;
+        }
+        String room = s.roomId.startsWith("#") ? s.roomId : resolvedRoomId;
+        return (room == null || room.isBlank()) ? "<unknown>" : room;
+    }
+
     public boolean isRunning() {
         return running.get();
     }

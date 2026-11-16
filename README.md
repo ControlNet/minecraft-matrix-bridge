@@ -65,7 +65,7 @@ The 26.x projects use the dedicated Gradle 9 wrapper and are conditionally inclu
 - `dist/SHA256SUMS.txt`
 
 ## Configuration
-Edit `config/minecraftmatrixbridge.toml`:
+Edit `config/minecraftmatrixbridge.toml`. Changes made while the server is running take effect after `/matrix reload` or a restart.
 - `matrix.homeserver` (required) the client API base URL, e.g. `https://matrix.example.com`. If it returns 404 (for example when you entered the server name `https://example.com`), the bridge looks up `/.well-known/matrix/client` once (following redirects) and uses the delegated URL; otherwise it logs an error and keeps retrying, in case the homeserver is still starting.
 - `matrix.roomId` (required) room ID `!abcdef:example.com` or room alias `#myroom:example.com` (the room **should not be encrypted**)
 - `matrix.accessToken` (required, or use env variable `MATRIX_ACCESS_TOKEN`)

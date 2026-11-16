@@ -1160,6 +1160,91 @@ public class BridgeServiceTest {
         assertEquals(100, invalid.eventCommandMinPowerLevel);
     }
 
+    @Test
+    void playerNoticesUseTheSettingsTheBridgeStartedWith() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            // Bootstrap waits briefly, so all lines are queued before the sender starts.
+            server.setWhoamiRateLimit(1, 500);
+            BridgeService service = new BridgeService();
+            try {
+                // Join/leave off, lifecycle on.
+                BridgeSettings settings = new BridgeSettings(server.homeserverUrl(), roomId, "token", true, false, false,
+                        "[S] ", "[Matrix] ", "!mc", 0, 20, 100, 64, true, 10, 1000, 100, false, true);
+                service.start(settings, worldRoot, text -> { });
+                assertTrue(service.enqueueServerLifecycle(true));
+                assertTrue(service.enqueuePlayerChat("Steve", "hi"));
+                assertTrue(!service.enqueuePlayerJoinLeave("Steve", true), "join/leave notices are off");
+                assertTrue(service.enqueuePlayerTestMessage("ping"));
+                waitUntil(() -> !server.getSendRequests().isEmpty(), Duration.ofSeconds(3));
+                Thread.sleep(200);
+                assertEquals("[S] * Server started.\n[S] <Steve> hi\n[S] [TEST] ping",
+                        sentBody(server.getSendRequests().get(0)));
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void playerNoticesAreRefusedWhenTheBridgeStartedWithoutMcToMatrix() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            server.enqueueSyncResponse(roomId, "s0", new JsonArray());
+            BridgeService service = new BridgeService();
+            try {
+                service.start(syncOnlySettings(server, roomId), worldRoot, text -> { });
+                waitUntil(service::isReady, Duration.ofSeconds(2));
+                assertTrue(!service.enqueuePlayerChat("Steve", "hi"));
+                assertTrue(!service.enqueuePlayerJoinLeave("Steve", false));
+                assertTrue(!service.enqueueServerLifecycle(false));
+                assertTrue(!service.enqueuePlayerTestMessage("ping"));
+                assertEquals(0, service.getQueueSize());
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void connectedNoticeRoomFollowsTheStartupSettings() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            server.enqueueSyncResponse(roomId, "s0", new JsonArray());
+            server.enqueueSyncResponse(roomId, "s1", new JsonArray());
+            BridgeService quiet = new BridgeService();
+            try {
+                quiet.start(syncOnlySettings(server, roomId), worldRoot, text -> { });
+                waitUntil(quiet::isReady, Duration.ofSeconds(2));
+                assertEquals(null, quiet.connectedNoticeRoom(), "announceConnected was off at startup");
+            } finally {
+                quiet.stop();
+            }
+            BridgeService announcing = new BridgeService();
+            try {
+                assertEquals(null, announcing.connectedNoticeRoom(), "not started");
+                announcing.start(new BridgeSettings(server.homeserverUrl(), roomId, "token", false, true, true,
+                        "[MC] ", "[Matrix] ", "!mc", 0, 20, 100, 64), worldRoot, text -> { });
+                waitUntil(announcing::isReady, Duration.ofSeconds(2));
+                assertEquals(roomId, announcing.connectedNoticeRoom());
+            } finally {
+                announcing.stop();
+            }
+        }
+    }
+
+    @Test
+    void anEmptyMcToMatrixPrefixIsKept() {
+        BridgeSettings settings = new BridgeSettings("https://hs", "!r:hs", "t", true, true, true,
+                "", "[Matrix] ", "!mc", 0, 20, 10, 64);
+        assertEquals("", settings.mcToMatrixPrefix);
+        assertTrue(!settings.enableJoinLeaveToMatrix, "matches the config default");
+        assertTrue(!settings.enableServerLifecycleToMatrix, "matches the config default");
+    }
+
     private static String urlEncode(String value) {
         return URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20");
     }
