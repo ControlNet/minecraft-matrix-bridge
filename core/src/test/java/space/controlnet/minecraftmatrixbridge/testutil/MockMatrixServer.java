@@ -212,6 +212,38 @@ public final class MockMatrixServer implements AutoCloseable {
         sendErrorRemaining = Math.max(0, times);
     }
 
+    private volatile int directoryErrorRemaining;
+    private volatile int directoryErrorStatus;
+    private volatile String directoryErrorCode = "";
+    private volatile int joinErrorRemaining;
+    private volatile int joinErrorStatus;
+    private volatile String joinErrorCode = "";
+
+    /** Fail the next {@code times} alias lookups with {@code status} and Matrix {@code errcode} (blank: none). */
+    public void setDirectoryError(int times, int status, String errcode) {
+        directoryErrorStatus = status;
+        directoryErrorCode = errcode == null ? "" : errcode;
+        directoryErrorRemaining = Math.max(0, times);
+    }
+
+    /** Fail the next {@code times} joins with {@code status} and Matrix {@code errcode} (blank: none). */
+    public void setJoinError(int times, int status, String errcode) {
+        joinErrorStatus = status;
+        joinErrorCode = errcode == null ? "" : errcode;
+        joinErrorRemaining = Math.max(0, times);
+    }
+
+    private void respondInjectedError(HttpExchange exchange, int status, String errcode) throws IOException {
+        if (errcode.isBlank()) {
+            respondPlain(exchange, status, "");
+            return;
+        }
+        JsonObject body = new JsonObject();
+        body.addProperty("errcode", errcode);
+        body.addProperty("error", "mock error");
+        respondJson(exchange, status, body);
+    }
+
     public int pendingSyncErrors() {
         return syncErrorRemaining;
     }
@@ -446,6 +478,11 @@ public final class MockMatrixServer implements AutoCloseable {
                 ""
         ));
 
+        if (joinErrorRemaining > 0) {
+            joinErrorRemaining--;
+            respondInjectedError(exchange, joinErrorStatus, joinErrorCode);
+            return;
+        }
         if (join429Remaining > 0) {
             join429Remaining--;
             JsonObject body = new JsonObject();
@@ -514,6 +551,12 @@ public final class MockMatrixServer implements AutoCloseable {
                 exchange.getRequestHeaders().getFirst("Content-Type"),
                 ""
         ));
+
+        if (directoryErrorRemaining > 0) {
+            directoryErrorRemaining--;
+            respondInjectedError(exchange, directoryErrorStatus, directoryErrorCode);
+            return;
+        }
 
         String prefix = "/_matrix/client/v3/directory/room/";
         if (path == null || !path.startsWith(prefix)) {

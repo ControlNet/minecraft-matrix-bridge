@@ -66,6 +66,8 @@ public final class BridgeService {
 
     private volatile String selfUserId = "";
     private volatile String resolvedRoomId = "";
+    /** {@link System#nanoTime()} when the last fresh (token-less) sync was requested; null when resuming. */
+    private volatile Long freshSyncRequestedNanos;
     private volatile boolean announcedConnected = false;
     private volatile long lastQueueFullLogMs = 0;
     private volatile long lastTapQueueFullLogMs = 0;
@@ -316,13 +318,14 @@ public final class BridgeService {
                 return;
             }
             resolvedRoomId = roomId;
-            // A token is a position in this account's sync stream; reused for another room it
-            // would replay that room's messages since the token.
-            sinceStore.bindOwner(settings.homeserver + "|" + userId + "|" + roomId);
 
             if (!verifyJoinedRoomWithRetry(roomId)) {
                 return;
             }
+            // A token is a position in this account's sync stream; reused for another room it
+            // would replay that room's messages since the token. Joining may have landed in
+            // another room than the alias lookup named.
+            sinceStore.bindOwner(settings.homeserver + "|" + userId + "|" + resolvedRoomId);
 
             boolean receiving;
             synchronized (lifecycleLock) {
@@ -434,17 +437,22 @@ public final class BridgeService {
     /** Switches to the client API named by the configured URL's .well-known, if any. */
     private boolean useWellKnownClientApi() {
         MatrixClient current = matrixClient;
+        BridgeSettings active = settings;
+        if (current == null || active == null) {
+            return false;
+        }
+        MatrixClient configured = new MatrixClient(active.homeserver, active.accessToken);
         try {
-            String baseUrl = current.discoverClientBaseUrl();
+            String baseUrl = configured.discoverClientBaseUrl();
             if (baseUrl.isBlank() || baseUrl.equals(current.baseUrl())) {
                 return false;
             }
-            LOGGER.info("MatrixBridge: " + current.baseUrl() + " delegates the client API to " + baseUrl
+            LOGGER.info("MatrixBridge: " + configured.baseUrl() + " delegates the client API to " + baseUrl
                     + " (/.well-known/matrix/client); using it.");
-            matrixClient = new MatrixClient(baseUrl, settings.accessToken);
+            matrixClient = new MatrixClient(baseUrl, active.accessToken);
             return true;
         } catch (IOException e) {
-            LOGGER.warning("MatrixBridge could not read /.well-known/matrix/client from " + current.baseUrl() + ": " + e);
+            LOGGER.warning("MatrixBridge could not read /.well-known/matrix/client from " + configured.baseUrl() + ": " + e);
             return false;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -487,7 +495,7 @@ public final class BridgeService {
                     running.set(false);
                     return null;
                 }
-                if (e.statusCode == 404) {
+                if (e.statusCode == 404 && !isRetryable(e)) {
                     LOGGER.severe("Matrix resolveRoomAlias failed (HTTP 404). Check that the room alias is correct and the bot can access it: " + value);
                     running.set(false);
                     return null;
@@ -525,7 +533,7 @@ public final class BridgeService {
                     running.set(false);
                     return null;
                 }
-                if (e.statusCode >= 400 && e.statusCode < 500 && e.statusCode != 429) {
+                if (e.statusCode >= 400 && e.statusCode < 500 && !isRetryable(e)) {
                     LOGGER.severe("Matrix joinRoom failed (HTTP " + e.statusCode + "). Not invited or cannot join room " + roomIdOrAlias);
                     running.set(false);
                     return null;
@@ -701,6 +709,7 @@ public final class BridgeService {
     }
 
     private void syncLoop() {
+        freshSyncRequestedNanos = null;
         String roomId = resolvedRoomId;
         String filterJson = buildFilterJson(roomId, settings.timelineLimit);
         String since = sinceStore.loadSince();
@@ -791,7 +800,9 @@ public final class BridgeService {
         long backoffMs = 1_000;
         while (running.get()) {
             try {
+                long requested = System.nanoTime();
                 MatrixClient.SyncResult result = matrixClient.syncOnce("", 0, filterJson);
+                freshSyncRequestedNanos = requested;
                 if (result.nextBatch != null && !result.nextBatch.isBlank()) {
                     sinceStore.saveSince(result.nextBatch);
                     LOGGER.info("MatrixBridge initial sync complete; starting from next_batch.");
@@ -945,9 +956,27 @@ public final class BridgeService {
                 || "M_UNRECOGNIZED".equals(e.errcode);
     }
 
+    /**
+     * A fresh sync starts the bridge from the moment it was requested. Synapse may answer it with
+     * a recent identical response (e.g. after switching rooms and back), whose next_batch is older,
+     * so the following syncs can still carry messages sent before; unsigned.age says how long ago.
+     */
+    private boolean sentBeforeFreshSync(JsonObject evt) {
+        Long requested = freshSyncRequestedNanos;
+        JsonObject unsigned = getObject(evt, "unsigned");
+        JsonElement age = unsigned == null ? null : unsigned.get("age");
+        if (requested == null || age == null || !age.isJsonPrimitive() || !age.getAsJsonPrimitive().isNumber()) {
+            return false;
+        }
+        return age.getAsLong() > (System.nanoTime() - requested) / 1_000_000;
+    }
+
     private void forwardMatrixEvent(String roomId, JsonObject evt) {
         String type = getString(evt, "type");
         if (!"m.room.message".equals(type)) {
+            return;
+        }
+        if (sentBeforeFreshSync(evt)) {
             return;
         }
         String eventId = getString(evt, "event_id");

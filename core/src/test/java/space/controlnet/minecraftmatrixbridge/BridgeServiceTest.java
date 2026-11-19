@@ -1125,6 +1125,136 @@ public class BridgeServiceTest {
     }
 
     @Test
+    void theStoredTokenIsBoundToTheRoomActuallyJoined() throws Exception {
+        String roomAlias = "#lobby:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            // The alias lookup still names the old room; joining by alias lands in the new one.
+            server.setRoomAliasMapping(roomAlias, "!old:example.com");
+            server.setJoinableAlias(roomAlias, "!new:example.com");
+            JsonObject state = new JsonObject();
+            state.addProperty("owner", server.homeserverUrl() + "|@bot:example.com|!old:example.com");
+            state.addProperty("since", "s_old_room");
+            writeState(state);
+            server.enqueueSyncResponse("!new:example.com", "s0", new JsonArray());
+            BridgeService service = new BridgeService();
+            try {
+                service.start(new BridgeSettings(server.homeserverUrl(), roomAlias, "token", false, true, false,
+                        "[MC] ", "[Matrix] ", "!mc", 0, 20, 100, 64), worldRoot, text -> { });
+                waitUntil(service::isReady, Duration.ofSeconds(3));
+                assertEquals("!new:example.com", service.getResolvedRoomId());
+                assertEquals(null, queryParam(server.getSyncRequests().get(0).query(), "since"));
+                assertEquals(server.homeserverUrl() + "|@bot:example.com|!new:example.com",
+                        stateOnDisk().get("owner").getAsString());
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void aRefusedJoinKeepsTheTokenOfThePreviousRoom() throws Exception {
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            JsonObject state = new JsonObject();
+            state.addProperty("owner", server.homeserverUrl() + "|@bot:example.com|!old:example.com");
+            state.addProperty("since", "s_old_room");
+            writeState(state);
+            BridgeService service = new BridgeService();
+            try {
+                service.start(syncOnlySettings(server, "!private:example.com"), worldRoot, text -> { });
+                waitUntil(() -> server.joinCallCount() >= 1 && !service.isRunning(), Duration.ofSeconds(3));
+                assertEquals("s_old_room", stateOnDisk().get("since").getAsString());
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void transientAliasAndJoinErrorsAreRetried() throws Exception {
+        String roomAlias = "#lobby:example.com";
+        String roomId = "!lobby:example.com";
+        for (int[] statusAndKind : new int[][] {{404, 0}, {404, 1}, {408, 1}}) {
+            try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+                server.setRoomAliasMapping(roomAlias, roomId);
+                server.setJoinableAlias(roomAlias, roomId);
+                String errcode = statusAndKind[0] == 404 ? "M_UNRECOGNIZED" : "";
+                if (statusAndKind[1] == 0) {
+                    server.setDirectoryError(1, statusAndKind[0], errcode);
+                } else {
+                    server.setJoinError(1, statusAndKind[0], errcode);
+                }
+                BridgeService service = new BridgeService();
+                try {
+                    service.start(new BridgeSettings(server.homeserverUrl(), roomAlias, "token", true, false, false,
+                            "[MC] ", "[Matrix] ", "!mc", 10, 20, 100, 64), worldRoot, text -> { });
+                    waitUntil(service::isReady, Duration.ofSeconds(5));
+                    assertTrue(service.isReady(), (statusAndKind[1] == 0 ? "alias " : "join ") + statusAndKind[0]);
+                } finally {
+                    service.stop();
+                }
+            }
+        }
+    }
+
+    @Test
+    void delegationIsAlwaysLookedUpAtTheConfiguredUrl() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer retired = new MockMatrixServer("token", "@bot:example.com");
+             MockMatrixServer replacement = new MockMatrixServer("token", "@bot:example.com");
+             MockMatrixServer site = new MockMatrixServer("token", "@bot:example.com")) {
+            replacement.setJoinedRooms(List.of(roomId));
+            retired.setWhoamiNotFound(true);
+            site.setWhoamiNotFound(true);
+            site.setWellKnownBaseUrl(retired.homeserverUrl());
+            BridgeService service = new BridgeService();
+            try {
+                service.start(sendOnlySettings(site.homeserverUrl(), roomId, 10), worldRoot, text -> { });
+                waitUntil(() -> retired.whoamiCallCount() >= 1, Duration.ofSeconds(3));
+                site.setWellKnownBaseUrl(replacement.homeserverUrl());
+                waitUntil(service::isReady, Duration.ofSeconds(8));
+                assertTrue(service.isReady());
+                assertEquals(0, retired.wellKnownCallCount());
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void messagesSentBeforeAFreshSyncAreNotForwardedLater() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            // Synapse can answer a fresh sync from a recent identical one, whose next_batch
+            // predates messages sent since; they then arrive in the next sync.
+            server.enqueueSyncResponse(roomId, "s_cached", new JsonArray());
+            JsonObject old = matrixTextEvent("$old", "@alice:example.com", "sent before the switch");
+            JsonObject oldUnsigned = new JsonObject();
+            oldUnsigned.addProperty("age", 90_000);
+            old.add("unsigned", oldUnsigned);
+            JsonObject fresh = matrixTextEvent("$new", "@alice:example.com", "sent after");
+            JsonObject freshUnsigned = new JsonObject();
+            freshUnsigned.addProperty("age", 0);
+            fresh.add("unsigned", freshUnsigned);
+            JsonArray events = new JsonArray();
+            events.add(old);
+            events.add(fresh);
+            server.enqueueSyncResponse(roomId, "s1", events);
+            List<String> received = Collections.synchronizedList(new ArrayList<>());
+            BridgeService service = new BridgeService();
+            try {
+                service.start(syncOnlySettings(server, roomId), worldRoot, received::add);
+                waitUntil(() -> !received.isEmpty(), Duration.ofSeconds(3));
+                Thread.sleep(200);
+                assertEquals(1, received.size(), received.toString());
+                assertTrue(received.get(0).contains("sent after"), received.toString());
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
     void aBotReplyThatKeepsFailingIsLoggedAndDoesNotDelayTheNext() throws Exception {
         String roomId = "!room:example.com";
         List<String> warnings = Collections.synchronizedList(new ArrayList<>());
