@@ -34,11 +34,35 @@ public final class SinceStore {
     }
 
     public synchronized void saveSince(String since) {
+        saveSince(since, "");
+    }
+
+    /**
+     * Saves the token of a fresh (token-less) sync with the ID of the room's latest message at that
+     * time. The sync after it may still carry that message and older ones; {@link #saveSince(String)}
+     * clears the boundary once that sync was handled.
+     */
+    public synchronized void saveFreshSince(String since, String boundaryEventId) {
+        saveSince(since, boundaryEventId);
+    }
+
+    /** The latest message when the stored token came from a fresh sync, or empty. */
+    public synchronized String loadFreshBoundary() {
+        JsonElement boundary = loadStateObject().get("fresh_boundary");
+        return (boundary != null && boundary.isJsonPrimitive()) ? boundary.getAsString() : "";
+    }
+
+    private void saveSince(String since, String boundaryEventId) {
         JsonObject state = loadStateObject();
         if (since == null || since.isBlank()) {
             state.remove("since");
         } else {
             state.addProperty("since", since);
+        }
+        if (since == null || since.isBlank() || boundaryEventId == null || boundaryEventId.isBlank()) {
+            state.remove("fresh_boundary");
+        } else {
+            state.addProperty("fresh_boundary", boundaryEventId);
         }
         atomicWrite(state);
     }
@@ -65,6 +89,7 @@ public final class SinceStore {
         if (!kept) {
             LOGGER.info("MatrixBridge homeserver, account or room changed; discarding the stored sync token");
             state.remove("since");
+            state.remove("fresh_boundary");
         }
         if (!kept || stored == null || !owner.equals(stored.getAsString())) {
             state.addProperty("owner", owner);

@@ -26,6 +26,7 @@ import java.util.logging.LogRecord;
 import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class BridgeServiceTest {
@@ -1018,6 +1019,15 @@ public class BridgeServiceTest {
         }
     }
 
+    private String sinceOnDisk() {
+        try {
+            JsonObject state = stateOnDisk();
+            return state.has("since") ? state.get("since").getAsString() : "";
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
     private JsonObject stateOnDisk() throws Exception {
         Path statePath = worldRoot.resolve("data").resolve("minecraftmatrixbridge").resolve("state.json");
         return JsonParser.parseString(Files.readString(statePath, StandardCharsets.UTF_8)).getAsJsonObject();
@@ -1228,26 +1238,101 @@ public class BridgeServiceTest {
             // Synapse can answer a fresh sync from a recent identical one, whose next_batch
             // predates messages sent since; they then arrive in the next sync.
             server.enqueueSyncResponse(roomId, "s_cached", new JsonArray());
-            JsonObject old = matrixTextEvent("$old", "@alice:example.com", "sent before the switch");
-            JsonObject oldUnsigned = new JsonObject();
-            oldUnsigned.addProperty("age", 90_000);
-            old.add("unsigned", oldUnsigned);
-            JsonObject fresh = matrixTextEvent("$new", "@alice:example.com", "sent after");
-            JsonObject freshUnsigned = new JsonObject();
-            freshUnsigned.addProperty("age", 0);
-            fresh.add("unsigned", freshUnsigned);
+            JsonArray latest = new JsonArray();
+            latest.add(matrixTextEvent("$old", "@alice:example.com", "sent before the switch"));
+            server.setMessagesPage("", latest, "");
             JsonArray events = new JsonArray();
-            events.add(old);
-            events.add(fresh);
+            events.add(matrixTextEvent("$older", "@alice:example.com", "sent long before"));
+            events.add(matrixTextEvent("$old", "@alice:example.com", "sent before the switch"));
+            events.add(matrixTextEvent("$new", "@alice:example.com", "sent after"));
             server.enqueueSyncResponse(roomId, "s1", events);
             List<String> received = Collections.synchronizedList(new ArrayList<>());
             BridgeService service = new BridgeService();
             try {
                 service.start(syncOnlySettings(server, roomId), worldRoot, received::add);
                 waitUntil(() -> !received.isEmpty(), Duration.ofSeconds(3));
-                Thread.sleep(200);
+                waitUntil(() -> "s1".equals(sinceOnDisk()), Duration.ofSeconds(3));
                 assertEquals(1, received.size(), received.toString());
                 assertTrue(received.get(0).contains("sent after"), received.toString());
+                assertFalse(stateOnDisk().has("fresh_boundary"), "only the first sync after a fresh one is trimmed");
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void theFreshSyncBoundarySurvivesARestart() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            // Stopped after the fresh sync, before the sync that carries the older messages.
+            JsonObject state = new JsonObject();
+            state.addProperty("since", "s_cached");
+            state.addProperty("fresh_boundary", "$old");
+            writeState(state);
+            JsonArray events = new JsonArray();
+            events.add(matrixTextEvent("$old", "@alice:example.com", "sent before the switch"));
+            events.add(matrixTextEvent("$new", "@alice:example.com", "sent after"));
+            server.enqueueSyncResponse(roomId, "s1", events);
+            JsonArray later = new JsonArray();
+            later.add(matrixTextEvent("$later", "@alice:example.com", "next message"));
+            server.enqueueSyncResponse(roomId, "s2", later);
+            List<String> received = Collections.synchronizedList(new ArrayList<>());
+            BridgeService service = new BridgeService();
+            try {
+                service.start(syncOnlySettings(server, roomId), worldRoot, received::add);
+                waitUntil(() -> received.size() >= 2, Duration.ofSeconds(3));
+                assertEquals(2, received.size(), received.toString());
+                assertTrue(received.get(0).contains("sent after"), received.toString());
+                assertTrue(received.get(1).contains("next message"), received.toString());
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void anUnreachableDelegateIsReplacedWhenTheDelegationChanges() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer retired = new MockMatrixServer("token", "@bot:example.com");
+             MockMatrixServer replacement = new MockMatrixServer("token", "@bot:example.com");
+             MockMatrixServer site = new MockMatrixServer("token", "@bot:example.com")) {
+            replacement.setJoinedRooms(List.of(roomId));
+            retired.setWhoamiError(503);
+            site.setWhoamiNotFound(true);
+            site.setWellKnownBaseUrl(retired.homeserverUrl());
+            BridgeService service = new BridgeService();
+            try {
+                service.start(sendOnlySettings(site.homeserverUrl(), roomId, 10), worldRoot, text -> { });
+                waitUntil(() -> retired.whoamiCallCount() >= 1, Duration.ofSeconds(3));
+                site.setWellKnownBaseUrl(replacement.homeserverUrl());
+                waitUntil(service::isReady, Duration.ofSeconds(8));
+                assertTrue(service.isReady());
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void theConfiguredUrlIsUsedAgainWhenItsDelegationIsRemoved() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer retired = new MockMatrixServer("token", "@bot:example.com");
+             MockMatrixServer site = new MockMatrixServer("token", "@bot:example.com")) {
+            site.setJoinedRooms(List.of(roomId));
+            retired.setWhoamiNotFound(true);
+            site.setWhoamiNotFound(true);
+            site.setWellKnownBaseUrl(retired.homeserverUrl());
+            BridgeService service = new BridgeService();
+            try {
+                service.start(sendOnlySettings(site.homeserverUrl(), roomId, 10), worldRoot, text -> { });
+                waitUntil(() -> retired.whoamiCallCount() >= 1, Duration.ofSeconds(3));
+                // The configured URL now serves the client API itself.
+                site.setWellKnownBaseUrl("");
+                site.setWhoamiNotFound(false);
+                waitUntil(service::isReady, Duration.ofSeconds(8));
+                assertTrue(service.isReady());
             } finally {
                 service.stop();
             }

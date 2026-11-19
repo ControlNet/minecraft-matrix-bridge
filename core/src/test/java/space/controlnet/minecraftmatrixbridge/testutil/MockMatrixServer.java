@@ -156,6 +156,13 @@ public final class MockMatrixServer implements AutoCloseable {
         whoamiNotFound = notFound;
     }
 
+    private volatile int whoamiErrorStatus;
+
+    /** Answer every whoami with {@code status} (0 turns it off), like a retired endpoint. */
+    public void setWhoamiError(int status) {
+        whoamiErrorStatus = status;
+    }
+
     /** Serves {@code /.well-known/matrix/client} pointing at {@code baseUrl}; blank means 404. */
     public void setWellKnownBaseUrl(String baseUrl) {
         wellKnownBaseUrl = baseUrl == null ? "" : baseUrl;
@@ -374,6 +381,10 @@ public final class MockMatrixServer implements AutoCloseable {
 
         if (whoamiNotFound) {
             respondPlain(exchange, 404, "<html>Not Found</html>");
+            return;
+        }
+        if (whoamiErrorStatus > 0) {
+            respondPlain(exchange, whoamiErrorStatus, "");
             return;
         }
 

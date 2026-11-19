@@ -633,9 +633,10 @@ public final class MatrixClient {
      */
     public MessagesPage roomMessagesBackwards(String roomId, String from, String to, int limit, String filterJson)
             throws IOException, InterruptedException, MatrixException {
+        // Without "from" the page starts at the latest event.
         String uri = roomPath(roomId) + "/messages?dir=b"
-                + "&from=" + urlEncodeQuery(from)
-                + "&to=" + urlEncodeQuery(to)
+                + (from == null || from.isBlank() ? "" : "&from=" + urlEncodeQuery(from))
+                + (to == null || to.isBlank() ? "" : "&to=" + urlEncodeQuery(to))
                 + "&limit=" + limit
                 + "&filter=" + urlEncodeQuery(filterJson);
         JsonObject response = getJson(uri, "messages");

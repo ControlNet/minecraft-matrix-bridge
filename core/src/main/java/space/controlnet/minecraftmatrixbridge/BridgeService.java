@@ -66,8 +66,12 @@ public final class BridgeService {
 
     private volatile String selfUserId = "";
     private volatile String resolvedRoomId = "";
-    /** {@link System#nanoTime()} when the last fresh (token-less) sync was requested; null when resuming. */
-    private volatile Long freshSyncRequestedNanos;
+    /**
+     * The room's latest message when the current token came from a fresh sync. Synapse may answer
+     * a fresh sync with a recent identical response (e.g. after switching rooms and back) whose
+     * next_batch is older, so the sync after it can carry messages up to this one; they are skipped.
+     */
+    private volatile String freshBoundaryEventId = "";
     private volatile boolean announcedConnected = false;
     private volatile long lastQueueFullLogMs = 0;
     private volatile long lastTapQueueFullLogMs = 0;
@@ -385,6 +389,7 @@ public final class BridgeService {
     private String resolveSelfUserIdWithRetry() {
         long backoffMs = 1_000;
         boolean loggedNotFound = false;
+        boolean switched = false;
         while (running.get()) {
             try {
                 return matrixClient.whoami();
@@ -394,16 +399,16 @@ public final class BridgeService {
                     running.set(false);
                     return null;
                 }
-                if (e.statusCode == 404) {
-                    // The URL may be the server name rather than the client API, whose
-                    // delegation may itself not be served yet. It may also be a reverse proxy
-                    // whose route is not up yet. Look again on every retry; hint once.
-                    if (useWellKnownClientApi()) {
-                        continue;
-                    }
-                    if (Thread.currentThread().isInterrupted()) {
-                        return null;
-                    }
+                // The URL may be the server name rather than the client API, whose delegation may
+                // not be served yet or may have moved. It may also be a reverse proxy whose route
+                // is not up yet. Look again on every retry; hint once. Only the first switch skips
+                // the backoff, so a flapping delegation cannot spin.
+                if (useWellKnownClientApi() && !switched) {
+                    switched = true;
+                    continue;
+                }
+                if (Thread.currentThread().isInterrupted()) {
+                    return null;
                 }
                 if (e.statusCode == 404 && !loggedNotFound) {
                     loggedNotFound = true;
@@ -417,6 +422,10 @@ public final class BridgeService {
                 sleepMs(sleepMs);
                 backoffMs = nextBackoff(backoffMs);
             } catch (IOException e) {
+                if (useWellKnownClientApi() && !switched) {
+                    switched = true;
+                    continue;
+                }
                 long sleepMs = jitter(backoffMs);
                 LOGGER.warning("Matrix whoami network error (" + e + "); retrying in " + sleepMs + " ms.");
                 sleepMs(sleepMs);
@@ -434,7 +443,10 @@ public final class BridgeService {
         return null;
     }
 
-    /** Switches to the client API named by the configured URL's .well-known, if any. */
+    /**
+     * Switches to the client API that the configured URL's .well-known names, or back to the
+     * configured URL when it no longer delegates. Returns true when the endpoint changed.
+     */
     private boolean useWellKnownClientApi() {
         MatrixClient current = matrixClient;
         BridgeSettings active = settings;
@@ -443,13 +455,19 @@ public final class BridgeService {
         }
         MatrixClient configured = new MatrixClient(active.homeserver, active.accessToken);
         try {
-            String baseUrl = configured.discoverClientBaseUrl();
-            if (baseUrl.isBlank() || baseUrl.equals(current.baseUrl())) {
+            String delegated = configured.discoverClientBaseUrl();
+            String baseUrl = delegated.isBlank() ? configured.baseUrl() : delegated;
+            if (baseUrl.equals(current.baseUrl())) {
                 return false;
             }
-            LOGGER.info("MatrixBridge: " + configured.baseUrl() + " delegates the client API to " + baseUrl
-                    + " (/.well-known/matrix/client); using it.");
-            matrixClient = new MatrixClient(baseUrl, active.accessToken);
+            if (delegated.isBlank()) {
+                LOGGER.info("MatrixBridge: " + configured.baseUrl() + " no longer delegates the client API; using it directly.");
+                matrixClient = configured;
+            } else {
+                LOGGER.info("MatrixBridge: " + configured.baseUrl() + " delegates the client API to " + baseUrl
+                        + " (/.well-known/matrix/client); using it.");
+                matrixClient = new MatrixClient(baseUrl, active.accessToken);
+            }
             return true;
         } catch (IOException e) {
             LOGGER.warning("MatrixBridge could not read /.well-known/matrix/client from " + configured.baseUrl() + ": " + e);
@@ -709,10 +727,10 @@ public final class BridgeService {
     }
 
     private void syncLoop() {
-        freshSyncRequestedNanos = null;
         String roomId = resolvedRoomId;
         String filterJson = buildFilterJson(roomId, settings.timelineLimit);
         String since = sinceStore.loadSince();
+        freshBoundaryEventId = sinceStore.loadFreshBoundary();
 
         if (since == null || since.isBlank()) {
             since = initialCatchup(filterJson);
@@ -736,6 +754,7 @@ public final class BridgeService {
                 if (!forwardMatrixMessages(result, since)) {
                     continue;
                 }
+                freshBoundaryEventId = "";
                 if (result.nextBatch != null && !result.nextBatch.isBlank()) {
                     since = result.nextBatch;
                     sinceStore.saveSince(since);
@@ -800,11 +819,11 @@ public final class BridgeService {
         long backoffMs = 1_000;
         while (running.get()) {
             try {
-                long requested = System.nanoTime();
                 MatrixClient.SyncResult result = matrixClient.syncOnce("", 0, filterJson);
-                freshSyncRequestedNanos = requested;
                 if (result.nextBatch != null && !result.nextBatch.isBlank()) {
-                    sinceStore.saveSince(result.nextBatch);
+                    String boundary = latestMessageId();
+                    freshBoundaryEventId = boundary;
+                    sinceStore.saveFreshSince(result.nextBatch, boundary);
                     LOGGER.info("MatrixBridge initial sync complete; starting from next_batch.");
                     return result.nextBatch;
                 }
@@ -876,6 +895,16 @@ public final class BridgeService {
         if (timelineEvents != null) {
             timelineEvents.forEach(events::add);
         }
+        String boundary = freshBoundaryEventId;
+        if (!boundary.isBlank()) {
+            for (int i = events.size() - 1; i >= 0; i--) {
+                JsonElement el = events.get(i);
+                if (el != null && el.isJsonObject() && boundary.equals(getString(el.getAsJsonObject(), "event_id"))) {
+                    events.subList(0, i + 1).clear();
+                    break;
+                }
+            }
+        }
 
         for (JsonElement el : events) {
             if (!running.get()) {
@@ -928,6 +957,20 @@ public final class BridgeService {
         return newestFirst;
     }
 
+    /** The room's latest message ID, or empty when there is none or it cannot be read now. */
+    private String latestMessageId() throws InterruptedException {
+        try {
+            MatrixClient.MessagesPage page = fetchBackfillPage(resolvedRoomId, "", "", 1,
+                    "{\"types\":[\"m.room.message\"]}");
+            JsonElement latest = page.chunk.isEmpty() ? null : page.chunk.get(0);
+            return latest != null && latest.isJsonObject() ? getString(latest.getAsJsonObject(), "event_id") : "";
+        } catch (IOException | MatrixClient.MatrixException e) {
+            LOGGER.warning("MatrixBridge could not read the room's latest message after a fresh sync (" + e
+                    + "); messages sent shortly before it may be forwarded.");
+            return "";
+        }
+    }
+
     /** One page, retried briefly on timeouts, rate limits and server errors. */
     private MatrixClient.MessagesPage fetchBackfillPage(String roomId, String from, String to, int limit, String filter)
             throws IOException, InterruptedException, MatrixClient.MatrixException {
@@ -956,27 +999,9 @@ public final class BridgeService {
                 || "M_UNRECOGNIZED".equals(e.errcode);
     }
 
-    /**
-     * A fresh sync starts the bridge from the moment it was requested. Synapse may answer it with
-     * a recent identical response (e.g. after switching rooms and back), whose next_batch is older,
-     * so the following syncs can still carry messages sent before; unsigned.age says how long ago.
-     */
-    private boolean sentBeforeFreshSync(JsonObject evt) {
-        Long requested = freshSyncRequestedNanos;
-        JsonObject unsigned = getObject(evt, "unsigned");
-        JsonElement age = unsigned == null ? null : unsigned.get("age");
-        if (requested == null || age == null || !age.isJsonPrimitive() || !age.getAsJsonPrimitive().isNumber()) {
-            return false;
-        }
-        return age.getAsLong() > (System.nanoTime() - requested) / 1_000_000;
-    }
-
     private void forwardMatrixEvent(String roomId, JsonObject evt) {
         String type = getString(evt, "type");
         if (!"m.room.message".equals(type)) {
-            return;
-        }
-        if (sentBeforeFreshSync(evt)) {
             return;
         }
         String eventId = getString(evt, "event_id");
