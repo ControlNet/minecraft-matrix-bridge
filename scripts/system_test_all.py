@@ -679,6 +679,17 @@ def installed_server_command(java: str, run_dir: Path, coordinate: str) -> list[
     raise FileNotFoundError(f"Installer did not generate {args_file} or a matching Forge shim JAR")
 
 
+LOADER_COORDINATE_RE = re.compile(r"\d+(?:\.\d+)+(?:-[A-Za-z0-9]+(?:\.\d+)*)?")
+
+
+def coordinate_run_dir(base: Path, loader_coordinate: str) -> Path:
+    """Per-loader-version run directory under base. Its contents are deleted before each
+    run, so only a plain version string (no separators, no "..") is accepted."""
+    if not LOADER_COORDINATE_RE.fullmatch(loader_coordinate or ""):
+        raise ValueError(f"Invalid loader coordinate: {loader_coordinate!r}")
+    return base / loader_coordinate
+
+
 def run_one(module: str, timeout_s: int, packaged: bool = False,
             loader_coordinate: str | None = None, artifact_dir: Path | None = None) -> None:
     root = Path(__file__).resolve().parents[1]
@@ -696,7 +707,7 @@ def run_one(module: str, timeout_s: int, packaged: bool = False,
     run_dir = root / module / "run-systemtest"
     if loader_coordinate:
         # Keep cross-patch test logs separate from the default server test.
-        run_dir = run_dir / loader_coordinate
+        run_dir = coordinate_run_dir(run_dir, loader_coordinate)
 
     # Make each run clean and deterministic.
     if run_dir.exists():
@@ -884,7 +895,7 @@ def main() -> int:
     if args.loader_coordinate:
         if not args.packaged or len(args.modules) != 1:
             parser.error("--loader-coordinate requires --packaged and exactly one module")
-        if not re.fullmatch(r"\d+(?:\.\d+)+(?:-[A-Za-z0-9]+(?:\.\d+)*)?", args.loader_coordinate):
+        if not LOADER_COORDINATE_RE.fullmatch(args.loader_coordinate):
             parser.error("Invalid loader coordinate")
 
     for module in args.modules:

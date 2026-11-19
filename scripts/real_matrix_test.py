@@ -509,12 +509,10 @@ def run_one(
 ) -> None:
     if module not in system_test_all.MODULE_EVENT_ALIASES:
         raise ValueError(f"Unknown real Matrix test module: {module}")
-    if not loader_coordinate:
-        raise ValueError("A loader coordinate is required for packaged real Matrix tests")
     validate_synapse_image(synapse_image)
 
     root = Path(__file__).resolve().parents[1]
-    run_dir = root / module / "run-realmatrixtest" / loader_coordinate
+    run_dir = system_test_all.coordinate_run_dir(root / module / "run-realmatrixtest", loader_coordinate)
     if run_dir.exists():
         shutil.rmtree(run_dir)
     system_test_all.ensure_eula(run_dir)
