@@ -34,6 +34,9 @@ public final class BridgeService {
     /** Longer Matrix messages are cut so one remote user cannot flood Minecraft chat. */
     static final int MAX_MATRIX_TO_MC_CHARS = 512;
     /** A sync gap (limited timeline) is filled with at most this many pages of history. */
+    /** "> <@user:server>" or, for an emote, "> * <@user:server>". */
+    private static final java.util.regex.Pattern REPLY_FALLBACK_START =
+            java.util.regex.Pattern.compile("> (\\* )?<@[^\\s:>]+:[^\\s>]+>");
     private static final int MAX_BACKFILL_EVENTS = 1000;
     // Pages may be empty (the server filters them after reading), so requests are capped separately.
     private static final int MAX_BACKFILL_REQUESTS = 50;
@@ -646,7 +649,8 @@ public final class BridgeService {
                         sleepMs(60_000);
                         break;
                     }
-                    if (e.statusCode >= 500) {
+                    if (isRetryable(e)) {
+                        // The transaction ID stays the same, so a retry cannot post the batch twice.
                         long sleepMs = jitter(backoffMs);
                         LOGGER.warning("Matrix send failed (" + e.getMessage() + "); retrying in " + sleepMs + " ms.");
                         sleepMs(sleepMs);
@@ -734,8 +738,10 @@ public final class BridgeService {
                     // permanently invalid; retrying it would stall Matrix -> MC forever.
                     LOGGER.warning("Matrix rejected the stored sync token (" + e.getMessage() + "); starting a fresh sync.");
                     sinceStore.saveSince("");
-                    // Messages sent before the fresh sync completes are skipped by it.
+                    // Messages sent before the fresh sync completes are skipped by it. Login
+                    // notices are held meanwhile, so announce again once it is done.
                     ready.set(false);
+                    announcedConnected = false;
                     since = initialCatchup(filterJson);
                     markReady();
                     backoffMs = 1_000;
@@ -877,7 +883,8 @@ public final class BridgeService {
         for (int request = 0; request < MAX_BACKFILL_REQUESTS && newestFirst.size() < MAX_BACKFILL_EVENTS; request++) {
             MatrixClient.MessagesPage result;
             try {
-                result = fetchBackfillPage(roomId, from, previousSince, filter);
+                int limit = Math.min(BACKFILL_PAGE_SIZE, MAX_BACKFILL_EVENTS - newestFirst.size());
+                result = fetchBackfillPage(roomId, from, previousSince, limit, filter);
             } catch (MatrixClient.MatrixException e) {
                 if (!isRetryable(e)) {
                     // The room or token is refused: forward what the sync returned rather than stall on the gap.
@@ -886,7 +893,11 @@ public final class BridgeService {
                 }
                 throw e;
             }
-            result.chunk.forEach(newestFirst::add);
+            for (JsonElement event : result.chunk) {
+                if (newestFirst.size() < MAX_BACKFILL_EVENTS) {
+                    newestFirst.add(event);
+                }
+            }
             // An empty page does not end pagination: only a missing or repeated end token does.
             if (result.end.isBlank() || result.end.equals(from)) {
                 Collections.reverse(newestFirst);
@@ -901,12 +912,12 @@ public final class BridgeService {
     }
 
     /** One page, retried briefly on timeouts, rate limits and server errors. */
-    private MatrixClient.MessagesPage fetchBackfillPage(String roomId, String from, String to, String filter)
+    private MatrixClient.MessagesPage fetchBackfillPage(String roomId, String from, String to, int limit, String filter)
             throws IOException, InterruptedException, MatrixClient.MatrixException {
         long backoffMs = 1_000;
         for (int attempt = 1; ; attempt++) {
             try {
-                return matrixClient.roomMessagesBackwards(roomId, from, to, BACKFILL_PAGE_SIZE, filter);
+                return matrixClient.roomMessagesBackwards(roomId, from, to, limit, filter);
             } catch (MatrixClient.MatrixException e) {
                 if (!isRetryable(e) || attempt >= BACKFILL_PAGE_ATTEMPTS || !running.get()) {
                     throw e;
@@ -922,8 +933,10 @@ public final class BridgeService {
         }
     }
 
+    /** Errors about this request, not about the room or token: the same request can succeed later. */
     private static boolean isRetryable(MatrixClient.MatrixException e) {
-        return e.statusCode == 408 || e.statusCode == 429 || e.statusCode >= 500;
+        return e.statusCode == 408 || e.statusCode == 429 || e.statusCode >= 500
+                || "M_UNRECOGNIZED".equals(e.errcode);
     }
 
     private void forwardMatrixEvent(String roomId, JsonObject evt) {
@@ -1004,12 +1017,16 @@ public final class BridgeService {
      * that clients put in front of a reply's text.
      */
     static String stripReplyFallback(String body) {
-        // The fallback opens with the quoted sender's user ID and ends with a blank line;
+        if (body == null) {
+            return null;
+        }
+        // The fallback opens with the quoted sender's full user ID and ends with a blank line;
         // anything else is text the user typed.
-        if (body == null || !(body.startsWith("> <@") || body.startsWith("> * <@"))) {
+        String text = body.replace("\r\n", "\n");
+        if (!REPLY_FALLBACK_START.matcher(text).lookingAt()) {
             return body;
         }
-        String[] lines = body.split("\n", -1);
+        String[] lines = text.split("\n", -1);
         int i = 0;
         while (i < lines.length && lines[i].startsWith(">")) {
             i++;
@@ -1186,8 +1203,8 @@ public final class BridgeService {
                 client.sendText(roomId, text, transactionId);
                 return;
             } catch (MatrixClient.MatrixException e) {
-                if (e.statusCode == 429) {
-                    long sleepMs = e.retryAfterMs > 0 ? e.retryAfterMs : jitter(backoffMs);
+                if (isRetryable(e)) {
+                    long sleepMs = e.statusCode == 429 && e.retryAfterMs > 0 ? e.retryAfterMs : jitter(backoffMs);
                     sleepMs(sleepMs);
                     backoffMs = nextBackoff(backoffMs);
                     continue;

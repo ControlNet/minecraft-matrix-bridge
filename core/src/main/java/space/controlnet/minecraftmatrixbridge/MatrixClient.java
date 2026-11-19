@@ -11,9 +11,14 @@ import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.HashSet;
@@ -53,6 +58,39 @@ public final class MatrixClient {
         return HttpRequest.newBuilder().timeout(requestTimeout);
     }
 
+    /**
+     * Sends {@code request} and reads the whole body within its timeout. HttpClient applies the
+     * request timeout only until the response headers arrive, so a body that stalls part-way
+     * (e.g. behind a proxy) would otherwise block the caller indefinitely.
+     */
+    private static HttpResponse<String> send(HttpClient client, HttpRequest request)
+            throws IOException, InterruptedException {
+        CompletableFuture<HttpResponse<String>> future =
+                client.sendAsync(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        long timeoutMs = request.timeout().orElse(Duration.ofSeconds(30)).toMillis();
+        try {
+            return future.get(timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            future.cancel(true);
+            throw new HttpTimeoutException("Matrix request timed out after " + timeoutMs + " ms");
+        } catch (InterruptedException e) {
+            future.cancel(true);
+            throw e;
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof IOException io) {
+                throw io;
+            }
+            if (cause instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            throw new IOException(cause);
+        }
+    }
+
     String baseUrl() {
         return homeserver;
     }
@@ -73,7 +111,7 @@ public final class MatrixClient {
                 .connectTimeout(Duration.ofSeconds(10))
                 .followRedirects(HttpClient.Redirect.NORMAL)
                 .build();
-        HttpResponse<String> response = discovery.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response = send(discovery, request);
         if (response.statusCode() / 100 != 2) {
             return "";
         }
@@ -102,7 +140,7 @@ public final class MatrixClient {
                 .GET()
                 .build();
 
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response = send(http, request);
         if (response.statusCode() / 100 != 2) {
             throw toException("whoami", response);
         }
@@ -124,7 +162,7 @@ public final class MatrixClient {
                 .GET()
                 .build();
 
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response = send(http, request);
         if (response.statusCode() / 100 != 2) {
             throw toException("resolveRoomAlias", response);
         }
@@ -144,7 +182,7 @@ public final class MatrixClient {
                 .GET()
                 .build();
 
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response = send(http, request);
         if (response.statusCode() / 100 != 2) {
             throw toException("joined_rooms", response);
         }
@@ -184,7 +222,7 @@ public final class MatrixClient {
                 .POST(HttpRequest.BodyPublishers.noBody())
                 .build();
 
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response = send(http, request);
         if (response.statusCode() / 100 != 2) {
             throw toException("joinRoom", response);
         }
@@ -219,7 +257,7 @@ public final class MatrixClient {
                 .GET()
                 .build();
 
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response = send(http, request);
         int status = response.statusCode();
         if (status != 404 && status / 100 != 2) {
             throw toException("power_levels", response);
@@ -343,7 +381,7 @@ public final class MatrixClient {
                 .header("Authorization", "Bearer " + accessToken)
                 .GET()
                 .build();
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response = send(http, request);
         if (response.statusCode() / 100 != 2) {
             throw toException(op, response);
         }
@@ -389,7 +427,7 @@ public final class MatrixClient {
                 .GET()
                 .build();
 
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response = send(http, request);
         int status = response.statusCode();
         if (status == 404) {
             cacheDisplayName(key, "", now);
@@ -439,7 +477,7 @@ public final class MatrixClient {
                 .PUT(HttpRequest.BodyPublishers.ofString(body.toString(), StandardCharsets.UTF_8))
                 .build();
 
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response = send(http, request);
         if (response.statusCode() / 100 != 2) {
             throw toException("sendText", response);
         }
@@ -465,7 +503,7 @@ public final class MatrixClient {
                 .GET()
                 .build();
 
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response = send(http, request);
         if (response.statusCode() / 100 != 2) {
             throw toException("sync", response);
         }

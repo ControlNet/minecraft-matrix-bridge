@@ -42,7 +42,6 @@ public final class NeoForgeHooks {
     private volatile McCallbacks callbacks;
     private volatile EventTapManager eventTapManager;
     private volatile MinecraftServer runningServer;
-    private volatile String connectedRoomIdOrAlias = "";
     private final ConcurrentHashMap<UUID, Integer> pendingConnectedNoticeTicks = new ConcurrentHashMap<>();
 
     private void closeEventTapManager() {
@@ -80,8 +79,6 @@ public final class NeoForgeHooks {
                 if (s == null) {
                     return;
                 }
-                String room = (roomIdOrAlias == null || roomIdOrAlias.isBlank()) ? "<unknown>" : roomIdOrAlias;
-                connectedRoomIdOrAlias = room;
                 s.execute(() -> {
                     for (ServerPlayer p : s.getPlayerList().getPlayers()) {
                         scheduleConnectedNotice(p);
@@ -162,7 +159,6 @@ public final class NeoForgeHooks {
         bridgeService = null;
         closeEventTapManager();
         runningServer = null;
-        connectedRoomIdOrAlias = "";
         pendingConnectedNoticeTicks.clear();
         if (service != null) {
             if (announceStopping && service.enqueueServerLifecycle(false)) {
@@ -215,7 +211,6 @@ public final class NeoForgeHooks {
         if (room == null) {
             return;
         }
-        connectedRoomIdOrAlias = room;
         scheduleConnectedNotice(event.getEntity());
     }
 
@@ -229,9 +224,13 @@ public final class NeoForgeHooks {
             return;
         }
 
-        String room = connectedRoomIdOrAlias;
-        if (room == null || room.isBlank()) {
-            room = "<unknown>";
+        // Asked at send time: while the bridge is not receiving (e.g. replacing a rejected sync
+        // token) queued notices are dropped, and it announces again to everyone once it is.
+        BridgeService service = bridgeService;
+        String room = service == null ? null : service.connectedNoticeRoom();
+        if (room == null) {
+            pendingConnectedNoticeTicks.clear();
+            return;
         }
 
         for (Map.Entry<UUID, Integer> e : pendingConnectedNoticeTicks.entrySet()) {
@@ -343,8 +342,6 @@ public final class NeoForgeHooks {
                             if (s == null) {
                                 return;
                             }
-                            String room = (roomIdOrAlias == null || roomIdOrAlias.isBlank()) ? "<unknown>" : roomIdOrAlias;
-                            connectedRoomIdOrAlias = room;
                             s.execute(() -> {
                                 for (ServerPlayer p : s.getPlayerList().getPlayers()) {
                                     scheduleConnectedNotice(p);

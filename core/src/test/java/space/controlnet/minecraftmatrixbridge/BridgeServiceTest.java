@@ -1282,6 +1282,9 @@ public class BridgeServiceTest {
         assertEquals("> <dependency> is optional", BridgeService.stripReplyFallback("> <dependency> is optional"));
         // A fallback is always followed by a blank line and the reply itself.
         assertEquals("> <@bob:example.com> only a quote", BridgeService.stripReplyFallback("> <@bob:example.com> only a quote"));
+        // A hand-written quote that only looks like the start of a user ID stays.
+        assertEquals("> <@note\n\nsecond", BridgeService.stripReplyFallback("> <@note\n\nsecond"));
+        assertEquals("my answer", BridgeService.stripReplyFallback("> <@bob:example.com> original\r\n\r\nmy answer"));
     }
 
     @Test
@@ -1430,16 +1433,106 @@ public class BridgeServiceTest {
     }
 
     @Test
+    void backfillStopsAtExactlyTheMessageCap() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            JsonObject state = new JsonObject();
+            state.addProperty("since", "s_old");
+            writeState(state);
+            JsonArray newest = new JsonArray();
+            newest.add(matrixTextEvent("$live", "@alice:example.com", "live"));
+            server.enqueueSyncResponse(roomId, "s1", newest, true, "p0");
+            // 99 messages, then full pages: a whole next page would overshoot the cap.
+            int id = 0;
+            for (int page = 0; page < 12; page++) {
+                JsonArray chunk = new JsonArray();
+                for (int i = 0; i < (page == 0 ? 99 : 100); i++, id++) {
+                    chunk.add(matrixTextEvent("$h" + id, "@alice:example.com", "old " + id));
+                }
+                server.setMessagesPage("p" + page, chunk, "p" + (page + 1));
+            }
+
+            List<String> received = Collections.synchronizedList(new ArrayList<>());
+            BridgeService service = new BridgeService();
+            try {
+                service.start(syncOnlySettings(server, roomId), worldRoot, received::add);
+                waitUntil(() -> new ArrayList<>(received).stream().anyMatch(t -> t.endsWith("live")), Duration.ofSeconds(10));
+                Thread.sleep(200);
+                assertEquals(1001, received.size(), "1000 missed messages plus the live one");
+                List<MockMatrixServer.RecordedRequest> pages = server.getMessagesRequests();
+                assertEquals("1", queryParam(pages.get(pages.size() - 1).query(), "limit"));
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void anUnrecognizedMessagesEndpointIsRetried() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            JsonObject state = new JsonObject();
+            state.addProperty("since", "s_old");
+            writeState(state);
+            JsonArray newest = new JsonArray();
+            newest.add(matrixTextEvent("$2", "@alice:example.com", "two"));
+            server.enqueueSyncResponse(roomId, "s1", newest, true, "p_gap");
+            JsonArray older = new JsonArray();
+            older.add(matrixTextEvent("$1", "@alice:example.com", "one"));
+            server.setMessagesPage("p_gap", older, "");
+            server.setMessagesError(1, 404, "M_UNRECOGNIZED");
+
+            List<String> received = Collections.synchronizedList(new ArrayList<>());
+            BridgeService service = new BridgeService();
+            try {
+                service.start(syncOnlySettings(server, roomId), worldRoot, received::add);
+                waitUntil(() -> received.size() >= 2, Duration.ofSeconds(5));
+                assertEquals(List.of("[Matrix] <@alice:example.com> one", "[Matrix] <@alice:example.com> two"), received);
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void aTimedOutSendIsRetriedWithTheSameTransaction() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            server.setSendError(1, 408);
+            BridgeService service = new BridgeService();
+            try {
+                service.start(sendOnlySettings(server.homeserverUrl(), roomId, 100), worldRoot, text -> { });
+                assertTrue(service.enqueueMcMessage("[MC] <Steve> first"));
+                waitUntil(() -> server.getSendRequests().size() >= 2, Duration.ofSeconds(5));
+                List<MockMatrixServer.RecordedRequest> sends = server.getSendRequests();
+                assertEquals("[MC] <Steve> first", sentBody(sends.get(1)));
+                assertEquals(sends.get(0).path(), sends.get(1).path(), "a retry must reuse the transaction ID");
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
     void notReadyWhileARejectedTokenIsReplaced() throws Exception {
         String roomId = "!room:example.com";
         try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
             server.setJoinedRooms(List.of(roomId));
             server.enqueueSyncResponse(roomId, "s0", new JsonArray());
+            List<String> notices = Collections.synchronizedList(new ArrayList<>());
             BridgeService service = new BridgeService();
             try {
                 service.start(new BridgeSettings(server.homeserverUrl(), roomId, "token", false, true, true,
-                        "[MC] ", "[Matrix] ", "!mc", 0, 20, 100, 64), worldRoot, text -> { });
+                        "[MC] ", "[Matrix] ", "!mc", 0, 20, 100, 64), worldRoot, text -> {
+                    if (text.startsWith("Matrix room connected:")) {
+                        notices.add(text);
+                    }
+                });
                 waitUntil(service::isReady, Duration.ofSeconds(3));
+                waitUntil(() -> notices.size() == 1, Duration.ofSeconds(2));
                 // The running token gets rejected, and the fresh initial sync is held up by rate limits.
                 server.setSyncRateLimit(2, 1_500);
                 server.setSyncError(1, 400, "M_INVALID_PARAM");
@@ -1448,6 +1541,8 @@ public class BridgeServiceTest {
                 assertTrue(!service.isReady(), "messages sent now would be skipped by the fresh sync");
                 assertEquals(null, service.connectedNoticeRoom());
                 waitUntil(service::isReady, Duration.ofSeconds(6));
+                // Players who joined meanwhile, or whose notice was dropped, are told again.
+                waitUntil(() -> notices.size() == 2, Duration.ofSeconds(2));
             } finally {
                 service.stop();
             }

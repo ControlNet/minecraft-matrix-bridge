@@ -17,6 +17,37 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class MatrixClientTest {
     @Test
+    void theRequestTimeoutAlsoCoversAStalledBody() throws Exception {
+        // Headers and the first body bytes arrive, then the server (or a proxy) stalls.
+        com.sun.net.httpserver.HttpServer server =
+                com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        server.createContext("/", exchange -> {
+            exchange.sendResponseHeaders(200, 0);
+            exchange.getResponseBody().write("{\"user_id\":".getBytes(StandardCharsets.UTF_8));
+            exchange.getResponseBody().flush();
+            try {
+                release.await(10, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            exchange.close();
+        });
+        server.start();
+        try {
+            MatrixClient client = new MatrixClient("http://127.0.0.1:" + server.getAddress().getPort(), "token",
+                    java.time.Duration.ofMillis(400));
+            long start = System.nanoTime();
+            org.junit.jupiter.api.Assertions.assertThrows(java.net.http.HttpTimeoutException.class, client::whoami);
+            long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+            assertTrue(elapsedMs < 3_000, "timed out after " + elapsedMs + " ms");
+        } finally {
+            release.countDown();
+            server.stop(0);
+        }
+    }
+
+    @Test
     void explicitTransactionIdIsRetainedAcrossRetries() throws Exception {
         try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
             server.setSendRateLimit(1, 1);

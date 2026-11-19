@@ -190,11 +190,26 @@ public final class MockMatrixServer implements AutoCloseable {
 
     private volatile int messagesErrorRemaining;
     private volatile int messagesErrorStatus;
+    private volatile String messagesErrorCode = "";
+    private volatile int sendErrorRemaining;
+    private volatile int sendErrorStatus;
 
     /** Fail the next {@code times} {@code /messages} requests with {@code status} and no Matrix errcode. */
     public void setMessagesError(int times, int status) {
+        setMessagesError(times, status, "");
+    }
+
+    /** Fail the next {@code times} {@code /messages} requests with {@code status} and Matrix {@code errcode}. */
+    public void setMessagesError(int times, int status, String errcode) {
         messagesErrorStatus = status;
+        messagesErrorCode = errcode == null ? "" : errcode;
         messagesErrorRemaining = Math.max(0, times);
+    }
+
+    /** Fail the next {@code times} message sends with {@code status} and no Matrix errcode. */
+    public void setSendError(int times, int status) {
+        sendErrorStatus = status;
+        sendErrorRemaining = Math.max(0, times);
     }
 
     public int pendingSyncErrors() {
@@ -604,6 +619,11 @@ public final class MockMatrixServer implements AutoCloseable {
                 bodyStr
         ));
 
+        if (sendErrorRemaining > 0) {
+            sendErrorRemaining--;
+            respondPlain(exchange, sendErrorStatus, "");
+            return;
+        }
         if (send429Remaining > 0) {
             send429Remaining--;
             JsonObject body = new JsonObject();
@@ -628,7 +648,14 @@ public final class MockMatrixServer implements AutoCloseable {
         messagesRequests.add(new RecordedRequest("GET", exchange.getRequestURI().getRawPath(), query, null, ""));
         if (messagesErrorRemaining > 0) {
             messagesErrorRemaining--;
-            respondPlain(exchange, messagesErrorStatus, "");
+            if (messagesErrorCode.isEmpty()) {
+                respondPlain(exchange, messagesErrorStatus, "");
+            } else {
+                JsonObject body = new JsonObject();
+                body.addProperty("errcode", messagesErrorCode);
+                body.addProperty("error", "mock messages error");
+                respondJson(exchange, messagesErrorStatus, body);
+            }
             return;
         }
         String from = "";
