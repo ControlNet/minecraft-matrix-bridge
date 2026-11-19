@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import queue
+import random
 import re
 import shutil
 import subprocess
@@ -294,10 +295,22 @@ def ensure_eula(run_dir: Path) -> None:
     (run_dir / "eula.txt").write_text("eula=true\n", encoding="utf-8")
 
 
+# Below the Linux ephemeral range (32768-60999): an outbound connection opened between probing
+# a port and Minecraft binding it cannot be given the same port.
+SERVER_PORT_RANGE = (20000, 32768)
+
+
 def pick_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
+    rng = random.SystemRandom()
+    for _ in range(200):
+        port = rng.randrange(*SERVER_PORT_RANGE)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError(f"no free port in {SERVER_PORT_RANGE}")
 
 
 def write_server_properties(run_dir: Path, server_port: int) -> None:

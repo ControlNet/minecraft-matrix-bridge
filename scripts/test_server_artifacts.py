@@ -13,6 +13,19 @@ from system_test_all import verify_artifact, MODULE_EVENT_ALIASES
 from release_metadata import validate_server_coverage
 
 
+
+class PickFreePortTest(unittest.TestCase):
+    def test_port_is_outside_the_ephemeral_range_and_bindable(self):
+        # Outbound connections take ephemeral ports, which can claim a probed one before
+        # Minecraft binds it.
+        for _ in range(20):
+            port = system_test_all.pick_free_port()
+            self.assertGreaterEqual(port, system_test_all.SERVER_PORT_RANGE[0])
+            self.assertLess(port, system_test_all.SERVER_PORT_RANGE[1])
+            self.assertLess(port, 32768)
+            with system_test_all.socket.socket() as probe:
+                probe.bind(("127.0.0.1", port))
+
 class ArtifactTests(unittest.TestCase):
     def test_installer_retries_a_transient_failure(self):
         command = ["java", "-jar", "synthetic-installer.jar"]
