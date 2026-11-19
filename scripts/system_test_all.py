@@ -298,17 +298,22 @@ def ensure_eula(run_dir: Path) -> None:
 # Below the Linux ephemeral range (32768-60999): an outbound connection opened between probing
 # a port and Minecraft binding it cannot be given the same port.
 SERVER_PORT_RANGE = (20000, 32768)
+# Ports already handed out: one run may pick several before any of them is listening.
+_PICKED_PORTS: set[int] = set()
 
 
 def pick_free_port() -> int:
     rng = random.SystemRandom()
     for _ in range(200):
         port = rng.randrange(*SERVER_PORT_RANGE)
+        if port in _PICKED_PORTS:
+            continue
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
                 s.bind(("127.0.0.1", port))
             except OSError:
                 continue
+            _PICKED_PORTS.add(port)
             return port
     raise RuntimeError(f"no free port in {SERVER_PORT_RANGE}")
 

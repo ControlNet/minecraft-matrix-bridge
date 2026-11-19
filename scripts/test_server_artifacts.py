@@ -26,6 +26,13 @@ class PickFreePortTest(unittest.TestCase):
             with system_test_all.socket.socket() as probe:
                 probe.bind(("127.0.0.1", port))
 
+    def test_ports_picked_before_either_listens_differ(self):
+        # The real Matrix test picks Synapse's and Minecraft's ports before starting either.
+        with patch.object(system_test_all, "_PICKED_PORTS", set()), \
+                patch.object(system_test_all.random.SystemRandom, "randrange", side_effect=[25000, 25000, 25001]):
+            self.assertEqual(25000, system_test_all.pick_free_port())
+            self.assertEqual(25001, system_test_all.pick_free_port())
+
 class ArtifactTests(unittest.TestCase):
     def test_installer_retries_a_transient_failure(self):
         command = ["java", "-jar", "synthetic-installer.jar"]
