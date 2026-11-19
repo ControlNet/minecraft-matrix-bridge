@@ -838,7 +838,11 @@ public final class BridgeService {
                     LOGGER.info("MatrixBridge initial sync complete; starting from next_batch.");
                     return result.nextBatch;
                 }
-                return "";
+                // Without a position, the next sync would be another snapshot taken as new messages.
+                long sleepMs = jitter(backoffMs);
+                LOGGER.warning("Matrix initial sync returned no next_batch; retrying in " + sleepMs + " ms.");
+                sleepMs(sleepMs);
+                backoffMs = nextBackoff(backoffMs);
             } catch (MatrixClient.MatrixException e) {
                 if (e.statusCode == 401 || e.statusCode == 403) {
                     logAuthErrorOnce("Matrix initial sync failed (HTTP " + e.statusCode + "). Check access token / permissions.");

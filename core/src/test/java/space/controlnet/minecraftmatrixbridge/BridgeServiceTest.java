@@ -1222,6 +1222,33 @@ public class BridgeServiceTest {
     }
 
     @Test
+    void aFreshSyncWithoutATokenIsRepeatedBeforeTheBridgeIsReady() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            server.enqueueSync(new JsonObject());
+            JsonArray history = new JsonArray();
+            history.add(matrixTextEvent("$old", "@alice:example.com", "already shown"));
+            server.enqueueSyncResponse(roomId, "s0", history);
+            JsonArray live = new JsonArray();
+            live.add(matrixTextEvent("$new", "@alice:example.com", "sent after"));
+            server.enqueueSyncResponse(roomId, "s1", live);
+            List<String> received = Collections.synchronizedList(new ArrayList<>());
+            BridgeService service = new BridgeService();
+            try {
+                service.start(syncOnlySettings(server, roomId), worldRoot, received::add);
+                waitUntil(() -> !received.isEmpty(), Duration.ofSeconds(5));
+                assertEquals(1, received.size(), received.toString());
+                assertTrue(received.get(0).contains("sent after"), received.toString());
+                assertEquals(null, queryParam(server.getSyncRequests().get(1).query(), "since"));
+                assertEquals("s0", queryParam(server.getSyncRequests().get(2).query(), "since"));
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
     void eachFreshSyncSendsTheFilterAsANewRequest() throws Exception {
         String roomId = "!room:example.com";
         List<String> freshFilters = new ArrayList<>();

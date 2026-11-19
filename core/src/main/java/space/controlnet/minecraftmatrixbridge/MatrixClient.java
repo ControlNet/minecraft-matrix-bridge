@@ -119,14 +119,20 @@ public final class MatrixClient {
             // Says nothing about whether a delegation exists.
             throw new IOException("HTTP " + response.statusCode());
         }
+        // JsonParser is lenient ("", bare words, unquoted names); a .well-known document is a
+        // strict JSON object and anything else says nothing about the delegation.
         JsonElement parsed;
         try {
-            parsed = JsonParser.parseString(response.body());
+            com.google.gson.stream.JsonReader reader = new com.google.gson.stream.JsonReader(
+                    new java.io.StringReader(response.body()));
+            parsed = new com.google.gson.Gson().getAdapter(JsonElement.class).read(reader);
+            if (reader.peek() != com.google.gson.stream.JsonToken.END_DOCUMENT) {
+                throw new IOException("trailing data");
+            }
         } catch (RuntimeException e) {
             throw new IOException("unreadable response", e);
         }
-        // Gson also reads "" and a bare word; only an object is a .well-known document.
-        if (!parsed.isJsonObject()) {
+        if (parsed == null || !parsed.isJsonObject()) {
             throw new IOException("response is not a JSON object");
         }
         try {

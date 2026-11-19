@@ -62,7 +62,8 @@ public class MatrixClientTest {
         server.start();
         try {
             MatrixClient client = new MatrixClient("http://127.0.0.1:" + server.getAddress().getPort(), "token");
-            for (String unreadable : new String[] {"", "Unavailable", "<html>Down</html>", "[]"}) {
+            for (String unreadable : new String[] {"", "Unavailable", "<html>Down</html>", "[]",
+                    "{status:'unavailable'}", "{} trailing"}) {
                 body.set(unreadable);
                 org.junit.jupiter.api.Assertions.assertThrows(java.io.IOException.class, client::discoverClientBaseUrl,
                         "body: " + unreadable);
