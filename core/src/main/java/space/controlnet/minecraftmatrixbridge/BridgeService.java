@@ -228,6 +228,11 @@ public final class BridgeService {
         return enqueuePrefixed("<" + playerName + "> " + message);
     }
 
+    /** A chat line another mod formatted itself, relayed as players see it. */
+    public boolean enqueueShownChatLine(String line) {
+        return enqueuePrefixed(line);
+    }
+
     public boolean enqueuePlayerJoinLeave(String playerName, boolean joined) {
         BridgeSettings s = settings;
         if (s == null || !s.enableJoinLeaveToMatrix) {
@@ -548,7 +553,10 @@ public final class BridgeService {
                 // Not joined yet: attempt to accept invite by joining.
                 if (!attemptedJoin) {
                     attemptedJoin = true;
-                    String joinTarget = roomId;
+                    // An alias lets the homeserver find a server to join through; a bare
+                    // room ID only works when it already knows one (e.g. from an invite).
+                    String configured = settings.roomId;
+                    String joinTarget = configured.startsWith("#") ? configured : roomId;
                     LOGGER.info("MatrixBridge: user is not joined to " + roomId + "; attempting to join (accept invite)...");
                     String joinedRoomId = joinRoomWithRetry(joinTarget);
                     if (joinedRoomId == null) {
@@ -686,16 +694,21 @@ public final class BridgeService {
 
         if (since == null || since.isBlank()) {
             since = initialCatchup(filterJson);
+            if (!running.get()) {
+                return;
+            }
+            markReady();
         }
-        if (!running.get()) {
-            return;
-        }
-        markReady();
+        // Otherwise readiness waits for the homeserver to accept the stored token: if it is
+        // rejected, the fresh initial sync skips everything sent before it, so players must not
+        // be told the bridge is connected yet.
 
         long backoffMs = 1_000;
         while (running.get()) {
             try {
-                MatrixClient.SyncResult result = matrixClient.syncOnce(since, settings.syncTimeoutMs, filterJson);
+                // Until ready, do not long-poll: the first answer only has to confirm the token.
+                int timeoutMs = ready.get() ? settings.syncTimeoutMs : 0;
+                MatrixClient.SyncResult result = matrixClient.syncOnce(since, timeoutMs, filterJson);
                 // Save the token only after its messages went out, so a stop or a failed
                 // backfill replays this batch instead of skipping the rest of it.
                 if (!forwardMatrixMessages(result, since)) {
@@ -705,6 +718,7 @@ public final class BridgeService {
                     since = result.nextBatch;
                     sinceStore.saveSince(since);
                 }
+                markReady();
                 backoffMs = 1_000;
             } catch (MatrixClient.MatrixException e) {
                 if (e.statusCode == 401 || e.statusCode == 403) {
@@ -718,6 +732,7 @@ public final class BridgeService {
                     LOGGER.warning("Matrix rejected the stored sync token (" + e.getMessage() + "); starting a fresh sync.");
                     sinceStore.saveSince("");
                     since = initialCatchup(filterJson);
+                    markReady();
                     backoffMs = 1_000;
                     continue;
                 }
@@ -864,7 +879,8 @@ public final class BridgeService {
                 throw e;
             }
             result.chunk.forEach(newestFirst::add);
-            if (result.chunk.isEmpty() || result.end.isBlank() || result.end.equals(from)) {
+            // An empty page does not end pagination: only a missing or repeated end token does.
+            if (result.end.isBlank() || result.end.equals(from)) {
                 Collections.reverse(newestFirst);
                 return newestFirst;
             }
@@ -956,7 +972,8 @@ public final class BridgeService {
      * that clients put in front of a reply's text.
      */
     static String stripReplyFallback(String body) {
-        if (body == null || !body.startsWith(">")) {
+        // The fallback opens with the quoted sender; anything else is text the user typed.
+        if (body == null || !(body.startsWith("> <") || body.startsWith("> * <"))) {
             return body;
         }
         String[] lines = body.split("\n", -1);
@@ -1058,7 +1075,9 @@ public final class BridgeService {
             String reply = fut.get(5, TimeUnit.SECONDS);
             sendMatrixBotReply(reply != null ? reply : "No response from event handler.");
         } catch (java.util.concurrent.TimeoutException e) {
-            sendMatrixBotReply("Event command timed out.");
+            // The task is already queued on the server thread and may still run.
+            sendMatrixBotReply("The server did not answer within 5 seconds; the command may still take effect. "
+                    + "Check \"" + settings.matrixBotPrefix + " event list\" before retrying.");
         } catch (Exception e) {
             LOGGER.warning("Event command failed: " + e);
             sendMatrixBotReply("Event command failed: " + e.getMessage());

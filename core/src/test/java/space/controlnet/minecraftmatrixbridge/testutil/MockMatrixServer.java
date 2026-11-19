@@ -71,6 +71,7 @@ public final class MockMatrixServer implements AutoCloseable {
     private volatile String roomIdForAlias = "";
     private final Set<String> joinedRooms = ConcurrentHashMap.newKeySet();
     private final Set<String> invitedRooms = ConcurrentHashMap.newKeySet();
+    private final Map<String, String> joinableAliases = new ConcurrentHashMap<>();
     private final Map<String, String> memberDisplayNames = new ConcurrentHashMap<>();
 
     public MockMatrixServer(String expectedToken, String selfUserId) throws IOException {
@@ -251,6 +252,11 @@ public final class MockMatrixServer implements AutoCloseable {
                 }
             }
         }
+    }
+
+    /** A public room that can be joined by {@code alias} (the server finds a route) but not by its bare ID. */
+    public void setJoinableAlias(String alias, String roomId) {
+        joinableAliases.put(alias, roomId);
     }
 
     public void setInvitedRooms(List<String> roomIds) {
@@ -434,6 +440,14 @@ public final class MockMatrixServer implements AutoCloseable {
         String rawRoom = path.substring(prefix.length());
         String room = URLDecoder.decode(rawRoom, StandardCharsets.UTF_8);
 
+        String aliasTarget = joinableAliases.get(room);
+        if (aliasTarget != null) {
+            joinedRooms.add(aliasTarget);
+            JsonObject ok = new JsonObject();
+            ok.addProperty("room_id", aliasTarget);
+            respondJson(exchange, 200, ok);
+            return;
+        }
         if (invitedRooms.contains(room)) {
             invitedRooms.remove(room);
             joinedRooms.add(room);

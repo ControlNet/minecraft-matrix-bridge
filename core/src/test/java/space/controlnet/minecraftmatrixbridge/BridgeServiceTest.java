@@ -1177,9 +1177,11 @@ public class BridgeServiceTest {
                 assertTrue(service.enqueuePlayerChat("Steve", "hi"));
                 assertTrue(!service.enqueuePlayerJoinLeave("Steve", true), "join/leave notices are off");
                 assertTrue(service.enqueuePlayerTestMessage("ping"));
+                // A chat line whose format another mod replaced is relayed as players see it.
+                assertTrue(service.enqueueShownChatLine("[Admin] Steve: hi"));
                 waitUntil(() -> !server.getSendRequests().isEmpty(), Duration.ofSeconds(3));
                 Thread.sleep(200);
-                assertEquals("[S] * Server started.\n[S] <Steve> hi\n[S] [TEST] ping",
+                assertEquals("[S] * Server started.\n[S] <Steve> hi\n[S] [TEST] ping\n[S] [Admin] Steve: hi",
                         sentBody(server.getSendRequests().get(0)));
             } finally {
                 service.stop();
@@ -1201,6 +1203,7 @@ public class BridgeServiceTest {
                 assertTrue(!service.enqueuePlayerJoinLeave("Steve", false));
                 assertTrue(!service.enqueueServerLifecycle(false));
                 assertTrue(!service.enqueuePlayerTestMessage("ping"));
+                assertTrue(!service.enqueueShownChatLine("[Admin] Steve: hi"));
                 assertEquals(0, service.getQueueSize());
             } finally {
                 service.stop();
@@ -1232,6 +1235,101 @@ public class BridgeServiceTest {
                 assertEquals(roomId, announcing.connectedNoticeRoom());
             } finally {
                 announcing.stop();
+            }
+        }
+    }
+
+    @Test
+    void backfillContinuesPastAnEmptyPage() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            JsonObject state = new JsonObject();
+            state.addProperty("since", "s_old");
+            writeState(state);
+            JsonArray newest = new JsonArray();
+            newest.add(matrixTextEvent("$2", "@alice:example.com", "two"));
+            server.enqueueSyncResponse(roomId, "s1", newest, true, "p_gap");
+            // Servers may return an empty page (e.g. after visibility filtering) that still points further back.
+            server.setMessagesPage("p_gap", new JsonArray(), "p_more");
+            JsonArray older = new JsonArray();
+            older.add(matrixTextEvent("$1", "@alice:example.com", "one"));
+            server.setMessagesPage("p_more", older, "");
+
+            List<String> received = Collections.synchronizedList(new ArrayList<>());
+            BridgeService service = new BridgeService();
+            try {
+                service.start(syncOnlySettings(server, roomId), worldRoot, received::add);
+                waitUntil(() -> received.size() >= 2, Duration.ofSeconds(3));
+                assertEquals(List.of("[Matrix] <@alice:example.com> one", "[Matrix] <@alice:example.com> two"), received);
+                assertEquals(2, server.getMessagesRequests().size());
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void onlyARealReplyFallbackIsStripped() {
+        assertEquals("my answer", BridgeService.stripReplyFallback("> <@bob:example.com> original\n> more\n\nmy answer"));
+        assertEquals("my answer", BridgeService.stripReplyFallback("> * <@bob:example.com> waves\n\nmy answer"));
+        // Clients following Matrix v1.13 send replies without a fallback; a quote the user typed stays.
+        assertEquals("> 5 minutes", BridgeService.stripReplyFallback("> 5 minutes"));
+        assertEquals("> quoted\nanswer", BridgeService.stripReplyFallback("> quoted\nanswer"));
+    }
+
+    @Test
+    void storedSyncTokenIsConfirmedBeforeAnnouncingConnected() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            JsonObject state = new JsonObject();
+            state.addProperty("since", "s_stale");
+            writeState(state);
+            server.setSyncError(1, 400, "M_INVALID_PARAM");
+            server.enqueueSyncResponse(roomId, "s0", new JsonArray());
+            server.enqueueSyncResponse(roomId, "s1", new JsonArray());
+
+            List<Integer> syncsAtNotice = Collections.synchronizedList(new ArrayList<>());
+            BridgeService service = new BridgeService();
+            try {
+                BridgeSettings announcing = new BridgeSettings(server.homeserverUrl(), roomId, "token", false, true, true,
+                        "[MC] ", "[Matrix] ", "!mc", 30_000, 20, 100, 64);
+                service.start(announcing, worldRoot, text -> {
+                    if (text.startsWith("Matrix room connected:")) {
+                        syncsAtNotice.add(server.getSyncRequests().size());
+                    }
+                });
+                waitUntil(() -> !syncsAtNotice.isEmpty(), Duration.ofSeconds(5));
+                // Chat sent after the notice must not fall into the fresh initial sync that replaces a rejected token.
+                assertTrue(syncsAtNotice.get(0) >= 2, "connected before the stored token was checked: " + syncsAtNotice);
+                // Checking the stored token must not hold the notice for a whole long poll.
+                assertEquals("0", queryParam(server.getSyncRequests().get(0).query(), "timeout"));
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void aConfiguredAliasIsJoinedByAlias() throws Exception {
+        String roomAlias = "#public:remote.example";
+        String roomId = "!remote:remote.example";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setRoomAliasMapping(roomAlias, roomId);
+            // Joining by ID alone fails when the homeserver does not know a server in the room yet.
+            server.setJoinableAlias(roomAlias, roomId);
+            server.enqueueSyncResponse(roomId, "s0", new JsonArray());
+            BridgeService service = new BridgeService();
+            try {
+                service.start(new BridgeSettings(server.homeserverUrl(), roomAlias, "token", false, true, false,
+                        "[MC] ", "[Matrix] ", "!mc", 0, 20, 100, 64), worldRoot, text -> { });
+                waitUntil(service::isReady, Duration.ofSeconds(3));
+                assertEquals("/_matrix/client/v3/join/" + roomAlias,
+                        java.net.URLDecoder.decode(server.getJoinRequests().get(0).path(), StandardCharsets.UTF_8));
+                assertEquals(roomId, service.getResolvedRoomId());
+            } finally {
+                service.stop();
             }
         }
     }
