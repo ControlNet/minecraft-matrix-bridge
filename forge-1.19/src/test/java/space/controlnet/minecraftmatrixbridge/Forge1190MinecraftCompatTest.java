@@ -19,6 +19,7 @@ class Forge1190MinecraftCompatTest {
     void forge41StringMessageIsReturnedVerbatim() {
         assertEquals("hello", Forge1190MinecraftCompat.chatText("hello"));
         assertEquals("", Forge1190MinecraftCompat.chatText(null));
+        assertEquals("***", Forge1190MinecraftCompat.chatText(Component.literal("***")));
     }
 
     @Test
@@ -44,9 +45,28 @@ class Forge1190MinecraftCompatTest {
         public static final ResourceKey<?> f_130599_ = null;
     }
 
+    /** Forge 41 shape: getMessage() is the raw text, getComponent() what is broadcast. */
     public static final class SyntheticChatEvent {
         public String getMessage() {
             return "hello";
         }
+
+        public Component getComponent() {
+            return null;
+        }
+    }
+
+    public static final class SyntheticRawOnlyChatEvent {
+        public String getMessage() {
+            return "hello";
+        }
+    }
+
+    @Test
+    void readsTheBroadcastComponentNotTheRawText() {
+        // Without getComponent() the adapter would relay text that mods filtered or removed in game.
+        assertThrows(IllegalStateException.class,
+                () -> new Forge1190MinecraftCompat(SyntheticPlayerList.class, SyntheticChatType.class,
+                        SyntheticRawOnlyChatEvent.class));
     }
 }

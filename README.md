@@ -16,7 +16,7 @@
 Bridges chat between a Minecraft server and **one Matrix room** (unencrypted only).
 
 ## Features
-- **MC → Matrix**: forwards player chat into a Matrix room.
+- **MC → Matrix**: forwards player chat into a Matrix room, as players see it: if another mod cancels or rewrites a message (e.g. a chat filter), Matrix gets the result, not the original.
 - **Matrix → MC**: forwards Matrix `m.text` room messages into Minecraft server chat. Edits are shown as the new text with ` (edited)`, replies without the quoted original, and messages longer than 512 characters are cut off. After a disconnect, messages the homeserver left out of a sync are fetched and shown in order (up to 1000).
 - Sync state stored in the **world save** (prevents replay spam on restart). The position is saved only after its messages were handed to Minecraft, so a restart replays the batch it was in the middle of instead of skipping it. Old room history is skipped on the very first start.
 - The "Matrix room connected: …" notice is sent once the initial sync is done, so messages sent after it are not lost.

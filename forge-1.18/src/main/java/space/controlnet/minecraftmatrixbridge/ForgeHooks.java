@@ -212,13 +212,25 @@ public final class ForgeHooks {
         if (bridgeService == null || !bridgeService.isRunning()) {
             return;
         }
-        String msg = event.getMessage();
-        if (msg == null || msg.isBlank()) {
+        // Relay what players see: getMessage() is the raw text even when a mod filtered it.
+        Component shown = event.getComponent();
+        if (shown == null) {
+            return; // Forge does not broadcast it either
+        }
+        String body = ChatComponents.vanillaChatBody(shown);
+        if (body == null) {
+            String line = shown.getString();
+            if (!line.isBlank()) {
+                bridgeService.enqueueShownChatLine(line);
+            }
+            return;
+        }
+        if (body.isBlank()) {
             return;
         }
 
         String playerName = event.getPlayer().getGameProfile().getName();
-        bridgeService.enqueuePlayerChat(playerName, msg);
+        bridgeService.enqueuePlayerChat(playerName, body);
     }
 
     @SubscribeEvent
