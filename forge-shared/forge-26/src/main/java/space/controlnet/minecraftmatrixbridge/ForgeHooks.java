@@ -200,6 +200,11 @@ public final class ForgeHooks {
         shutdownBridge(false);
     }
 
+    // EventBus 7 skips posting (monitors included) while no ordinary listener exists.
+    @SubscribeEvent
+    public void keepChatMonitorPosted(ServerChatEvent event) {
+    }
+
     // After every other listener: the chat as formatting mods left it, unless one cancelled it.
     @SubscribeEvent(priority = Priority.MONITOR)
     public void onServerChat(ServerChatEvent event, boolean wasCancelled) {

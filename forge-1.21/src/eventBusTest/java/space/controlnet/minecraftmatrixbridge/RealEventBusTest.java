@@ -30,6 +30,16 @@ class RealEventBusTest {
     }
 
     @Test
+    void monitorRunsWhenItIsTheOnlyListener() {
+        List<String> received = new ArrayList<>();
+        adapter.monitor(Lonely.class, event -> received.add(((Lonely) event).message));
+        Lonely chat = new Lonely();
+        chat.message = "hello";
+        assertFalse(Lonely.BUS.post(chat));
+        assertEquals(List.of("hello"), received);
+    }
+
+    @Test
     void monitorSeesTheFinalChatAndSkipsCancelledChat() {
         List<String> received = new ArrayList<>();
         // Registered first, as the bridge is when a formatter mod loads after it.
@@ -63,6 +73,10 @@ class RealEventBusTest {
 
     public static final class Chat extends MutableEvent implements Cancellable {
         public static final CancellableEventBus<Chat> BUS = CancellableEventBus.create(Chat.class);
+        String message = "";
+    }
+    public static final class Lonely extends MutableEvent implements Cancellable {
+        public static final CancellableEventBus<Lonely> BUS = CancellableEventBus.create(Lonely.class);
         String message = "";
     }
     public sealed interface Tick permits Pre, Post {}

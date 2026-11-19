@@ -122,11 +122,14 @@ final class ModernEventBus {
                             yield null;
                         }
                     });
+            Consumer<Object> keepPosting = ignored -> { };
             for (Object bus : buses) {
                 if (!cancellableBus.isInstance(bus)) {
                     throw new IllegalStateException("Not a cancellable event: " + type.getName());
                 }
                 addMonitor.invoke(bus, monitor);
+                // EventBus 7 skips posting (monitors included) while no ordinary listener exists.
+                addListener.invoke(bus, normalPriority, keepPosting);
             }
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("Could not monitor Forge event: " + type.getName(), e);
