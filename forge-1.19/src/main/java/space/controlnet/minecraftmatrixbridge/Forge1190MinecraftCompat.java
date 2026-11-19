@@ -64,7 +64,18 @@ final class Forge1190MinecraftCompat extends ForgeMinecraftCompat {
 
     @Override
     String chatMessage(ServerChatEvent event) {
+        // Forge 41 also fires ServerChatEvent for the text of /say, /me, /msg and /teammsg, before
+        // the command picks its recipients (and with no player for the console). Only chat typed
+        // into the chat box is relayed, so private messages stay private.
+        if (firedByCommand()) {
+            return "";
+        }
         return chatText(invoke(chatMessage, event));
+    }
+
+    static boolean firedByCommand() {
+        return StackWalker.getInstance().walk(frames ->
+                frames.anyMatch(frame -> frame.getClassName().startsWith("com.mojang.brigadier.")));
     }
 
     /** Text of the broadcast chat component; empty when a mod removed the message. */

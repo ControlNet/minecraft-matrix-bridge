@@ -7,25 +7,25 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
-/** Components built like vanilla 1.18.2 and like chat-filter mods do; no server is started. */
+/** Components built like vanilla 1.18.2 and like chat-formatting mods do; no server is started. */
 class ChatComponentsTest {
     @Test
-    void readsTheMessageOfVanillaChat() {
-        // ServerGamePacketListenerImpl passes the raw string as the second argument.
-        assertEquals("hi", ChatComponents.vanillaChatBody(
+    void vanillaChatKeepsTheBridgeFormat() {
+        // ServerGamePacketListenerImpl builds chat.type.text ("<%s> %s") with the raw string.
+        assertEquals("<Steve> hi", ChatComponents.shownLine(
                 new TranslatableComponent("chat.type.text", new TextComponent("Steve"), "hi")));
     }
 
     @Test
-    void readsTheTextAModPutInPlaceOfTheMessage() {
-        assertEquals("***", ChatComponents.vanillaChatBody(
-                new TranslatableComponent("chat.type.text", new TextComponent("Steve"), new TextComponent("***"))));
+    void keepsWhatAModAddsToTheLine() {
+        var line = new TranslatableComponent("chat.type.text", new TextComponent("[VIP] Probe"), new TextComponent("***"));
+        line.append(new TextComponent(" [suffix]"));
+        assertEquals("<[VIP] Probe> *** [suffix]", ChatComponents.shownLine(line));
+        assertEquals("[Admin] Steve: hi", ChatComponents.shownLine(new TextComponent("[Admin] Steve: hi")));
     }
 
     @Test
-    void reportsAReplacedFormat() {
-        assertNull(ChatComponents.vanillaChatBody(new TextComponent("[Admin] Steve: hi")));
-        assertNull(ChatComponents.vanillaChatBody(
-                new TranslatableComponent("chat.type.announcement", new TextComponent("Steve"), "hi")));
+    void nothingIsRelayedWhenAModHidesTheMessage() {
+        assertNull(ChatComponents.shownLine(null));
     }
 }

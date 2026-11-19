@@ -23,6 +23,20 @@ class Forge1190MinecraftCompatTest {
     }
 
     @Test
+    void chatFiredFromACommandIsRecognized() throws Exception {
+        assertFalse(Forge1190MinecraftCompat.firedByCommand(), "chat typed into the chat box");
+        // /msg and /say resolve their text through brigadier, which is on the stack when Forge 41 fires the event.
+        var dispatcher = new com.mojang.brigadier.CommandDispatcher<Object>();
+        boolean[] seen = new boolean[1];
+        dispatcher.register(com.mojang.brigadier.builder.LiteralArgumentBuilder.literal("msg").executes(ctx -> {
+            seen[0] = Forge1190MinecraftCompat.firedByCommand();
+            return 1;
+        }));
+        dispatcher.execute("msg", new Object());
+        assertTrue(seen[0]);
+    }
+
+    @Test
     void resolvesTheSrgMembersOnTheTargetShape() {
         // Synthetic stand-ins with the 1.19.0 SRG member names; not the real classes.
         assertDoesNotThrow(() -> new Forge1190MinecraftCompat(SyntheticPlayerList.class, SyntheticChatType.class,
