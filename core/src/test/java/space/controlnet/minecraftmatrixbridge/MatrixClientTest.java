@@ -64,7 +64,9 @@ public class MatrixClientTest {
             MatrixClient client = new MatrixClient("http://127.0.0.1:" + server.getAddress().getPort(), "token");
             for (String unreadable : new String[] {"", "Unavailable", "<html>Down</html>", "[]",
                     "{status:'unavailable'}", "{} trailing", "{\"maintenance\":True}", "{}",
-                    "{\"m.homeserver\":{\"base_url\":\"matrix.example.com\"}}"}) {
+                    "{\"m.homeserver\":{\"base_url\":\"matrix.example.com\"}}",
+                    "{\"m.homeserver\":{\"base_url\":\"http://:8008\"}}",
+                    "{\"m.homeserver\":{\"base_url\":\"https://bad host\"}}"}) {
                 body.set(unreadable);
                 org.junit.jupiter.api.Assertions.assertThrows(java.io.IOException.class, client::discoverClientBaseUrl,
                         "body: " + unreadable);

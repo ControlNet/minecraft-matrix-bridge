@@ -142,6 +142,12 @@ public final class MatrixClient {
         boolean usable = homeserver.startsWith("https://")
                 ? baseUrl.startsWith("https://")
                 : baseUrl.startsWith("https://") || baseUrl.startsWith("http://");
+        try {
+            String host = URI.create(baseUrl).getHost();
+            usable = usable && host != null && !host.isBlank();
+        } catch (IllegalArgumentException e) {
+            usable = false;
+        }
         if (!usable) {
             throw new IOException("no usable m.homeserver.base_url");
         }
