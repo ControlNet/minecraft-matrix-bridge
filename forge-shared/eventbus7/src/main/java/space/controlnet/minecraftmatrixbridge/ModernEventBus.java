@@ -2,6 +2,7 @@ package space.controlnet.minecraftmatrixbridge;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Consumer;
@@ -90,6 +91,45 @@ final class ModernEventBus {
             }
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("Could not register Forge event: " + type.getName(), e);
+        }
+    }
+
+    /**
+     * Registers a read-only listener that runs after every other listener (MONITOR), so it sees an
+     * event as the other mods left it, and only when none of them cancelled it.
+     */
+    void monitor(Class<?> type, Consumer<Object> listener) {
+        if (!isEventClass(type)) {
+            throw new IllegalArgumentException("Not a Forge event: " + type.getName());
+        }
+        List<Object> buses = new ArrayList<>();
+        collectBuses(type, buses);
+        try {
+            ClassLoader loader = busType.getClassLoader();
+            Class<?> cancellableBus = Class.forName("net.minecraftforge.eventbus.api.bus.CancellableEventBus", true, loader);
+            Class<?> monitorType = Class.forName("net.minecraftforge.eventbus.api.listener.ObjBooleanBiConsumer", true, loader);
+            Method addMonitor = cancellableBus.getMethod("addListener", monitorType);
+            Object monitor = Proxy.newProxyInstance(monitorType.getClassLoader(), new Class<?>[] {monitorType},
+                    (proxy, method, args) -> switch (method.getName()) {
+                        case "equals" -> proxy == args[0];
+                        case "hashCode" -> System.identityHashCode(proxy);
+                        case "toString" -> "MatrixBridge monitor for " + type.getName();
+                        default -> {
+                            // accept(event, wasCancelled)
+                            if (!(Boolean) args[1]) {
+                                listener.accept(args[0]);
+                            }
+                            yield null;
+                        }
+                    });
+            for (Object bus : buses) {
+                if (!cancellableBus.isInstance(bus)) {
+                    throw new IllegalStateException("Not a cancellable event: " + type.getName());
+                }
+                addMonitor.invoke(bus, monitor);
+            }
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Could not monitor Forge event: " + type.getName(), e);
         }
     }
 

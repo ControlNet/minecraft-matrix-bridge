@@ -30,19 +30,24 @@ class RealEventBusTest {
     }
 
     @Test
-    void lowestListenerSkipsChatCancelledAtLowPriority() throws ReflectiveOperationException {
-        List<Object> received = new ArrayList<>();
-        byte lowest = ModernEventBus.priority(getClass().getClassLoader(), "LOWEST");
-        assertEquals(Priority.LOWEST, lowest);
-        adapter.listen(Chat.class, received::add, lowest);
-        // A mute mod cancelling at LOW runs before the bridge and hides the message.
-        var muter = Chat.BUS.addListener(Priority.LOW, (Predicate<Chat>) ignored -> true);
-        assertTrue(Chat.BUS.post(new Chat()));
-        assertTrue(received.isEmpty());
-        Chat.BUS.removeListener(muter);
-        Chat kept = new Chat();
-        assertFalse(Chat.BUS.post(kept));
-        assertEquals(List.of(kept), received);
+    void monitorSeesTheFinalChatAndSkipsCancelledChat() {
+        List<String> received = new ArrayList<>();
+        // Registered first, as the bridge is when a formatter mod loads after it.
+        adapter.monitor(Chat.class, event -> received.add(((Chat) event).message));
+        var formatter = Chat.BUS.addListener(Priority.LOWEST, (java.util.function.Consumer<Chat>) chat ->
+                chat.message = "[Town] " + chat.message);
+        Chat chat = new Chat();
+        chat.message = "good morning";
+        assertFalse(Chat.BUS.post(chat));
+        assertEquals(List.of("[Town] good morning"), received);
+        // A mute mod cancelling at any priority, even the lowest, hides the message.
+        for (byte priority : new byte[] {Priority.LOW, Priority.LOWEST}) {
+            var muter = Chat.BUS.addListener(priority, (Predicate<Chat>) ignored -> true);
+            assertTrue(Chat.BUS.post(new Chat()));
+            Chat.BUS.removeListener(muter);
+        }
+        assertEquals(List.of("[Town] good morning"), received);
+        Chat.BUS.removeListener(formatter);
     }
 
     @Test
@@ -58,6 +63,7 @@ class RealEventBusTest {
 
     public static final class Chat extends MutableEvent implements Cancellable {
         public static final CancellableEventBus<Chat> BUS = CancellableEventBus.create(Chat.class);
+        String message = "";
     }
     public sealed interface Tick permits Pre, Post {}
     public record Pre() implements RecordEvent, Tick {

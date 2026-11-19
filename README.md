@@ -16,7 +16,7 @@
 Bridges chat between a Minecraft server and **one Matrix room** (unencrypted only).
 
 ## Features
-- **MC → Matrix**: forwards player chat into a Matrix room as it appears in game, after other mods such as chat filters have rewritten or cancelled it.
+- **MC → Matrix**: forwards player chat into a Matrix room as it appears in game. Chat that mods such as chat filters rewrite or cancel is relayed rewritten or not at all. On Forge with EventBus 7 (later 1.21.x patches and 26.x) the bridge reads chat after every other listener; on other loaders it reads chat at the lowest priority, together with any other mod listening there.
 - **Matrix → MC**: forwards Matrix `m.text` room messages into Minecraft server chat. Edits are shown as the new text with ` (edited)`, replies without the quoted original, and messages longer than 512 characters are cut off. After a disconnect, messages the homeserver left out of a sync are fetched and shown in order (up to 1000).
 - Sync state stored in the **world save** (prevents replay spam on restart). The position is saved after its messages reach Minecraft, so a restart replays the batch the bridge was handling. Old room history is skipped on the very first start.
 - The "Matrix room connected: …" notice appears once the bridge has caught up with the room; messages sent after it reach Minecraft.

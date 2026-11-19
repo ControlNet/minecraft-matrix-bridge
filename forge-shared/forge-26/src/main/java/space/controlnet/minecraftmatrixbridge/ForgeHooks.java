@@ -200,10 +200,10 @@ public final class ForgeHooks {
         shutdownBridge(false);
     }
 
-    // Last, so chat cancelled by mute/filter mods at any other priority is not relayed.
-    @SubscribeEvent(priority = Priority.LOWEST)
-    public void onServerChat(ServerChatEvent event) {
-        if (bridgeService == null || !bridgeService.isRunning()) {
+    // After every other listener: the chat as formatting mods left it, unless one cancelled it.
+    @SubscribeEvent(priority = Priority.MONITOR)
+    public void onServerChat(ServerChatEvent event, boolean wasCancelled) {
+        if (wasCancelled || bridgeService == null || !bridgeService.isRunning()) {
             return;
         }
         String msg = event.getMessage().getString();

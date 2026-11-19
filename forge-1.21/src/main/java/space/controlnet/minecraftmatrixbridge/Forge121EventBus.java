@@ -37,8 +37,8 @@ final class Forge121EventBus extends ForgeEventBus {
         subscribe(ServerStoppingEvent.class, hooks::onServerStopping);
         subscribe(ServerStoppedEvent.class, hooks::onServerStopped);
         subscribe(RegisterCommandsEvent.class, hooks::onRegisterCommands);
-        // Last, so chat cancelled by mute/filter mods at any other priority is not relayed.
-        bus.listen(ServerChatEvent.class, event -> hooks.onServerChat((ServerChatEvent) event), lowestPriority());
+        // After every other listener: the chat as formatting mods left it, unless one cancelled it.
+        bus.monitor(ServerChatEvent.class, event -> hooks.onServerChat((ServerChatEvent) event));
         subscribe(PlayerEvent.PlayerLoggedInEvent.class, hooks::onPlayerLoggedIn);
         subscribe(PlayerEvent.PlayerLoggedOutEvent.class, hooks::onPlayerLoggedOut);
         try {
@@ -47,14 +47,6 @@ final class Forge121EventBus extends ForgeEventBus {
                     ignored -> hooks.onServerPostTick());
         } catch (ClassNotFoundException e) {
             throw new IllegalStateException("Missing Forge server post-tick event", e);
-        }
-    }
-
-    private byte lowestPriority() {
-        try {
-            return ModernEventBus.priority(getClass().getClassLoader(), "LOWEST");
-        } catch (ReflectiveOperationException e) {
-            throw new IllegalStateException("Unsupported Forge EventBus 7 priority API", e);
         }
     }
 
