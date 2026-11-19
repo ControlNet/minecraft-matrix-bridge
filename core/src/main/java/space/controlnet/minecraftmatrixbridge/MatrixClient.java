@@ -138,20 +138,24 @@ public final class MatrixClient {
             throw new IOException("response is not a JSON object");
         }
         String baseUrl = stripTrailingSlash(getString(getObject(parsed.getAsJsonObject(), "m.homeserver"), "base_url"));
-        // Never let a delegation downgrade an https homeserver to plain http.
-        boolean usable = homeserver.startsWith("https://")
-                ? baseUrl.startsWith("https://")
-                : baseUrl.startsWith("https://") || baseUrl.startsWith("http://");
-        try {
-            String host = URI.create(baseUrl).getHost();
-            usable = usable && host != null && !host.isBlank();
-        } catch (IllegalArgumentException e) {
-            usable = false;
-        }
-        if (!usable) {
+        if (!usableDelegation(homeserver, baseUrl)) {
             throw new IOException("no usable m.homeserver.base_url");
         }
         return baseUrl;
+    }
+
+    /** An http(s) URL with a host, and https when the configured URL is (schemes are case-insensitive). */
+    static boolean usableDelegation(String configured, String baseUrl) {
+        try {
+            URI target = URI.create(baseUrl);
+            String scheme = target.getScheme() == null ? "" : target.getScheme().toLowerCase(java.util.Locale.ROOT);
+            String configuredScheme = URI.create(configured).getScheme();
+            boolean httpsRequired = "https".equalsIgnoreCase(configuredScheme);
+            boolean schemeOk = httpsRequired ? scheme.equals("https") : scheme.equals("https") || scheme.equals("http");
+            return schemeOk && target.getHost() != null && !target.getHost().isBlank();
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
     }
 
     Duration syncRequestTimeout(int timeoutMs) {

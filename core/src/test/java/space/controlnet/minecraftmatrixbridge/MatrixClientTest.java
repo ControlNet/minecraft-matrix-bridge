@@ -83,6 +83,20 @@ public class MatrixClientTest {
     }
 
     @Test
+    void aDelegationNeverDowngradesHttpsWhateverTheSchemeCase() {
+        assertTrue(MatrixClient.usableDelegation("https://example.com", "https://matrix.example.com"));
+        assertTrue(MatrixClient.usableDelegation("https://example.com", "HTTPS://matrix.example.com"));
+        assertTrue(MatrixClient.usableDelegation("http://example.com", "http://matrix.example.com:8008"));
+        org.junit.jupiter.api.Assertions.assertFalse(
+                MatrixClient.usableDelegation("HTTPS://example.com", "http://matrix.example.com"));
+        org.junit.jupiter.api.Assertions.assertFalse(
+                MatrixClient.usableDelegation("https://example.com", "Http://matrix.example.com"));
+        org.junit.jupiter.api.Assertions.assertFalse(
+                MatrixClient.usableDelegation("http://example.com", "ftp://matrix.example.com"));
+        org.junit.jupiter.api.Assertions.assertFalse(MatrixClient.usableDelegation("http://example.com", "http://:8008"));
+    }
+
+    @Test
     void aSyncResponseWithoutAStringNextBatchIsAnError() throws Exception {
         try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
             MatrixClient client = new MatrixClient(server.homeserverUrl(), "token");
