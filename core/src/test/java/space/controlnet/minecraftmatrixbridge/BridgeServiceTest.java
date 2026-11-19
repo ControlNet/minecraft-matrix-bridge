@@ -899,6 +899,27 @@ public class BridgeServiceTest {
     }
 
     @Test
+    void wellKnownDiscoveryIsRetriedAfterAFailedLookup() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer api = new MockMatrixServer("token", "@bot:example.com");
+             MockMatrixServer site = new MockMatrixServer("token", "@bot:example.com")) {
+            api.setJoinedRooms(List.of(roomId));
+            site.setWhoamiNotFound(true);
+            BridgeService service = new BridgeService();
+            try {
+                service.start(sendOnlySettings(site.homeserverUrl(), roomId, 10), worldRoot, text -> { });
+                // The delegation is not served yet (e.g. the web server is still starting).
+                waitUntil(() -> site.wellKnownCallCount() >= 1, Duration.ofSeconds(3));
+                site.setWellKnownBaseUrl(api.homeserverUrl());
+                waitUntil(service::isReady, Duration.ofSeconds(8));
+                assertTrue(api.whoamiCallCount() >= 1);
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
     void followsAWellKnownRedirectToFindTheClientApi() throws Exception {
         String roomId = "!room:example.com";
         try (MockMatrixServer api = new MockMatrixServer("token", "@bot:example.com");
@@ -952,13 +973,12 @@ public class BridgeServiceTest {
                 waitUntil(() -> server.whoamiCallCount() >= 2, Duration.ofSeconds(4));
                 assertTrue(service.isRunning());
                 assertTrue(server.whoamiCallCount() <= 3, "retries must back off, not spin");
-                assertEquals(1, server.wellKnownCallCount());
                 assertEquals(1, severe.stream().filter(m -> m.contains("404")).count(), String.valueOf(severe));
 
                 server.setWhoamiNotFound(false);
                 waitUntil(service::isReady, Duration.ofSeconds(6));
                 assertTrue(service.isReady());
-                assertEquals(1, server.wellKnownCallCount());
+                assertEquals(1, severe.stream().filter(m -> m.contains("404")).count(), "the hint is logged once");
             } finally {
                 service.stop();
                 logger.removeHandler(capture);
@@ -1078,6 +1098,73 @@ public class BridgeServiceTest {
                 waitUntil(() -> server.sendCallCount() >= 1, Duration.ofSeconds(2));
             } finally {
                 service.stop();
+            }
+        }
+    }
+
+    @Test
+    void aSyncTokenFromAnotherRoomIsNotReused() throws Exception {
+        String roomId = "!new:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            JsonObject state = new JsonObject();
+            state.addProperty("owner", server.homeserverUrl() + "|@bot:example.com|!old:example.com");
+            state.addProperty("since", "s_old_room");
+            writeState(state);
+            server.enqueueSyncResponse(roomId, "s0", new JsonArray());
+            BridgeService service = new BridgeService();
+            try {
+                service.start(syncOnlySettings(server, roomId), worldRoot, text -> { });
+                waitUntil(service::isReady, Duration.ofSeconds(3));
+                assertEquals(null, queryParam(server.getSyncRequests().get(0).query(), "since"),
+                        "a new room starts with a fresh initial sync");
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void aBotReplyThatKeepsFailingIsLoggedAndDoesNotDelayTheNext() throws Exception {
+        String roomId = "!room:example.com";
+        List<String> warnings = Collections.synchronizedList(new ArrayList<>());
+        Handler capture = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                if (record.getLevel() == Level.WARNING) {
+                    warnings.add(record.getMessage());
+                }
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        Logger logger = Logger.getLogger("MatrixBridge");
+        logger.addHandler(capture);
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            JsonObject state = new JsonObject();
+            state.addProperty("since", "s_old");
+            writeState(state);
+            server.setSendError(3, 503);
+            JsonArray events = new JsonArray();
+            events.add(matrixTextEvent("$c1", "@alice:example.com", "!mc help"));
+            events.add(matrixTextEvent("$c2", "@alice:example.com", "!mc help"));
+            server.enqueueSyncResponse(roomId, "s1", events);
+            BridgeService service = new BridgeService();
+            try {
+                service.start(syncOnlySettings(server, roomId), worldRoot, text -> { });
+                waitUntil(() -> server.getSendRequests().size() >= 4, Duration.ofSeconds(8));
+                assertTrue(warnings.stream().anyMatch(m -> m.contains("bot reply") && m.contains("dropping")),
+                        String.valueOf(warnings));
+            } finally {
+                service.stop();
+                logger.removeHandler(capture);
             }
         }
     }

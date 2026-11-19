@@ -5,10 +5,7 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.players.PlayerList;
-import net.minecraftforge.common.MinecraftForge;
-import net.minecraftforge.event.CommandEvent;
 import net.minecraftforge.event.ServerChatEvent;
-import net.minecraftforge.eventbus.api.EventPriority;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -31,17 +28,17 @@ final class Forge1190MinecraftCompat extends ForgeMinecraftCompat {
 
     private final Method broadcast;
     private final Object systemChatType;
+    /**
+     * Decorates the message argument of /say, /me, /msg and /teammsg on 1.19.0. Its code (lambdas
+     * included) is on the stack whenever Forge 41 fires ServerChatEvent for a command, on whichever
+     * task that happens; chat typed into the chat box is decorated by ServerGamePacketListenerImpl.
+     */
+    static final String COMMAND_MESSAGE_CLASS = "net.minecraft.commands.arguments.MessageArgument$ChatMessage";
+
     private final Method chatMessage;
-    private final Method rawMessage;
-    private final CommandEchoes commandEchoes = new CommandEchoes();
 
     Forge1190MinecraftCompat() {
         this(PlayerList.class, ChatType.class, ServerChatEvent.class);
-        // Fires synchronously with the whole command line, before the message argument is
-        // decorated (asynchronously) and ServerChatEvent fires for it.
-        MinecraftForge.EVENT_BUS.addListener(EventPriority.LOWEST, false, CommandEvent.class,
-                event -> commandEchoes.noteCommand(event.getParseResults().getReader().getString(),
-                        System.currentTimeMillis()));
     }
 
     Forge1190MinecraftCompat(Class<?> playerList, Class<?> chatType, Class<?> chatEvent) {
@@ -58,10 +55,6 @@ final class Forge1190MinecraftCompat extends ForgeMinecraftCompat {
             // getMessage() is the text as typed; getComponent() is what Forge broadcasts after
             // other mods filtered or cleared it, so relay that.
             chatMessage = chatEvent.getMethod("getComponent");
-            rawMessage = chatEvent.getMethod("getMessage");
-            if (rawMessage.getReturnType() != String.class) {
-                throw new IllegalStateException("Unexpected Forge 41 chat event: " + rawMessage);
-            }
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("Missing Minecraft 1.19 / Forge 41 API", e);
         }
@@ -81,11 +74,15 @@ final class Forge1190MinecraftCompat extends ForgeMinecraftCompat {
         // Forge 41 also fires ServerChatEvent for the text of /say, /me, /msg and /teammsg, before
         // the command picks its recipients (and with no player for the console). Only chat typed
         // into the chat box is relayed, so private messages stay private.
-        if (event.getPlayer() == null
-                || commandEchoes.consume((String) invoke(rawMessage, event), System.currentTimeMillis())) {
+        if (event.getPlayer() == null || calledFrom(COMMAND_MESSAGE_CLASS)) {
             return "";
         }
         return chatText(invoke(chatMessage, event));
+    }
+
+    static boolean calledFrom(String className) {
+        return StackWalker.getInstance().walk(frames ->
+                frames.anyMatch(frame -> frame.getClassName().equals(className)));
     }
 
     /** Text of the broadcast chat component; empty when a mod removed the message. */

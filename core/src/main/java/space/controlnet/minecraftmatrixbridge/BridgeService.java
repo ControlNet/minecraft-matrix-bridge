@@ -37,6 +37,7 @@ public final class BridgeService {
     /** "> <@user:server>" or, for an emote, "> * <@user:server>". */
     private static final java.util.regex.Pattern REPLY_FALLBACK_START =
             java.util.regex.Pattern.compile("> (\\* )?<@[^\\s:>]+:[^\\s>]+>");
+    private static final int BOT_REPLY_ATTEMPTS = 3;
     private static final int MAX_BACKFILL_EVENTS = 1000;
     // Pages may be empty (the server filters them after reading), so requests are capped separately.
     private static final int MAX_BACKFILL_REQUESTS = 50;
@@ -309,13 +310,15 @@ public final class BridgeService {
             }
             selfUserId = userId;
             sinceStore.saveSelfUserId(userId);
-            sinceStore.bindOwner(settings.homeserver + "|" + userId);
 
             String roomId = resolveRoomIdWithRetry(settings.roomId);
             if (!running.get() || roomId == null || roomId.isBlank()) {
                 return;
             }
             resolvedRoomId = roomId;
+            // A token is a position in this account's sync stream; reused for another room it
+            // would replay that room's messages since the token.
+            sinceStore.bindOwner(settings.homeserver + "|" + userId + "|" + roomId);
 
             if (!verifyJoinedRoomWithRetry(roomId)) {
                 return;
@@ -378,7 +381,7 @@ public final class BridgeService {
 
     private String resolveSelfUserIdWithRetry() {
         long backoffMs = 1_000;
-        boolean triedDiscovery = false;
+        boolean loggedNotFound = false;
         while (running.get()) {
             try {
                 return matrixClient.whoami();
@@ -388,16 +391,19 @@ public final class BridgeService {
                     running.set(false);
                     return null;
                 }
-                if (e.statusCode == 404 && !triedDiscovery) {
-                    // The URL may be the server name rather than the client API. It may also be
-                    // a reverse proxy whose route is not up yet, so keep retrying either way.
-                    triedDiscovery = true;
+                if (e.statusCode == 404) {
+                    // The URL may be the server name rather than the client API, whose
+                    // delegation may itself not be served yet. It may also be a reverse proxy
+                    // whose route is not up yet. Look again on every retry; hint once.
                     if (useWellKnownClientApi()) {
                         continue;
                     }
                     if (Thread.currentThread().isInterrupted()) {
                         return null;
                     }
+                }
+                if (e.statusCode == 404 && !loggedNotFound) {
+                    loggedNotFound = true;
                     LOGGER.severe("Matrix whoami returned HTTP 404 at " + matrixClient.baseUrl()
                             + ". matrix.homeserver must be the client API URL (for example https://matrix.example.com),"
                             + " and no /.well-known/matrix/client delegation was found. Retrying in case the"
@@ -1198,22 +1204,24 @@ public final class BridgeService {
 
         long backoffMs = 1_000;
         String transactionId = UUID.randomUUID().toString();
-        for (int attempt = 0; running.get() && attempt < 3; attempt++) {
+        for (int attempt = 1; running.get(); attempt++) {
+            boolean last = attempt >= BOT_REPLY_ATTEMPTS;
             try {
                 client.sendText(roomId, text, transactionId);
                 return;
             } catch (MatrixClient.MatrixException e) {
-                if (isRetryable(e)) {
-                    long sleepMs = e.statusCode == 429 && e.retryAfterMs > 0 ? e.retryAfterMs : jitter(backoffMs);
-                    sleepMs(sleepMs);
-                    backoffMs = nextBackoff(backoffMs);
-                    continue;
+                if (!isRetryable(e) || last) {
+                    LOGGER.warning("Matrix bot reply failed (" + e.getMessage() + "); dropping.");
+                    return;
                 }
-                LOGGER.warning("Matrix bot reply failed (" + e.getMessage() + "); dropping.");
-                return;
+                sleepMs(e.statusCode == 429 && e.retryAfterMs > 0 ? e.retryAfterMs : jitter(backoffMs));
+                backoffMs = nextBackoff(backoffMs);
             } catch (IOException e) {
-                long sleepMs = jitter(backoffMs);
-                sleepMs(sleepMs);
+                if (last) {
+                    LOGGER.warning("Matrix bot reply failed (" + e + "); dropping.");
+                    return;
+                }
+                sleepMs(jitter(backoffMs));
                 backoffMs = nextBackoff(backoffMs);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();

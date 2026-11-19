@@ -62,22 +62,27 @@ class Forge1190MinecraftCompatTest {
         }
     }
 
-    /** Forge 42+ shape: getMessage() returns the broadcast Component, not the raw text. */
-    public static final class SyntheticComponentMessageEvent {
-        public Component getMessage() {
-            return null;
-        }
-
-        public Component getComponent() {
-            return null;
+    /** Stand-in for MessageArgument$ChatMessage: decorates a command's message, possibly in a later task. */
+    static final class CommandMessageDecorator {
+        static boolean decorate() {
+            return Forge1190MinecraftCompat.calledFrom(CommandMessageDecorator.class.getName());
         }
     }
 
     @Test
-    void needsTheRawTextToRecognizeCommandMessages() {
-        assertThrows(IllegalStateException.class,
-                () -> new Forge1190MinecraftCompat(SyntheticPlayerList.class, SyntheticChatType.class,
-                        SyntheticComponentMessageEvent.class));
+    void chatEventsFromACommandsMessageArgumentAreRecognized() throws Exception {
+        assertFalse(Forge1190MinecraftCompat.calledFrom(CommandMessageDecorator.class.getName()), "chat box");
+        assertTrue(CommandMessageDecorator.decorate());
+        // 1.19.0 resolves the argument with thenComposeAsync: the decorating frame is still on that task's stack.
+        assertTrue(java.util.concurrent.CompletableFuture.completedFuture(null)
+                .thenComposeAsync(ignored -> java.util.concurrent.CompletableFuture.completedFuture(CommandMessageDecorator.decorate()))
+                .get());
+    }
+
+    @Test
+    void targetsTheClassThatDecoratesCommandMessages() {
+        assertEquals("net.minecraft.commands.arguments.MessageArgument$ChatMessage",
+                Forge1190MinecraftCompat.COMMAND_MESSAGE_CLASS);
     }
 
     @Test
