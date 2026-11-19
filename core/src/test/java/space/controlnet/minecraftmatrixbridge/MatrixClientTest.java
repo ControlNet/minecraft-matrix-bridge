@@ -63,18 +63,39 @@ public class MatrixClientTest {
         try {
             MatrixClient client = new MatrixClient("http://127.0.0.1:" + server.getAddress().getPort(), "token");
             for (String unreadable : new String[] {"", "Unavailable", "<html>Down</html>", "[]",
-                    "{status:'unavailable'}", "{} trailing"}) {
+                    "{status:'unavailable'}", "{} trailing", "{\"maintenance\":True}", "{}",
+                    "{\"m.homeserver\":{\"base_url\":\"matrix.example.com\"}}"}) {
                 body.set(unreadable);
                 org.junit.jupiter.api.Assertions.assertThrows(java.io.IOException.class, client::discoverClientBaseUrl,
                         "body: " + unreadable);
             }
-            body.set("{}");
-            assertEquals("", client.discoverClientBaseUrl(), "a document without m.homeserver delegates nothing");
+            body.set("{\"m.homeserver\":{\"base_url\":\"https://matrix.example.com/\"}}");
+            assertEquals("https://matrix.example.com", client.discoverClientBaseUrl());
+            // Only a missing document means there is no delegation.
             status.set(404);
             body.set("");
             assertEquals("", client.discoverClientBaseUrl());
         } finally {
             server.stop(0);
+        }
+    }
+
+    @Test
+    void aSyncResponseWithoutAStringNextBatchIsAnError() throws Exception {
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            MatrixClient client = new MatrixClient(server.homeserverUrl(), "token");
+            JsonObject noToken = new JsonObject();
+            server.enqueueSync(noToken);
+            JsonObject booleanToken = new JsonObject();
+            booleanToken.addProperty("next_batch", false);
+            server.enqueueSync(booleanToken);
+            JsonObject blankToken = new JsonObject();
+            blankToken.addProperty("next_batch", " ");
+            server.enqueueSync(blankToken);
+            for (int i = 0; i < 3; i++) {
+                org.junit.jupiter.api.Assertions.assertThrows(java.io.IOException.class,
+                        () -> client.syncOnce("s0", 0, "{}"));
+            }
         }
     }
 

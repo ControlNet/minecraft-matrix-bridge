@@ -832,17 +832,11 @@ public final class BridgeService {
         long backoffMs = 1_000;
         while (running.get()) {
             try {
+                // syncOnce rejects a response without next_batch, which is retried below.
                 MatrixClient.SyncResult result = matrixClient.syncOnce("", 0, uncachedFilter(filterJson));
-                if (result.nextBatch != null && !result.nextBatch.isBlank()) {
-                    sinceStore.saveSince(result.nextBatch);
-                    LOGGER.info("MatrixBridge initial sync complete; starting from next_batch.");
-                    return result.nextBatch;
-                }
-                // Without a position, the next sync would be another snapshot taken as new messages.
-                long sleepMs = jitter(backoffMs);
-                LOGGER.warning("Matrix initial sync returned no next_batch; retrying in " + sleepMs + " ms.");
-                sleepMs(sleepMs);
-                backoffMs = nextBackoff(backoffMs);
+                sinceStore.saveSince(result.nextBatch);
+                LOGGER.info("MatrixBridge initial sync complete; starting from next_batch.");
+                return result.nextBatch;
             } catch (MatrixClient.MatrixException e) {
                 if (e.statusCode == 401 || e.statusCode == 403) {
                     logAuthErrorOnce("Matrix initial sync failed (HTTP " + e.statusCode + "). Check access token / permissions.");

@@ -98,7 +98,9 @@ public final class MatrixClient {
     /**
      * Reads {@code m.homeserver.base_url} from {@code /.well-known/matrix/client} on the
      * configured URL, for setups where the configured URL is the server name rather than the
-     * client API. Returns an empty string when there is no usable delegation.
+     * client API. Returns an empty string when there is no document (404). Any other answer
+     * without a usable {@code m.homeserver.base_url} throws, since it says nothing about whether
+     * the delegation still exists.
      */
     public String discoverClientBaseUrl() throws IOException, InterruptedException {
         HttpRequest request = newRequest()
@@ -135,17 +137,15 @@ public final class MatrixClient {
         if (parsed == null || !parsed.isJsonObject()) {
             throw new IOException("response is not a JSON object");
         }
-        try {
-            JsonObject homeserverInfo = parsed.isJsonObject() ? getObject(parsed.getAsJsonObject(), "m.homeserver") : null;
-            String baseUrl = stripTrailingSlash(getString(homeserverInfo, "base_url"));
-            // Never let a delegation downgrade an https homeserver to plain http.
-            if (homeserver.startsWith("https://") && !baseUrl.startsWith("https://")) {
-                return "";
-            }
-            return baseUrl.startsWith("https://") || baseUrl.startsWith("http://") ? baseUrl : "";
-        } catch (RuntimeException e) {
-            return "";
+        String baseUrl = stripTrailingSlash(getString(getObject(parsed.getAsJsonObject(), "m.homeserver"), "base_url"));
+        // Never let a delegation downgrade an https homeserver to plain http.
+        boolean usable = homeserver.startsWith("https://")
+                ? baseUrl.startsWith("https://")
+                : baseUrl.startsWith("https://") || baseUrl.startsWith("http://");
+        if (!usable) {
+            throw new IOException("no usable m.homeserver.base_url");
         }
+        return baseUrl;
     }
 
     Duration syncRequestTimeout(int timeoutMs) {
@@ -528,7 +528,13 @@ public final class MatrixClient {
         }
 
         JsonObject root = JsonParser.parseString(response.body()).getAsJsonObject();
-        String nextBatch = getString(root, "next_batch");
+        JsonElement token = root.get("next_batch");
+        // Without a position the response cannot be resumed from; treat it like a failed request.
+        if (token == null || !token.isJsonPrimitive() || !token.getAsJsonPrimitive().isString()
+                || token.getAsString().isBlank()) {
+            throw new IOException("sync response without next_batch");
+        }
+        String nextBatch = token.getAsString();
         JsonObject joinedRooms = new JsonObject();
         JsonObject rooms = getObject(root, "rooms");
         if (rooms != null) {
