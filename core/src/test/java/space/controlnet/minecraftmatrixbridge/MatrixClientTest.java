@@ -48,6 +48,36 @@ public class MatrixClientTest {
     }
 
     @Test
+    void discoveryTellsAMissingDelegationFromAnUnreadableAnswer() throws Exception {
+        com.sun.net.httpserver.HttpServer server =
+                com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        java.util.concurrent.atomic.AtomicReference<String> body = new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicInteger status = new java.util.concurrent.atomic.AtomicInteger(200);
+        server.createContext("/", exchange -> {
+            byte[] bytes = body.get().getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(status.get(), bytes.length == 0 ? -1 : bytes.length);
+            exchange.getResponseBody().write(bytes);
+            exchange.close();
+        });
+        server.start();
+        try {
+            MatrixClient client = new MatrixClient("http://127.0.0.1:" + server.getAddress().getPort(), "token");
+            for (String unreadable : new String[] {"", "Unavailable", "<html>Down</html>", "[]"}) {
+                body.set(unreadable);
+                org.junit.jupiter.api.Assertions.assertThrows(java.io.IOException.class, client::discoverClientBaseUrl,
+                        "body: " + unreadable);
+            }
+            body.set("{}");
+            assertEquals("", client.discoverClientBaseUrl(), "a document without m.homeserver delegates nothing");
+            status.set(404);
+            body.set("");
+            assertEquals("", client.discoverClientBaseUrl());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void explicitTransactionIdIsRetainedAcrossRetries() throws Exception {
         try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
             server.setSendRateLimit(1, 1);

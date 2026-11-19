@@ -26,7 +26,7 @@ import java.util.logging.LogRecord;
 import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class BridgeServiceTest {
@@ -1019,15 +1019,6 @@ public class BridgeServiceTest {
         }
     }
 
-    private String sinceOnDisk() {
-        try {
-            JsonObject state = stateOnDisk();
-            return state.has("since") ? state.get("since").getAsString() : "";
-        } catch (Exception e) {
-            return "";
-        }
-    }
-
     private JsonObject stateOnDisk() throws Exception {
         Path statePath = worldRoot.resolve("data").resolve("minecraftmatrixbridge").resolve("state.json");
         return JsonParser.parseString(Files.readString(statePath, StandardCharsets.UTF_8)).getAsJsonObject();
@@ -1231,102 +1222,31 @@ public class BridgeServiceTest {
     }
 
     @Test
-    void messagesSentBeforeAFreshSyncAreNotForwardedLater() throws Exception {
+    void eachFreshSyncSendsTheFilterAsANewRequest() throws Exception {
         String roomId = "!room:example.com";
-        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
-            server.setJoinedRooms(List.of(roomId));
-            // Synapse can answer a fresh sync from a recent identical one, whose next_batch
-            // predates messages sent since; they then arrive in the next sync.
-            server.enqueueSyncResponse(roomId, "s_cached", new JsonArray());
-            JsonArray latest = new JsonArray();
-            latest.add(matrixTextEvent("$old", "@alice:example.com", "sent before the switch"));
-            server.setMessagesPage("", latest, "");
-            JsonArray events = new JsonArray();
-            events.add(matrixTextEvent("$older", "@alice:example.com", "sent long before"));
-            events.add(matrixTextEvent("$old", "@alice:example.com", "sent before the switch"));
-            events.add(matrixTextEvent("$new", "@alice:example.com", "sent after"));
-            server.enqueueSyncResponse(roomId, "s1", events);
-            List<String> received = Collections.synchronizedList(new ArrayList<>());
-            BridgeService service = new BridgeService();
-            try {
-                service.start(syncOnlySettings(server, roomId), worldRoot, received::add);
-                waitUntil(() -> !received.isEmpty(), Duration.ofSeconds(3));
-                waitUntil(() -> "s1".equals(sinceOnDisk()), Duration.ofSeconds(3));
-                assertEquals(1, received.size(), received.toString());
-                assertTrue(received.get(0).contains("sent after"), received.toString());
-                assertFalse(stateOnDisk().has("fresh_boundary"), "only the first sync after a fresh one is trimmed");
-            } finally {
-                service.stop();
+        List<String> freshFilters = new ArrayList<>();
+        String incrementalFilter = "";
+        for (int start = 0; start < 2; start++) {
+            try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+                server.setJoinedRooms(List.of(roomId));
+                server.enqueueSyncResponse(roomId, "s0", new JsonArray());
+                server.enqueueSyncResponse(roomId, "s1", new JsonArray());
+                writeState(new JsonObject());
+                BridgeService service = new BridgeService();
+                try {
+                    service.start(syncOnlySettings(server, roomId), worldRoot, text -> { });
+                    waitUntil(() -> server.getSyncRequests().size() >= 2, Duration.ofSeconds(3));
+                    freshFilters.add(queryParam(server.getSyncRequests().get(0).query(), "filter"));
+                    incrementalFilter = queryParam(server.getSyncRequests().get(1).query(), "filter");
+                } finally {
+                    service.stop();
+                }
             }
         }
-    }
-
-    /** Runs a fresh start whose next_batch predates "$old1" and "$old2"; returns what reached Minecraft. */
-    private List<String> freshStartAfterACachedSync(MockMatrixServer server, JsonArray firstSync, JsonArray secondSync)
-            throws Exception {
-        String roomId = "!room:example.com";
-        server.setJoinedRooms(List.of(roomId));
-        server.enqueueSyncResponse(roomId, "s_cached", new JsonArray());
-        server.enqueueSyncResponse(roomId, "s1", firstSync);
-        server.enqueueSyncResponse(roomId, "s2", secondSync);
-        List<String> received = Collections.synchronizedList(new ArrayList<>());
-        BridgeService service = new BridgeService();
-        try {
-            service.start(syncOnlySettings(server, roomId), worldRoot, received::add);
-            waitUntil(() -> "s2".equals(sinceOnDisk()), Duration.ofSeconds(15));
-            return new ArrayList<>(received);
-        } finally {
-            service.stop();
-        }
-    }
-
-    private static JsonArray events(JsonObject... events) {
-        JsonArray array = new JsonArray();
-        for (JsonObject event : events) {
-            array.add(event);
-        }
-        return array;
-    }
-
-    @Test
-    void theBoundaryIsHeldUntilTheSyncThatCarriesIt() throws Exception {
-        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
-            server.setMessagesPage("", events(matrixTextEvent("$old2", "@alice:example.com", "old two")), "");
-            List<String> received = freshStartAfterACachedSync(server,
-                    events(matrixTextEvent("$old1", "@alice:example.com", "old one")),
-                    events(matrixTextEvent("$old2", "@alice:example.com", "old two"),
-                            matrixTextEvent("$new", "@alice:example.com", "sent after")));
-            assertEquals(1, received.size(), received.toString());
-            assertTrue(received.get(0).contains("sent after"), received.toString());
-            String boundaryQuery = server.getMessagesRequests().get(0).query();
-            assertEquals("s_cached", queryParam(boundaryQuery, "to"), "only messages after the fresh token count");
-        }
-    }
-
-    @Test
-    void anEmptyFilteredPageDoesNotHideTheBoundary() throws Exception {
-        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
-            // The newest events are filtered out (e.g. from an ignored user); the page is empty but goes on.
-            server.setMessagesPage("", new JsonArray(), "p2");
-            server.setMessagesPage("p2", events(matrixTextEvent("$old1", "@alice:example.com", "old one")), "");
-            List<String> received = freshStartAfterACachedSync(server,
-                    events(matrixTextEvent("$old1", "@alice:example.com", "old one")),
-                    events(matrixTextEvent("$new", "@alice:example.com", "sent after")));
-            assertEquals(1, received.size(), received.toString());
-            assertTrue(received.get(0).contains("sent after"), received.toString());
-        }
-    }
-
-    @Test
-    void theBoundaryLookupIsRetriedUntilItAnswers() throws Exception {
-        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
-            server.setMessagesError(5, 503);
-            server.setMessagesPage("", events(matrixTextEvent("$old1", "@alice:example.com", "old one")), "");
-            List<String> received = freshStartAfterACachedSync(server,
-                    events(matrixTextEvent("$old1", "@alice:example.com", "old one")),
-                    events(matrixTextEvent("$new", "@alice:example.com", "sent after")));
-            assertEquals(1, received.size(), received.toString());
-            assertTrue(received.get(0).contains("sent after"), received.toString());
+        // Synapse would answer a repeated fresh sync from its cache, with an older next_batch.
+        assertNotEquals(freshFilters.get(0), freshFilters.get(1));
+        for (String filter : freshFilters) {
+            assertEquals(JsonParser.parseString(incrementalFilter), JsonParser.parseString(filter));
         }
     }
 
@@ -1378,37 +1298,6 @@ public class BridgeServiceTest {
                 site.setWellKnownBaseUrl(replacement.homeserverUrl());
                 waitUntil(service::isReady, Duration.ofSeconds(8));
                 assertTrue(service.isReady());
-            } finally {
-                service.stop();
-            }
-        }
-    }
-
-    @Test
-    void theFreshSyncBoundarySurvivesARestart() throws Exception {
-        String roomId = "!room:example.com";
-        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
-            server.setJoinedRooms(List.of(roomId));
-            // Stopped after the fresh sync, before the sync that carries the older messages.
-            JsonObject state = new JsonObject();
-            state.addProperty("since", "s_cached");
-            state.addProperty("fresh_boundary", "$old");
-            writeState(state);
-            JsonArray events = new JsonArray();
-            events.add(matrixTextEvent("$old", "@alice:example.com", "sent before the switch"));
-            events.add(matrixTextEvent("$new", "@alice:example.com", "sent after"));
-            server.enqueueSyncResponse(roomId, "s1", events);
-            JsonArray later = new JsonArray();
-            later.add(matrixTextEvent("$later", "@alice:example.com", "next message"));
-            server.enqueueSyncResponse(roomId, "s2", later);
-            List<String> received = Collections.synchronizedList(new ArrayList<>());
-            BridgeService service = new BridgeService();
-            try {
-                service.start(syncOnlySettings(server, roomId), worldRoot, received::add);
-                waitUntil(() -> received.size() >= 2, Duration.ofSeconds(3));
-                assertEquals(2, received.size(), received.toString());
-                assertTrue(received.get(0).contains("sent after"), received.toString());
-                assertTrue(received.get(1).contains("next message"), received.toString());
             } finally {
                 service.stop();
             }

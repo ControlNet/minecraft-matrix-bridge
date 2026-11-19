@@ -67,13 +67,6 @@ public final class BridgeService {
 
     private volatile String selfUserId = "";
     private volatile String resolvedRoomId = "";
-    /**
-     * The latest message sent before a fresh sync that its next_batch does not cover yet, or empty.
-     * Synapse may answer a fresh sync with a recent identical response (e.g. after switching rooms
-     * and back) whose next_batch is older; the syncs after it then carry those messages, which are
-     * skipped up to and including this one.
-     */
-    private volatile String freshBoundaryEventId = "";
     private volatile boolean announcedConnected = false;
     private volatile long lastQueueFullLogMs = 0;
     private volatile long lastTapQueueFullLogMs = 0;
@@ -737,7 +730,6 @@ public final class BridgeService {
         String roomId = resolvedRoomId;
         String filterJson = buildFilterJson(roomId, settings.timelineLimit);
         String since = sinceStore.loadSince();
-        freshBoundaryEventId = sinceStore.loadFreshBoundary();
 
         if (since == null || since.isBlank()) {
             since = initialCatchup(filterJson);
@@ -763,7 +755,7 @@ public final class BridgeService {
                 }
                 if (result.nextBatch != null && !result.nextBatch.isBlank()) {
                     since = result.nextBatch;
-                    sinceStore.saveFreshSince(since, freshBoundaryEventId);
+                    sinceStore.saveSince(since);
                 }
                 markReady();
                 backoffMs = 1_000;
@@ -821,18 +813,28 @@ public final class BridgeService {
                 && !"M_UNRECOGNIZED".equals(e.errcode) && !"M_LIMIT_EXCEEDED".equals(e.errcode);
     }
 
+    /**
+     * The same filter written differently for each fresh sync. Synapse answers a request identical
+     * to a recent one (the raw filter string is part of the key) with that cached response, whose
+     * next_batch is older: after switching rooms and back, the following syncs would replay what
+     * was sent in between. Whitespace changes the string, not the filter.
+     */
+    static String uncachedFilter(String filterJson) {
+        long nonce = java.util.concurrent.ThreadLocalRandom.current().nextLong();
+        StringBuilder padding = new StringBuilder(64);
+        for (int bit = 0; bit < 64; bit++) {
+            padding.append((nonce >>> bit & 1) == 0 ? ' ' : '\t');
+        }
+        return "{" + padding + filterJson.substring(1);
+    }
+
     private String initialCatchup(String filterJson) {
         long backoffMs = 1_000;
         while (running.get()) {
             try {
-                MatrixClient.SyncResult result = matrixClient.syncOnce("", 0, filterJson);
+                MatrixClient.SyncResult result = matrixClient.syncOnce("", 0, uncachedFilter(filterJson));
                 if (result.nextBatch != null && !result.nextBatch.isBlank()) {
-                    String boundary = latestMessageAfter(result.nextBatch);
-                    if (!running.get()) {
-                        return "";
-                    }
-                    freshBoundaryEventId = boundary;
-                    sinceStore.saveFreshSince(result.nextBatch, boundary);
+                    sinceStore.saveSince(result.nextBatch);
                     LOGGER.info("MatrixBridge initial sync complete; starting from next_batch.");
                     return result.nextBatch;
                 }
@@ -904,7 +906,6 @@ public final class BridgeService {
         if (timelineEvents != null) {
             timelineEvents.forEach(events::add);
         }
-        skipUntilFreshBoundary(events, limited != null && limited.isJsonPrimitive() && limited.getAsBoolean());
 
         for (JsonElement el : events) {
             if (!running.get()) {
@@ -955,73 +956,6 @@ public final class BridgeService {
                 + " older ones were not forwarded.");
         Collections.reverse(newestFirst);
         return newestFirst;
-    }
-
-    /** Drops what precedes the fresh-sync boundary; events before it arrive until it does. */
-    private void skipUntilFreshBoundary(List<JsonElement> events, boolean limited) {
-        String boundary = freshBoundaryEventId;
-        if (boundary.isBlank()) {
-            return;
-        }
-        for (int i = events.size() - 1; i >= 0; i--) {
-            JsonElement el = events.get(i);
-            if (el != null && el.isJsonObject() && boundary.equals(getString(el.getAsJsonObject(), "event_id"))) {
-                events.subList(0, i + 1).clear();
-                freshBoundaryEventId = "";
-                return;
-            }
-        }
-        if (limited) {
-            // The gap was not filled back to the boundary (capped or refused): what came is newer.
-            freshBoundaryEventId = "";
-            return;
-        }
-        events.clear();
-    }
-
-    /**
-     * The newest message after {@code token} (a sync token), or empty when there is none.
-     * Retried until the homeserver answers, since without it older messages would be forwarded.
-     */
-    private String latestMessageAfter(String token) throws InterruptedException {
-        long backoffMs = 1_000;
-        while (running.get()) {
-            try {
-                String from = "";
-                for (int request = 0; request < MAX_BACKFILL_REQUESTS; request++) {
-                    MatrixClient.MessagesPage page = fetchBackfillPage(resolvedRoomId, from, token, 1, MESSAGE_FILTER);
-                    for (JsonElement event : page.chunk) {
-                        String eventId = event.isJsonObject() ? getString(event.getAsJsonObject(), "event_id") : "";
-                        if (!eventId.isBlank()) {
-                            return eventId;
-                        }
-                    }
-                    // Filtered pages can be empty and still go on.
-                    if (page.end.isBlank() || page.end.equals(from)) {
-                        return "";
-                    }
-                    from = page.end;
-                }
-                return "";
-            } catch (MatrixClient.MatrixException e) {
-                if (!isRetryable(e)) {
-                    LOGGER.warning("MatrixBridge could not read the messages sent before the initial sync (" + e.getMessage()
-                            + "); some of them may be forwarded.");
-                    return "";
-                }
-                long sleepMs = e.statusCode == 429 && e.retryAfterMs > 0 ? e.retryAfterMs : jitter(backoffMs);
-                LOGGER.warning("MatrixBridge could not read the messages sent before the initial sync (" + e.getMessage()
-                        + "); retrying in " + sleepMs + " ms.");
-                sleepMs(sleepMs);
-            } catch (IOException e) {
-                long sleepMs = jitter(backoffMs);
-                LOGGER.warning("MatrixBridge could not read the messages sent before the initial sync (" + e
-                        + "); retrying in " + sleepMs + " ms.");
-                sleepMs(sleepMs);
-            }
-            backoffMs = nextBackoff(backoffMs);
-        }
-        return "";
     }
 
     /** One page, retried briefly on timeouts, rate limits and server errors. */

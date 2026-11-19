@@ -125,6 +125,10 @@ public final class MatrixClient {
         } catch (RuntimeException e) {
             throw new IOException("unreadable response", e);
         }
+        // Gson also reads "" and a bare word; only an object is a .well-known document.
+        if (!parsed.isJsonObject()) {
+            throw new IOException("response is not a JSON object");
+        }
         try {
             JsonObject homeserverInfo = parsed.isJsonObject() ? getObject(parsed.getAsJsonObject(), "m.homeserver") : null;
             String baseUrl = stripTrailingSlash(getString(homeserverInfo, "base_url"));
@@ -642,10 +646,9 @@ public final class MatrixClient {
      */
     public MessagesPage roomMessagesBackwards(String roomId, String from, String to, int limit, String filterJson)
             throws IOException, InterruptedException, MatrixException {
-        // Without "from" the page starts at the latest event.
         String uri = roomPath(roomId) + "/messages?dir=b"
-                + (from == null || from.isBlank() ? "" : "&from=" + urlEncodeQuery(from))
-                + (to == null || to.isBlank() ? "" : "&to=" + urlEncodeQuery(to))
+                + "&from=" + urlEncodeQuery(from)
+                + "&to=" + urlEncodeQuery(to)
                 + "&limit=" + limit
                 + "&filter=" + urlEncodeQuery(filterJson);
         JsonObject response = getJson(uri, "messages");
