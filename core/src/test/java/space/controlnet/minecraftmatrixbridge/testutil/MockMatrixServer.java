@@ -188,6 +188,19 @@ public final class MockMatrixServer implements AutoCloseable {
         messagesPages.put(from, page);
     }
 
+    private volatile int messagesErrorRemaining;
+    private volatile int messagesErrorStatus;
+
+    /** Fail the next {@code times} {@code /messages} requests with {@code status} and no Matrix errcode. */
+    public void setMessagesError(int times, int status) {
+        messagesErrorStatus = status;
+        messagesErrorRemaining = Math.max(0, times);
+    }
+
+    public int pendingSyncErrors() {
+        return syncErrorRemaining;
+    }
+
     public List<RecordedRequest> getMessagesRequests() {
         synchronized (messagesRequests) {
             return List.copyOf(messagesRequests);
@@ -613,6 +626,11 @@ public final class MockMatrixServer implements AutoCloseable {
     private void handleMessages(HttpExchange exchange) throws IOException {
         String query = exchange.getRequestURI().getRawQuery();
         messagesRequests.add(new RecordedRequest("GET", exchange.getRequestURI().getRawPath(), query, null, ""));
+        if (messagesErrorRemaining > 0) {
+            messagesErrorRemaining--;
+            respondPlain(exchange, messagesErrorStatus, "");
+            return;
+        }
         String from = "";
         for (String part : (query == null ? "" : query).split("&")) {
             if (part.startsWith("from=")) {

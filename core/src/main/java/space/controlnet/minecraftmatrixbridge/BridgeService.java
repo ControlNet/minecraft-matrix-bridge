@@ -34,8 +34,11 @@ public final class BridgeService {
     /** Longer Matrix messages are cut so one remote user cannot flood Minecraft chat. */
     static final int MAX_MATRIX_TO_MC_CHARS = 512;
     /** A sync gap (limited timeline) is filled with at most this many pages of history. */
-    private static final int MAX_BACKFILL_PAGES = 10;
+    private static final int MAX_BACKFILL_EVENTS = 1000;
+    // Pages may be empty (the server filters them after reading), so requests are capped separately.
+    private static final int MAX_BACKFILL_REQUESTS = 50;
     private static final int BACKFILL_PAGE_SIZE = 100;
+    private static final int BACKFILL_PAGE_ATTEMPTS = 4;
     private static final int REPLY_QUEUE_SIZE = 32;
 
     private final Object lifecycleLock = new Object();
@@ -731,6 +734,8 @@ public final class BridgeService {
                     // permanently invalid; retrying it would stall Matrix -> MC forever.
                     LOGGER.warning("Matrix rejected the stored sync token (" + e.getMessage() + "); starting a fresh sync.");
                     sinceStore.saveSince("");
+                    // Messages sent before the fresh sync completes are skipped by it.
+                    ready.set(false);
                     since = initialCatchup(filterJson);
                     markReady();
                     backoffMs = 1_000;
@@ -763,8 +768,11 @@ public final class BridgeService {
      * dropping it would skip the messages sent in between.
      */
     private static boolean isRejectedSince(MatrixClient.MatrixException e, String since) {
+        // M_UNRECOGNIZED (endpoint not served, e.g. by a worker during a restart) and rate limits
+        // describe the request, not the token.
         return since != null && !since.isBlank()
-                && (e.statusCode == 400 || e.statusCode == 404) && !e.errcode.isBlank();
+                && (e.statusCode == 400 || e.statusCode == 404) && !e.errcode.isBlank()
+                && !"M_UNRECOGNIZED".equals(e.errcode) && !"M_LIMIT_EXCEEDED".equals(e.errcode);
     }
 
     private String initialCatchup(String filterJson) {
@@ -866,13 +874,13 @@ public final class BridgeService {
         String filter = "{\"types\":[\"m.room.message\"]}";
         List<JsonElement> newestFirst = new ArrayList<>();
         String from = prevBatch;
-        for (int page = 0; page < MAX_BACKFILL_PAGES; page++) {
+        for (int request = 0; request < MAX_BACKFILL_REQUESTS && newestFirst.size() < MAX_BACKFILL_EVENTS; request++) {
             MatrixClient.MessagesPage result;
             try {
-                result = matrixClient.roomMessagesBackwards(roomId, from, previousSince, BACKFILL_PAGE_SIZE, filter);
+                result = fetchBackfillPage(roomId, from, previousSince, filter);
             } catch (MatrixClient.MatrixException e) {
-                if (e.statusCode >= 400 && e.statusCode < 500 && e.statusCode != 429) {
-                    // Not retryable: forward what the sync returned rather than stall on the gap.
+                if (!isRetryable(e)) {
+                    // The room or token is refused: forward what the sync returned rather than stall on the gap.
                     LOGGER.warning("MatrixBridge could not fetch messages missed during a sync gap (" + e.getMessage() + ").");
                     break;
                 }
@@ -886,12 +894,36 @@ public final class BridgeService {
             }
             from = result.end;
         }
-        if (!newestFirst.isEmpty()) {
-            LOGGER.warning("MatrixBridge sync gap exceeded " + (MAX_BACKFILL_PAGES * BACKFILL_PAGE_SIZE)
-                    + " messages; older missed messages were not forwarded.");
-        }
+        LOGGER.warning("MatrixBridge forwarded " + newestFirst.size() + " messages missed during a sync gap;"
+                + " older ones were not forwarded.");
         Collections.reverse(newestFirst);
         return newestFirst;
+    }
+
+    /** One page, retried briefly on timeouts, rate limits and server errors. */
+    private MatrixClient.MessagesPage fetchBackfillPage(String roomId, String from, String to, String filter)
+            throws IOException, InterruptedException, MatrixClient.MatrixException {
+        long backoffMs = 1_000;
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return matrixClient.roomMessagesBackwards(roomId, from, to, BACKFILL_PAGE_SIZE, filter);
+            } catch (MatrixClient.MatrixException e) {
+                if (!isRetryable(e) || attempt >= BACKFILL_PAGE_ATTEMPTS || !running.get()) {
+                    throw e;
+                }
+                sleepMs(e.statusCode == 429 && e.retryAfterMs > 0 ? e.retryAfterMs : jitter(backoffMs));
+            } catch (IOException e) {
+                if (attempt >= BACKFILL_PAGE_ATTEMPTS || !running.get()) {
+                    throw e;
+                }
+                sleepMs(jitter(backoffMs));
+            }
+            backoffMs = nextBackoff(backoffMs);
+        }
+    }
+
+    private static boolean isRetryable(MatrixClient.MatrixException e) {
+        return e.statusCode == 408 || e.statusCode == 429 || e.statusCode >= 500;
     }
 
     private void forwardMatrixEvent(String roomId, JsonObject evt) {
@@ -972,8 +1004,9 @@ public final class BridgeService {
      * that clients put in front of a reply's text.
      */
     static String stripReplyFallback(String body) {
-        // The fallback opens with the quoted sender; anything else is text the user typed.
-        if (body == null || !(body.startsWith("> <") || body.startsWith("> * <"))) {
+        // The fallback opens with the quoted sender's user ID and ends with a blank line;
+        // anything else is text the user typed.
+        if (body == null || !(body.startsWith("> <@") || body.startsWith("> * <@"))) {
             return body;
         }
         String[] lines = body.split("\n", -1);
@@ -981,10 +1014,10 @@ public final class BridgeService {
         while (i < lines.length && lines[i].startsWith(">")) {
             i++;
         }
-        if (i < lines.length && lines[i].isBlank()) {
-            i++;
+        if (i >= lines.length || !lines[i].isEmpty()) {
+            return body;
         }
-        return String.join("\n", java.util.Arrays.copyOfRange(lines, i, lines.length));
+        return String.join("\n", java.util.Arrays.copyOfRange(lines, i + 1, lines.length));
     }
 
     private boolean isBotCommand(String body) {

@@ -170,12 +170,15 @@ public class BridgeServiceTest {
                 assertTrue(received.stream().anyMatch(s -> s.startsWith("Matrix room connected:")), "expected a connected announcement");
                 assertTrue(received.contains(expectedForwarded));
 
-                Path statePath = worldRoot.resolve("data").resolve("minecraftmatrixbridge").resolve("state.json");
-                waitUntil(() -> Files.exists(statePath), Duration.ofSeconds(2));
-
-                String stateJson = Files.readString(statePath, StandardCharsets.UTF_8);
-                JsonObject state = JsonParser.parseString(stateJson).getAsJsonObject();
-                assertEquals("s1", state.get("since").getAsString());
+                // The initial sync already wrote s0; s1 is saved just after its messages are handed over.
+                waitUntil(() -> {
+                    try {
+                        return "s1".equals(stateOnDisk().get("since").getAsString());
+                    } catch (Exception e) {
+                        return false;
+                    }
+                }, Duration.ofSeconds(2));
+                JsonObject state = stateOnDisk();
                 assertEquals(selfUserId, state.get("self_user_id").getAsString());
             } finally {
                 service.stop();
@@ -1276,6 +1279,9 @@ public class BridgeServiceTest {
         // Clients following Matrix v1.13 send replies without a fallback; a quote the user typed stays.
         assertEquals("> 5 minutes", BridgeService.stripReplyFallback("> 5 minutes"));
         assertEquals("> quoted\nanswer", BridgeService.stripReplyFallback("> quoted\nanswer"));
+        assertEquals("> <dependency> is optional", BridgeService.stripReplyFallback("> <dependency> is optional"));
+        // A fallback is always followed by a blank line and the reply itself.
+        assertEquals("> <@bob:example.com> only a quote", BridgeService.stripReplyFallback("> <@bob:example.com> only a quote"));
     }
 
     @Test
@@ -1328,6 +1334,120 @@ public class BridgeServiceTest {
                 assertEquals("/_matrix/client/v3/join/" + roomAlias,
                         java.net.URLDecoder.decode(server.getJoinRequests().get(0).path(), StandardCharsets.UTF_8));
                 assertEquals(roomId, service.getResolvedRoomId());
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void aTimedOutBackfillIsRetried() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            JsonObject state = new JsonObject();
+            state.addProperty("since", "s_old");
+            writeState(state);
+            JsonArray newest = new JsonArray();
+            newest.add(matrixTextEvent("$2", "@alice:example.com", "two"));
+            server.enqueueSyncResponse(roomId, "s1", newest, true, "p_gap");
+            JsonArray older = new JsonArray();
+            older.add(matrixTextEvent("$1", "@alice:example.com", "one"));
+            server.setMessagesPage("p_gap", older, "");
+            server.setMessagesError(1, 408);
+
+            List<String> received = Collections.synchronizedList(new ArrayList<>());
+            BridgeService service = new BridgeService();
+            try {
+                service.start(syncOnlySettings(server, roomId), worldRoot, received::add);
+                waitUntil(() -> received.size() >= 2, Duration.ofSeconds(5));
+                assertEquals(List.of("[Matrix] <@alice:example.com> one", "[Matrix] <@alice:example.com> two"), received);
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void anUnrecognizedEndpointDoesNotDiscardTheSyncToken() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            JsonObject state = new JsonObject();
+            state.addProperty("since", "s_keep");
+            writeState(state);
+            // E.g. a request routed to a worker that does not serve /sync during a restart.
+            server.setSyncError(1, 404, "M_UNRECOGNIZED");
+            JsonArray events = new JsonArray();
+            events.add(matrixTextEvent("$kept", "@alice:example.com", "still here"));
+            server.enqueueSyncResponse(roomId, "s1", events);
+
+            CountDownLatch latch = new CountDownLatch(1);
+            BridgeService service = new BridgeService();
+            try {
+                service.start(syncOnlySettings(server, roomId), worldRoot, text -> {
+                    if (text.endsWith("still here")) {
+                        latch.countDown();
+                    }
+                });
+                assertTrue(latch.await(5, TimeUnit.SECONDS), "the message after the stored token must arrive");
+                assertEquals("s_keep", queryParam(server.getSyncRequests().get(1).query(), "since"));
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void backfillIsBoundedByMessagesNotByRequests() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            JsonObject state = new JsonObject();
+            state.addProperty("since", "s_old");
+            writeState(state);
+            JsonArray newest = new JsonArray();
+            newest.add(matrixTextEvent("$2", "@alice:example.com", "two"));
+            server.enqueueSyncResponse(roomId, "s1", newest, true, "p0");
+            // Ten empty pages, each pointing further back, before the one missed message.
+            for (int i = 0; i < 10; i++) {
+                server.setMessagesPage("p" + i, new JsonArray(), "p" + (i + 1));
+            }
+            JsonArray older = new JsonArray();
+            older.add(matrixTextEvent("$1", "@alice:example.com", "one"));
+            server.setMessagesPage("p10", older, "");
+
+            List<String> received = Collections.synchronizedList(new ArrayList<>());
+            BridgeService service = new BridgeService();
+            try {
+                service.start(syncOnlySettings(server, roomId), worldRoot, received::add);
+                waitUntil(() -> received.size() >= 2, Duration.ofSeconds(5));
+                assertEquals(List.of("[Matrix] <@alice:example.com> one", "[Matrix] <@alice:example.com> two"), received);
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void notReadyWhileARejectedTokenIsReplaced() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setJoinedRooms(List.of(roomId));
+            server.enqueueSyncResponse(roomId, "s0", new JsonArray());
+            BridgeService service = new BridgeService();
+            try {
+                service.start(new BridgeSettings(server.homeserverUrl(), roomId, "token", false, true, true,
+                        "[MC] ", "[Matrix] ", "!mc", 0, 20, 100, 64), worldRoot, text -> { });
+                waitUntil(service::isReady, Duration.ofSeconds(3));
+                // The running token gets rejected, and the fresh initial sync is held up by rate limits.
+                server.setSyncRateLimit(2, 1_500);
+                server.setSyncError(1, 400, "M_INVALID_PARAM");
+                waitUntil(() -> server.pendingSyncErrors() == 0, Duration.ofSeconds(3));
+                Thread.sleep(200);
+                assertTrue(!service.isReady(), "messages sent now would be skipped by the fresh sync");
+                assertEquals(null, service.connectedNoticeRoom());
+                waitUntil(service::isReady, Duration.ofSeconds(6));
             } finally {
                 service.stop();
             }
