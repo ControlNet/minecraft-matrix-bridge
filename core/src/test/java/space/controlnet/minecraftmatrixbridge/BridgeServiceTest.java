@@ -1261,6 +1261,129 @@ public class BridgeServiceTest {
         }
     }
 
+    /** Runs a fresh start whose next_batch predates "$old1" and "$old2"; returns what reached Minecraft. */
+    private List<String> freshStartAfterACachedSync(MockMatrixServer server, JsonArray firstSync, JsonArray secondSync)
+            throws Exception {
+        String roomId = "!room:example.com";
+        server.setJoinedRooms(List.of(roomId));
+        server.enqueueSyncResponse(roomId, "s_cached", new JsonArray());
+        server.enqueueSyncResponse(roomId, "s1", firstSync);
+        server.enqueueSyncResponse(roomId, "s2", secondSync);
+        List<String> received = Collections.synchronizedList(new ArrayList<>());
+        BridgeService service = new BridgeService();
+        try {
+            service.start(syncOnlySettings(server, roomId), worldRoot, received::add);
+            waitUntil(() -> "s2".equals(sinceOnDisk()), Duration.ofSeconds(15));
+            return new ArrayList<>(received);
+        } finally {
+            service.stop();
+        }
+    }
+
+    private static JsonArray events(JsonObject... events) {
+        JsonArray array = new JsonArray();
+        for (JsonObject event : events) {
+            array.add(event);
+        }
+        return array;
+    }
+
+    @Test
+    void theBoundaryIsHeldUntilTheSyncThatCarriesIt() throws Exception {
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setMessagesPage("", events(matrixTextEvent("$old2", "@alice:example.com", "old two")), "");
+            List<String> received = freshStartAfterACachedSync(server,
+                    events(matrixTextEvent("$old1", "@alice:example.com", "old one")),
+                    events(matrixTextEvent("$old2", "@alice:example.com", "old two"),
+                            matrixTextEvent("$new", "@alice:example.com", "sent after")));
+            assertEquals(1, received.size(), received.toString());
+            assertTrue(received.get(0).contains("sent after"), received.toString());
+            String boundaryQuery = server.getMessagesRequests().get(0).query();
+            assertEquals("s_cached", queryParam(boundaryQuery, "to"), "only messages after the fresh token count");
+        }
+    }
+
+    @Test
+    void anEmptyFilteredPageDoesNotHideTheBoundary() throws Exception {
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            // The newest events are filtered out (e.g. from an ignored user); the page is empty but goes on.
+            server.setMessagesPage("", new JsonArray(), "p2");
+            server.setMessagesPage("p2", events(matrixTextEvent("$old1", "@alice:example.com", "old one")), "");
+            List<String> received = freshStartAfterACachedSync(server,
+                    events(matrixTextEvent("$old1", "@alice:example.com", "old one")),
+                    events(matrixTextEvent("$new", "@alice:example.com", "sent after")));
+            assertEquals(1, received.size(), received.toString());
+            assertTrue(received.get(0).contains("sent after"), received.toString());
+        }
+    }
+
+    @Test
+    void theBoundaryLookupIsRetriedUntilItAnswers() throws Exception {
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            server.setMessagesError(5, 503);
+            server.setMessagesPage("", events(matrixTextEvent("$old1", "@alice:example.com", "old one")), "");
+            List<String> received = freshStartAfterACachedSync(server,
+                    events(matrixTextEvent("$old1", "@alice:example.com", "old one")),
+                    events(matrixTextEvent("$new", "@alice:example.com", "sent after")));
+            assertEquals(1, received.size(), received.toString());
+            assertTrue(received.get(0).contains("sent after"), received.toString());
+        }
+    }
+
+    @Test
+    void aFailingDiscoveryKeepsTheDelegate() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer api = new MockMatrixServer("token", "@bot:example.com");
+             MockMatrixServer site = new MockMatrixServer("token", "@bot:example.com")) {
+            api.setJoinedRooms(List.of(roomId));
+            site.setWhoamiNotFound(true);
+            site.setWellKnownError(503);
+            api.setWhoamiError(503);
+            BridgeService service = new BridgeService();
+            try {
+                // Start on the delegate (as after an earlier discovery), then let it recover.
+                site.setWellKnownError(0);
+                site.setWellKnownBaseUrl(api.homeserverUrl());
+                service.start(sendOnlySettings(site.homeserverUrl(), roomId, 10), worldRoot, text -> { });
+                waitUntil(() -> api.whoamiCallCount() >= 1, Duration.ofSeconds(3));
+                site.setWellKnownError(503);
+                int lookups = site.wellKnownCallCount();
+                int calls = api.whoamiCallCount();
+                // A whoami failure at the delegate meets a failing discovery.
+                waitUntil(() -> site.wellKnownCallCount() > lookups && api.whoamiCallCount() > calls,
+                        Duration.ofSeconds(5));
+                api.setWhoamiError(0);
+                waitUntil(service::isReady, Duration.ofSeconds(8));
+                assertTrue(service.isReady());
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
+    @Test
+    void aMaintenancePageFromTheDelegateTriggersDiscovery() throws Exception {
+        String roomId = "!room:example.com";
+        try (MockMatrixServer retired = new MockMatrixServer("token", "@bot:example.com");
+             MockMatrixServer replacement = new MockMatrixServer("token", "@bot:example.com");
+             MockMatrixServer site = new MockMatrixServer("token", "@bot:example.com")) {
+            replacement.setJoinedRooms(List.of(roomId));
+            retired.setWhoamiHtml("<html>Down for maintenance</html>");
+            site.setWhoamiNotFound(true);
+            site.setWellKnownBaseUrl(retired.homeserverUrl());
+            BridgeService service = new BridgeService();
+            try {
+                service.start(sendOnlySettings(site.homeserverUrl(), roomId, 10), worldRoot, text -> { });
+                waitUntil(() -> retired.whoamiCallCount() >= 1, Duration.ofSeconds(3));
+                site.setWellKnownBaseUrl(replacement.homeserverUrl());
+                waitUntil(service::isReady, Duration.ofSeconds(8));
+                assertTrue(service.isReady());
+            } finally {
+                service.stop();
+            }
+        }
+    }
+
     @Test
     void theFreshSyncBoundarySurvivesARestart() throws Exception {
         String roomId = "!room:example.com";

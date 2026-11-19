@@ -43,6 +43,7 @@ public final class BridgeService {
     private static final int MAX_BACKFILL_REQUESTS = 50;
     private static final int BACKFILL_PAGE_SIZE = 100;
     private static final int BACKFILL_PAGE_ATTEMPTS = 4;
+    private static final String MESSAGE_FILTER = "{\"types\":[\"m.room.message\"]}";
     private static final int REPLY_QUEUE_SIZE = 32;
 
     private final Object lifecycleLock = new Object();
@@ -67,9 +68,10 @@ public final class BridgeService {
     private volatile String selfUserId = "";
     private volatile String resolvedRoomId = "";
     /**
-     * The room's latest message when the current token came from a fresh sync. Synapse may answer
-     * a fresh sync with a recent identical response (e.g. after switching rooms and back) whose
-     * next_batch is older, so the sync after it can carry messages up to this one; they are skipped.
+     * The latest message sent before a fresh sync that its next_batch does not cover yet, or empty.
+     * Synapse may answer a fresh sync with a recent identical response (e.g. after switching rooms
+     * and back) whose next_batch is older; the syncs after it then carry those messages, which are
+     * skipped up to and including this one.
      */
     private volatile String freshBoundaryEventId = "";
     private volatile boolean announcedConnected = false;
@@ -434,6 +436,11 @@ public final class BridgeService {
                 Thread.currentThread().interrupt();
                 return null;
             } catch (Exception e) {
+                // E.g. an HTML maintenance page answered with 200.
+                if (useWellKnownClientApi() && !switched) {
+                    switched = true;
+                    continue;
+                }
                 long sleepMs = jitter(backoffMs);
                 LOGGER.warning("Matrix whoami unexpected error (" + e + "); retrying in " + sleepMs + " ms.");
                 sleepMs(sleepMs);
@@ -754,10 +761,9 @@ public final class BridgeService {
                 if (!forwardMatrixMessages(result, since)) {
                     continue;
                 }
-                freshBoundaryEventId = "";
                 if (result.nextBatch != null && !result.nextBatch.isBlank()) {
                     since = result.nextBatch;
-                    sinceStore.saveSince(since);
+                    sinceStore.saveFreshSince(since, freshBoundaryEventId);
                 }
                 markReady();
                 backoffMs = 1_000;
@@ -821,7 +827,10 @@ public final class BridgeService {
             try {
                 MatrixClient.SyncResult result = matrixClient.syncOnce("", 0, filterJson);
                 if (result.nextBatch != null && !result.nextBatch.isBlank()) {
-                    String boundary = latestMessageId();
+                    String boundary = latestMessageAfter(result.nextBatch);
+                    if (!running.get()) {
+                        return "";
+                    }
                     freshBoundaryEventId = boundary;
                     sinceStore.saveFreshSince(result.nextBatch, boundary);
                     LOGGER.info("MatrixBridge initial sync complete; starting from next_batch.");
@@ -895,16 +904,7 @@ public final class BridgeService {
         if (timelineEvents != null) {
             timelineEvents.forEach(events::add);
         }
-        String boundary = freshBoundaryEventId;
-        if (!boundary.isBlank()) {
-            for (int i = events.size() - 1; i >= 0; i--) {
-                JsonElement el = events.get(i);
-                if (el != null && el.isJsonObject() && boundary.equals(getString(el.getAsJsonObject(), "event_id"))) {
-                    events.subList(0, i + 1).clear();
-                    break;
-                }
-            }
-        }
+        skipUntilFreshBoundary(events, limited != null && limited.isJsonPrimitive() && limited.getAsBoolean());
 
         for (JsonElement el : events) {
             if (!running.get()) {
@@ -923,7 +923,7 @@ public final class BridgeService {
      */
     private List<JsonElement> backfill(String roomId, String prevBatch, String previousSince)
             throws IOException, InterruptedException, MatrixClient.MatrixException {
-        String filter = "{\"types\":[\"m.room.message\"]}";
+        String filter = MESSAGE_FILTER;
         List<JsonElement> newestFirst = new ArrayList<>();
         String from = prevBatch;
         for (int request = 0; request < MAX_BACKFILL_REQUESTS && newestFirst.size() < MAX_BACKFILL_EVENTS; request++) {
@@ -957,18 +957,71 @@ public final class BridgeService {
         return newestFirst;
     }
 
-    /** The room's latest message ID, or empty when there is none or it cannot be read now. */
-    private String latestMessageId() throws InterruptedException {
-        try {
-            MatrixClient.MessagesPage page = fetchBackfillPage(resolvedRoomId, "", "", 1,
-                    "{\"types\":[\"m.room.message\"]}");
-            JsonElement latest = page.chunk.isEmpty() ? null : page.chunk.get(0);
-            return latest != null && latest.isJsonObject() ? getString(latest.getAsJsonObject(), "event_id") : "";
-        } catch (IOException | MatrixClient.MatrixException e) {
-            LOGGER.warning("MatrixBridge could not read the room's latest message after a fresh sync (" + e
-                    + "); messages sent shortly before it may be forwarded.");
-            return "";
+    /** Drops what precedes the fresh-sync boundary; events before it arrive until it does. */
+    private void skipUntilFreshBoundary(List<JsonElement> events, boolean limited) {
+        String boundary = freshBoundaryEventId;
+        if (boundary.isBlank()) {
+            return;
         }
+        for (int i = events.size() - 1; i >= 0; i--) {
+            JsonElement el = events.get(i);
+            if (el != null && el.isJsonObject() && boundary.equals(getString(el.getAsJsonObject(), "event_id"))) {
+                events.subList(0, i + 1).clear();
+                freshBoundaryEventId = "";
+                return;
+            }
+        }
+        if (limited) {
+            // The gap was not filled back to the boundary (capped or refused): what came is newer.
+            freshBoundaryEventId = "";
+            return;
+        }
+        events.clear();
+    }
+
+    /**
+     * The newest message after {@code token} (a sync token), or empty when there is none.
+     * Retried until the homeserver answers, since without it older messages would be forwarded.
+     */
+    private String latestMessageAfter(String token) throws InterruptedException {
+        long backoffMs = 1_000;
+        while (running.get()) {
+            try {
+                String from = "";
+                for (int request = 0; request < MAX_BACKFILL_REQUESTS; request++) {
+                    MatrixClient.MessagesPage page = fetchBackfillPage(resolvedRoomId, from, token, 1, MESSAGE_FILTER);
+                    for (JsonElement event : page.chunk) {
+                        String eventId = event.isJsonObject() ? getString(event.getAsJsonObject(), "event_id") : "";
+                        if (!eventId.isBlank()) {
+                            return eventId;
+                        }
+                    }
+                    // Filtered pages can be empty and still go on.
+                    if (page.end.isBlank() || page.end.equals(from)) {
+                        return "";
+                    }
+                    from = page.end;
+                }
+                return "";
+            } catch (MatrixClient.MatrixException e) {
+                if (!isRetryable(e)) {
+                    LOGGER.warning("MatrixBridge could not read the messages sent before the initial sync (" + e.getMessage()
+                            + "); some of them may be forwarded.");
+                    return "";
+                }
+                long sleepMs = e.statusCode == 429 && e.retryAfterMs > 0 ? e.retryAfterMs : jitter(backoffMs);
+                LOGGER.warning("MatrixBridge could not read the messages sent before the initial sync (" + e.getMessage()
+                        + "); retrying in " + sleepMs + " ms.");
+                sleepMs(sleepMs);
+            } catch (IOException e) {
+                long sleepMs = jitter(backoffMs);
+                LOGGER.warning("MatrixBridge could not read the messages sent before the initial sync (" + e
+                        + "); retrying in " + sleepMs + " ms.");
+                sleepMs(sleepMs);
+            }
+            backoffMs = nextBackoff(backoffMs);
+        }
+        return "";
     }
 
     /** One page, retried briefly on timeouts, rate limits and server errors. */

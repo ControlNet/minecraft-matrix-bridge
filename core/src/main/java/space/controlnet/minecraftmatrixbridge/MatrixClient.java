@@ -112,11 +112,20 @@ public final class MatrixClient {
                 .followRedirects(HttpClient.Redirect.NORMAL)
                 .build();
         HttpResponse<String> response = send(discovery, request);
-        if (response.statusCode() / 100 != 2) {
+        if (response.statusCode() == 404) {
             return "";
         }
+        if (response.statusCode() / 100 != 2) {
+            // Says nothing about whether a delegation exists.
+            throw new IOException("HTTP " + response.statusCode());
+        }
+        JsonElement parsed;
         try {
-            JsonElement parsed = JsonParser.parseString(response.body());
+            parsed = JsonParser.parseString(response.body());
+        } catch (RuntimeException e) {
+            throw new IOException("unreadable response", e);
+        }
+        try {
             JsonObject homeserverInfo = parsed.isJsonObject() ? getObject(parsed.getAsJsonObject(), "m.homeserver") : null;
             String baseUrl = stripTrailingSlash(getString(homeserverInfo, "base_url"));
             // Never let a delegation downgrade an https homeserver to plain http.

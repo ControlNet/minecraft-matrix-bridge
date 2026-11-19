@@ -168,6 +168,20 @@ public final class MockMatrixServer implements AutoCloseable {
         wellKnownBaseUrl = baseUrl == null ? "" : baseUrl;
     }
 
+    private volatile int wellKnownErrorStatus;
+
+    /** Answer {@code /.well-known/matrix/client} with {@code status} (0 turns it off). */
+    public void setWellKnownError(int status) {
+        wellKnownErrorStatus = status;
+    }
+
+    private volatile String whoamiBody = "";
+
+    /** Answer whoami with HTTP 200 and this non-JSON body (blank turns it off), like a maintenance page. */
+    public void setWhoamiHtml(String body) {
+        whoamiBody = body == null ? "" : body;
+    }
+
     /** Answers {@code /.well-known/matrix/client} with a 302 to {@code location} (e.g. apex -> www). */
     public void setWellKnownRedirect(String location) {
         wellKnownRedirect = location == null ? "" : location;
@@ -387,6 +401,10 @@ public final class MockMatrixServer implements AutoCloseable {
             respondPlain(exchange, whoamiErrorStatus, "");
             return;
         }
+        if (!whoamiBody.isBlank()) {
+            respondPlain(exchange, 200, whoamiBody);
+            return;
+        }
 
         if (whoami429Remaining > 0) {
             whoami429Remaining--;
@@ -409,6 +427,10 @@ public final class MockMatrixServer implements AutoCloseable {
 
     private void handleWellKnown(HttpExchange exchange) throws IOException {
         wellKnownCalls.incrementAndGet();
+        if (wellKnownErrorStatus > 0) {
+            respondPlain(exchange, wellKnownErrorStatus, "");
+            return;
+        }
         String redirect = wellKnownRedirect;
         if (!redirect.isBlank()) {
             exchange.getResponseHeaders().set("Location", redirect);
