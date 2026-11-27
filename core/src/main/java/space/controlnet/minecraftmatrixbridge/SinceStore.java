@@ -59,9 +59,11 @@ public final class SinceStore {
         }
         JsonObject state = loadStateObject();
         JsonElement stored = state.get("owner");
-        boolean kept = stored == null || !stored.isJsonPrimitive() || owner.equals(stored.getAsString());
+        // v0.1.6 stored "homeserver|account" without the room; that owner still matches.
+        boolean kept = stored == null || !stored.isJsonPrimitive() || owner.equals(stored.getAsString())
+                || owner.startsWith(stored.getAsString() + "|");
         if (!kept) {
-            LOGGER.info("MatrixBridge homeserver or account changed; discarding the stored sync token");
+            LOGGER.info("MatrixBridge homeserver, account or room changed; discarding the stored sync token");
             state.remove("since");
         }
         if (!kept || stored == null || !owner.equals(stored.getAsString())) {

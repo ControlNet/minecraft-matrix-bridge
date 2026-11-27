@@ -24,6 +24,12 @@ public final class EventTapManager extends AbstractEventTapManager<Event> {
         return Event.class;
     }
 
+    /** NeoForge's bus refuses listeners for abstract events such as BlockEvent or PlayerEvent. */
+    @Override
+    protected boolean supportsAbstractEventListeners() {
+        return false;
+    }
+
     @Override
     protected Object getListenerRegistryKey() {
         return eventBus;

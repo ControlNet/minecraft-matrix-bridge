@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import queue
+import random
 import re
 import shutil
 import subprocess
@@ -294,10 +295,27 @@ def ensure_eula(run_dir: Path) -> None:
     (run_dir / "eula.txt").write_text("eula=true\n", encoding="utf-8")
 
 
+# Below the Linux ephemeral range (32768-60999): an outbound connection opened between probing
+# a port and Minecraft binding it cannot be given the same port.
+SERVER_PORT_RANGE = (20000, 32768)
+# Ports already handed out: one run may pick several before any of them is listening.
+_PICKED_PORTS: set[int] = set()
+
+
 def pick_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
+    rng = random.SystemRandom()
+    for _ in range(200):
+        port = rng.randrange(*SERVER_PORT_RANGE)
+        if port in _PICKED_PORTS:
+            continue
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            _PICKED_PORTS.add(port)
+            return port
+    raise RuntimeError(f"no free port in {SERVER_PORT_RANGE}")
 
 
 def write_server_properties(run_dir: Path, server_port: int) -> None:
@@ -457,7 +475,8 @@ def run_headless_client(module: str, server_port: int) -> bool:
 
 
 def missing_player_messages(bodies: list[str]) -> list[str]:
-    texts = [tap_message_body(body) for body in bodies]
+    # The bridge batches lines queued together into one message, one line each.
+    texts = [line for body in bodies for line in message_body(body).split("\n")]
     return [expected for expected in EXPECTED_PLAYER_BODIES if expected not in texts]
 
 
@@ -480,11 +499,15 @@ def wait_for_player_messages(module: str, mock: "MockMatrix", proc: subprocess.P
     raise RuntimeError(f"{module}: Matrix never received {missing_player_messages(mock.counters.send_bodies)}")
 
 
-def tap_message_body(raw: str) -> str:
+def message_body(raw: str) -> str:
     try:
-        return str(json.loads(raw).get("body", ""))[:300]
+        return str(json.loads(raw).get("body", ""))
     except (ValueError, AttributeError):
-        return raw[:300]
+        return raw
+
+
+def tap_message_body(raw: str) -> str:
+    return message_body(raw)[:300]
 
 
 def wait_for_send_count(
@@ -674,6 +697,17 @@ def installed_server_command(java: str, run_dir: Path, coordinate: str) -> list[
     raise FileNotFoundError(f"Installer did not generate {args_file} or a matching Forge shim JAR")
 
 
+LOADER_COORDINATE_RE = re.compile(r"\d+(?:\.\d+)+(?:-[A-Za-z0-9]+(?:\.\d+)*)?")
+
+
+def coordinate_run_dir(base: Path, loader_coordinate: str) -> Path:
+    """Per-loader-version run directory under base. Its contents are deleted before each
+    run, so only a plain version string (no separators, no "..") is accepted."""
+    if not LOADER_COORDINATE_RE.fullmatch(loader_coordinate or ""):
+        raise ValueError(f"Invalid loader coordinate: {loader_coordinate!r}")
+    return base / loader_coordinate
+
+
 def run_one(module: str, timeout_s: int, packaged: bool = False,
             loader_coordinate: str | None = None, artifact_dir: Path | None = None) -> None:
     root = Path(__file__).resolve().parents[1]
@@ -691,7 +725,7 @@ def run_one(module: str, timeout_s: int, packaged: bool = False,
     run_dir = root / module / "run-systemtest"
     if loader_coordinate:
         # Keep cross-patch test logs separate from the default server test.
-        run_dir = run_dir / loader_coordinate
+        run_dir = coordinate_run_dir(run_dir, loader_coordinate)
 
     # Make each run clean and deterministic.
     if run_dir.exists():
@@ -879,7 +913,7 @@ def main() -> int:
     if args.loader_coordinate:
         if not args.packaged or len(args.modules) != 1:
             parser.error("--loader-coordinate requires --packaged and exactly one module")
-        if not re.fullmatch(r"\d+(?:\.\d+)+(?:-[A-Za-z0-9]+(?:\.\d+)*)?", args.loader_coordinate):
+        if not LOADER_COORDINATE_RE.fullmatch(args.loader_coordinate):
             parser.error("Invalid loader coordinate")
 
     for module in args.modules:

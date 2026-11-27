@@ -197,6 +197,15 @@ public class EventSerializationUtilTest {
 
     // -------------------------------------------------------------------------
     // truncate tests
+
+    @Test
+    void truncateNeverSplitsASurrogatePair() {
+        String input = "a".repeat(508) + "\uD83D\uDE00" + "tail";
+        String out = EventSerializationUtil.truncate(input, 512);
+        assertTrue(out.length() <= 512);
+        assertTrue(out.endsWith("a..."), out.substring(out.length() - 6));
+        assertEquals(out, new String(out.getBytes(java.nio.charset.StandardCharsets.UTF_8), java.nio.charset.StandardCharsets.UTF_8));
+    }
     // -------------------------------------------------------------------------
 
     @Test

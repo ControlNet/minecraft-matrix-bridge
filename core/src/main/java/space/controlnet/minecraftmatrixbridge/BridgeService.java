@@ -7,6 +7,8 @@ import com.google.gson.JsonObject;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
@@ -23,26 +25,51 @@ import java.util.logging.Logger;
 public final class BridgeService {
     private static final Logger LOGGER = Logger.getLogger("MatrixBridge");
 
+    /**
+     * Lines queued while a send is in flight go out together, so a burst of chat or tap
+     * output costs one Matrix event instead of one each (homeservers rate-limit messages).
+     */
+    static final int MAX_BATCH_LINES = 20;
+    private static final int MAX_BATCH_CHARS = 16_000;
+    /** Longer Matrix messages are cut so one remote user cannot flood Minecraft chat. */
+    static final int MAX_MATRIX_TO_MC_CHARS = 512;
+    /** A sync gap (limited timeline) is filled with at most this many pages of history. */
+    /** "> <@user:server>" or, for an emote, "> * <@user:server>". */
+    private static final java.util.regex.Pattern REPLY_FALLBACK_START =
+            java.util.regex.Pattern.compile("> (\\* )?<@[^\\s:>]+:[^\\s>]+>");
+    private static final int BOT_REPLY_ATTEMPTS = 3;
+    private static final int MAX_BACKFILL_EVENTS = 1000;
+    // Pages may be empty (the server filters them after reading), so requests are capped separately.
+    private static final int MAX_BACKFILL_REQUESTS = 50;
+    private static final int BACKFILL_PAGE_SIZE = 100;
+    private static final int BACKFILL_PAGE_ATTEMPTS = 4;
+    private static final String MESSAGE_FILTER = "{\"types\":[\"m.room.message\"]}";
+    private static final int REPLY_QUEUE_SIZE = 32;
+
     private final Object lifecycleLock = new Object();
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean ready = new AtomicBoolean(false);
 
     private volatile BridgeSettings settings;
-    private MatrixClient matrixClient;
+    private volatile MatrixClient matrixClient;
     private SinceStore sinceStore;
     private EventDeduplicator dedup;
     private McCallbacks callbacks;
 
     private BlockingQueue<String> outgoingQueue;
+    /** Bot replies; sent by their own thread so a rate-limited reply never blocks /sync. */
+    private volatile BlockingQueue<String> replyQueue;
 
     private Thread bootstrapThread;
     private Thread senderThread;
     private Thread syncThread;
+    private Thread replyThread;
 
     private volatile String selfUserId = "";
     private volatile String resolvedRoomId = "";
     private volatile boolean announcedConnected = false;
     private volatile long lastQueueFullLogMs = 0;
+    private volatile long lastTapQueueFullLogMs = 0;
     private volatile long lastAuthErrorLogMs = 0;
 
     public void start(BridgeSettings settings, Path worldRoot, McCallbacks callbacks) {
@@ -51,7 +78,7 @@ public final class BridgeService {
                 return;
             }
             reapTerminatedThreads();
-            if (bootstrapThread != null || senderThread != null || syncThread != null) {
+            if (bootstrapThread != null || senderThread != null || syncThread != null || replyThread != null) {
                 LOGGER.warning("MatrixBridge start ignored because the previous lifecycle is still stopping.");
                 return;
             }
@@ -80,6 +107,7 @@ public final class BridgeService {
             this.sinceStore = new SinceStore(worldRoot);
             this.dedup = new EventDeduplicator(settings.dedupSize);
             this.outgoingQueue = new ArrayBlockingQueue<>(settings.maxQueueSize);
+            this.replyQueue = new ArrayBlockingQueue<>(REPLY_QUEUE_SIZE);
 
             running.set(true);
 
@@ -92,8 +120,10 @@ public final class BridgeService {
         Thread bt;
         Thread st;
         Thread syt;
+        Thread rt;
         synchronized (lifecycleLock) {
-            if (!running.get() && bootstrapThread == null && senderThread == null && syncThread == null) {
+            if (!running.get() && bootstrapThread == null && senderThread == null && syncThread == null
+                    && replyThread == null) {
                 return;
             }
             running.set(false);
@@ -101,19 +131,22 @@ public final class BridgeService {
             bt = bootstrapThread;
             st = senderThread;
             syt = syncThread;
+            rt = replyThread;
         }
 
         interrupt(bt);
         interrupt(st);
         interrupt(syt);
+        interrupt(rt);
 
         join(bt);
         join(st);
         join(syt);
+        join(rt);
 
         synchronized (lifecycleLock) {
             reapTerminatedThreads();
-            if (bootstrapThread == null && senderThread == null && syncThread == null) {
+            if (bootstrapThread == null && senderThread == null && syncThread == null && replyThread == null) {
                 clearLifecycleState();
             } else {
                 LOGGER.warning("MatrixBridge worker threads did not stop within 2 seconds; retaining lifecycle state until they exit.");
@@ -131,10 +164,14 @@ public final class BridgeService {
         if (syncThread != null && !syncThread.isAlive()) {
             syncThread = null;
         }
+        if (replyThread != null && !replyThread.isAlive()) {
+            replyThread = null;
+        }
     }
 
     private void clearLifecycleState() {
         outgoingQueue = null;
+        replyQueue = null;
         matrixClient = null;
         sinceStore = null;
         dedup = null;
@@ -163,10 +200,86 @@ public final class BridgeService {
         return ok;
     }
 
+    /**
+     * Queues event-tap output. Taps may fill at most half of the queue, so a busy tap cannot
+     * crowd out player chat while the homeserver is rate-limiting the bridge.
+     */
+    public boolean enqueueTapMessage(String formattedText) {
+        BlockingQueue<String> q = outgoingQueue;
+        BridgeSettings s = settings;
+        if (!running.get() || q == null || s == null || !s.enableMcToMatrix) {
+            return false;
+        }
+        if (q.size() >= Math.max(1, s.maxQueueSize / 2)) {
+            long now = System.currentTimeMillis();
+            if (now - lastTapQueueFullLogMs > 30_000) {
+                lastTapQueueFullLogMs = now;
+                LOGGER.warning("MatrixBridge outgoing queue is half full; dropping event tap output until it drains.");
+            }
+            return false;
+        }
+        return enqueueMcMessage(formattedText);
+    }
+
     /** True when the running bridge was configured without MC -> Matrix forwarding. */
     public boolean isMcToMatrixDisabledByConfig() {
         BridgeSettings s = settings;
         return s != null && !s.enableMcToMatrix;
+    }
+
+    /*
+     * Player-facing notices are formatted from the settings this bridge was started with, like
+     * everything else it does, so editing the config file takes effect on the next reload only.
+     */
+
+    public boolean enqueuePlayerChat(String playerName, String message) {
+        return enqueuePrefixed("<" + playerName + "> " + message);
+    }
+
+    /** A chat line another mod formatted itself, relayed as players see it. */
+    public boolean enqueueShownChatLine(String line) {
+        return enqueuePrefixed(line);
+    }
+
+    public boolean enqueuePlayerJoinLeave(String playerName, boolean joined) {
+        BridgeSettings s = settings;
+        if (s == null || !s.enableJoinLeaveToMatrix) {
+            return false;
+        }
+        return enqueuePrefixed("* " + playerName + (joined ? " joined the game" : " left the game"));
+    }
+
+    public boolean enqueueServerLifecycle(boolean started) {
+        BridgeSettings s = settings;
+        if (s == null || !s.enableServerLifecycleToMatrix) {
+            return false;
+        }
+        return enqueuePrefixed(started ? "* Server started." : "* Server stopping.");
+    }
+
+    public boolean enqueuePlayerTestMessage(String text) {
+        return enqueuePrefixed("[TEST] " + text);
+    }
+
+    private boolean enqueuePrefixed(String line) {
+        BridgeSettings s = settings;
+        if (s == null || !s.enableMcToMatrix) {
+            return false;
+        }
+        return enqueueMcMessage(s.mcToMatrixPrefix + line);
+    }
+
+    /**
+     * The room to name in a player's login notice, or null when no notice is due: the bridge is
+     * not ready, or it was started with announceConnected off.
+     */
+    public String connectedNoticeRoom() {
+        BridgeSettings s = settings;
+        if (s == null || !s.announceConnected || !isReady()) {
+            return null;
+        }
+        String room = s.roomId.startsWith("#") ? s.roomId : resolvedRoomId;
+        return (room == null || room.isBlank()) ? "<unknown>" : room;
     }
 
     public boolean isRunning() {
@@ -198,7 +311,6 @@ public final class BridgeService {
             }
             selfUserId = userId;
             sinceStore.saveSelfUserId(userId);
-            sinceStore.bindOwner(settings.homeserver + "|" + userId);
 
             String roomId = resolveRoomIdWithRetry(settings.roomId);
             if (!running.get() || roomId == null || roomId.isBlank()) {
@@ -209,49 +321,70 @@ public final class BridgeService {
             if (!verifyJoinedRoomWithRetry(roomId)) {
                 return;
             }
+            // A token is a position in this account's sync stream; reused for another room it
+            // would replay that room's messages since the token. Joining may have landed in
+            // another room than the alias lookup named.
+            sinceStore.bindOwner(settings.homeserver + "|" + userId + "|" + resolvedRoomId);
 
-            BridgeSettings activeSettings;
-            McCallbacks activeCallbacks;
+            boolean receiving;
             synchronized (lifecycleLock) {
                 if (!running.get() || settings == null) {
                     return;
                 }
-                activeSettings = settings;
-                activeCallbacks = callbacks;
-                if (activeSettings.enableMcToMatrix) {
+                if (settings.enableMcToMatrix) {
                     senderThread = workerThread(this::senderLoop, "MatrixBridge-Sender");
                     senderThread.start();
                 }
-                if (activeSettings.enableMatrixToMc) {
+                receiving = settings.enableMatrixToMc;
+                if (receiving) {
                     syncThread = workerThread(this::syncLoop, "MatrixBridge-Sync");
                     syncThread.start();
+                    replyThread = workerThread(this::replyLoop, "MatrixBridge-Reply");
+                    replyThread.start();
                 }
-                ready.set(true);
             }
-
-            if (!running.get()) {
-                return;
+            if (!receiving) {
+                markReady();
             }
-            if (activeSettings.roomId != null && activeSettings.roomId.startsWith("#") && !activeSettings.roomId.equals(roomId)) {
-                LOGGER.info("MatrixBridge started as " + userId + " (room alias " + activeSettings.roomId + " -> " + roomId + ").");
-            } else {
-                LOGGER.info("MatrixBridge started as " + userId + " (room " + roomId + ").");
-            }
-
-            if (activeCallbacks != null && activeSettings.announceConnected && !announcedConnected) {
-                announcedConnected = true;
-                String displayRoom = activeSettings.roomId != null && activeSettings.roomId.startsWith("#")
-                        ? activeSettings.roomId
-                        : roomId;
-                activeCallbacks.announceMatrixConnected(displayRoom);
-            }
+            // Otherwise the sync thread marks the bridge ready after its initial sync, which skips
+            // the room history: a message sent after the "connected" notice must not be skipped.
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "MatrixBridge bootstrap failed: " + e, e);
         }
     }
 
+    private void markReady() {
+        BridgeSettings activeSettings;
+        McCallbacks activeCallbacks;
+        synchronized (lifecycleLock) {
+            if (!running.get() || settings == null || ready.get()) {
+                return;
+            }
+            activeSettings = settings;
+            activeCallbacks = callbacks;
+            ready.set(true);
+        }
+        String userId = selfUserId;
+        String roomId = resolvedRoomId;
+        if (activeSettings.roomId != null && activeSettings.roomId.startsWith("#") && !activeSettings.roomId.equals(roomId)) {
+            LOGGER.info("MatrixBridge started as " + userId + " (room alias " + activeSettings.roomId + " -> " + roomId + ").");
+        } else {
+            LOGGER.info("MatrixBridge started as " + userId + " (room " + roomId + ").");
+        }
+
+        if (activeCallbacks != null && activeSettings.announceConnected && !announcedConnected) {
+            announcedConnected = true;
+            String displayRoom = activeSettings.roomId != null && activeSettings.roomId.startsWith("#")
+                    ? activeSettings.roomId
+                    : roomId;
+            activeCallbacks.announceMatrixConnected(displayRoom);
+        }
+    }
+
     private String resolveSelfUserIdWithRetry() {
         long backoffMs = 1_000;
+        boolean loggedNotFound = false;
+        boolean switched = false;
         while (running.get()) {
             try {
                 return matrixClient.whoami();
@@ -261,11 +394,33 @@ public final class BridgeService {
                     running.set(false);
                     return null;
                 }
+                // The URL may be the server name rather than the client API, whose delegation may
+                // not be served yet or may have moved. It may also be a reverse proxy whose route
+                // is not up yet. Look again on every retry; hint once. Only the first switch skips
+                // the backoff, so a flapping delegation cannot spin.
+                if (useWellKnownClientApi() && !switched) {
+                    switched = true;
+                    continue;
+                }
+                if (Thread.currentThread().isInterrupted()) {
+                    return null;
+                }
+                if (e.statusCode == 404 && !loggedNotFound) {
+                    loggedNotFound = true;
+                    LOGGER.severe("Matrix whoami returned HTTP 404 at " + matrixClient.baseUrl()
+                            + ". matrix.homeserver must be the client API URL (for example https://matrix.example.com),"
+                            + " and no /.well-known/matrix/client delegation was found. Retrying in case the"
+                            + " homeserver is still starting; fix the URL and run /matrix reload otherwise.");
+                }
                 long sleepMs = (e.statusCode == 429 && e.retryAfterMs > 0) ? e.retryAfterMs : jitter(backoffMs);
                 LOGGER.warning("Matrix whoami failed (" + e.getMessage() + "); retrying in " + sleepMs + " ms.");
                 sleepMs(sleepMs);
                 backoffMs = nextBackoff(backoffMs);
             } catch (IOException e) {
+                if (useWellKnownClientApi() && !switched) {
+                    switched = true;
+                    continue;
+                }
                 long sleepMs = jitter(backoffMs);
                 LOGGER.warning("Matrix whoami network error (" + e + "); retrying in " + sleepMs + " ms.");
                 sleepMs(sleepMs);
@@ -274,6 +429,11 @@ public final class BridgeService {
                 Thread.currentThread().interrupt();
                 return null;
             } catch (Exception e) {
+                // E.g. an HTML maintenance page answered with 200.
+                if (useWellKnownClientApi() && !switched) {
+                    switched = true;
+                    continue;
+                }
                 long sleepMs = jitter(backoffMs);
                 LOGGER.warning("Matrix whoami unexpected error (" + e + "); retrying in " + sleepMs + " ms.");
                 sleepMs(sleepMs);
@@ -281,6 +441,41 @@ public final class BridgeService {
             }
         }
         return null;
+    }
+
+    /**
+     * Switches to the client API that the configured URL's .well-known names, or back to the
+     * configured URL when it no longer delegates. Returns true when the endpoint changed.
+     */
+    private boolean useWellKnownClientApi() {
+        MatrixClient current = matrixClient;
+        BridgeSettings active = settings;
+        if (current == null || active == null) {
+            return false;
+        }
+        MatrixClient configured = new MatrixClient(active.homeserver, active.accessToken);
+        try {
+            String delegated = configured.discoverClientBaseUrl();
+            String baseUrl = delegated.isBlank() ? configured.baseUrl() : delegated;
+            if (baseUrl.equals(current.baseUrl())) {
+                return false;
+            }
+            if (delegated.isBlank()) {
+                LOGGER.info("MatrixBridge: " + configured.baseUrl() + " no longer delegates the client API; using it directly.");
+                matrixClient = configured;
+            } else {
+                LOGGER.info("MatrixBridge: " + configured.baseUrl() + " delegates the client API to " + baseUrl
+                        + " (/.well-known/matrix/client); using it.");
+                matrixClient = new MatrixClient(baseUrl, active.accessToken);
+            }
+            return true;
+        } catch (IOException e) {
+            LOGGER.warning("MatrixBridge could not read /.well-known/matrix/client from " + configured.baseUrl() + ": " + e);
+            return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
     }
 
     private String resolveRoomIdWithRetry(String roomIdOrAlias) {
@@ -318,7 +513,7 @@ public final class BridgeService {
                     running.set(false);
                     return null;
                 }
-                if (e.statusCode == 404) {
+                if (e.statusCode == 404 && !isRetryable(e)) {
                     LOGGER.severe("Matrix resolveRoomAlias failed (HTTP 404). Check that the room alias is correct and the bot can access it: " + value);
                     running.set(false);
                     return null;
@@ -356,7 +551,7 @@ public final class BridgeService {
                     running.set(false);
                     return null;
                 }
-                if (e.statusCode >= 400 && e.statusCode < 500 && e.statusCode != 429) {
+                if (e.statusCode >= 400 && e.statusCode < 500 && !isRetryable(e)) {
                     LOGGER.severe("Matrix joinRoom failed (HTTP " + e.statusCode + "). Not invited or cannot join room " + roomIdOrAlias);
                     running.set(false);
                     return null;
@@ -396,7 +591,10 @@ public final class BridgeService {
                 // Not joined yet: attempt to accept invite by joining.
                 if (!attemptedJoin) {
                     attemptedJoin = true;
-                    String joinTarget = roomId;
+                    // An alias lets the homeserver find a server to join through; a bare
+                    // room ID only works when it already knows one (e.g. from an invite).
+                    String configured = settings.roomId;
+                    String joinTarget = configured.startsWith("#") ? configured : roomId;
                     LOGGER.info("MatrixBridge: user is not joined to " + roomId + "; attempting to join (accept invite)...");
                     String joinedRoomId = joinRoomWithRetry(joinTarget);
                     if (joinedRoomId == null) {
@@ -458,6 +656,7 @@ public final class BridgeService {
                 return;
             }
 
+            msg = appendQueuedLines(msg);
             String transactionId = UUID.randomUUID().toString();
             while (running.get()) {
                 try {
@@ -482,7 +681,8 @@ public final class BridgeService {
                         sleepMs(60_000);
                         break;
                     }
-                    if (e.statusCode >= 500) {
+                    if (isRetryable(e)) {
+                        // The transaction ID stays the same, so a retry cannot post the batch twice.
                         long sleepMs = jitter(backoffMs);
                         LOGGER.warning("Matrix send failed (" + e.getMessage() + "); retrying in " + sleepMs + " ms.");
                         sleepMs(sleepMs);
@@ -509,6 +709,23 @@ public final class BridgeService {
         }
     }
 
+    /** Joins lines already waiting in the queue onto {@code first}; this is the only consumer. */
+    private String appendQueuedLines(String first) {
+        BlockingQueue<String> q = outgoingQueue;
+        StringBuilder batch = new StringBuilder(first);
+        int lines = 1;
+        while (q != null && lines < MAX_BATCH_LINES) {
+            String next = q.peek();
+            if (next == null || batch.length() + 1 + next.length() > MAX_BATCH_CHARS) {
+                break;
+            }
+            q.poll();
+            batch.append('\n').append(next);
+            lines++;
+        }
+        return batch.toString();
+    }
+
     private void syncLoop() {
         String roomId = resolvedRoomId;
         String filterJson = buildFilterJson(roomId, settings.timelineLimit);
@@ -516,18 +733,31 @@ public final class BridgeService {
 
         if (since == null || since.isBlank()) {
             since = initialCatchup(filterJson);
+            if (!running.get()) {
+                return;
+            }
+            markReady();
         }
+        // Otherwise readiness waits for the homeserver to accept the stored token: if it is
+        // rejected, the fresh initial sync skips everything sent before it, so players must not
+        // be told the bridge is connected yet.
 
         long backoffMs = 1_000;
         while (running.get()) {
             try {
-                MatrixClient.SyncResult result = matrixClient.syncOnce(since, settings.syncTimeoutMs, filterJson);
+                // Until ready, do not long-poll: the first answer only has to confirm the token.
+                int timeoutMs = ready.get() ? settings.syncTimeoutMs : 0;
+                MatrixClient.SyncResult result = matrixClient.syncOnce(since, timeoutMs, filterJson);
+                // Save the token only after its messages went out, so a stop or a failed
+                // backfill replays this batch instead of skipping the rest of it.
+                if (!forwardMatrixMessages(result, since)) {
+                    continue;
+                }
                 if (result.nextBatch != null && !result.nextBatch.isBlank()) {
                     since = result.nextBatch;
                     sinceStore.saveSince(since);
                 }
-
-                forwardMatrixMessages(result);
+                markReady();
                 backoffMs = 1_000;
             } catch (MatrixClient.MatrixException e) {
                 if (e.statusCode == 401 || e.statusCode == 403) {
@@ -540,7 +770,12 @@ public final class BridgeService {
                     // permanently invalid; retrying it would stall Matrix -> MC forever.
                     LOGGER.warning("Matrix rejected the stored sync token (" + e.getMessage() + "); starting a fresh sync.");
                     sinceStore.saveSince("");
+                    // Messages sent before the fresh sync completes are skipped by it. Login
+                    // notices are held meanwhile, so announce again once it is done.
+                    ready.set(false);
+                    announcedConnected = false;
                     since = initialCatchup(filterJson);
+                    markReady();
                     backoffMs = 1_000;
                     continue;
                 }
@@ -565,22 +800,43 @@ public final class BridgeService {
         }
     }
 
+    /**
+     * A homeserver that does not accept a since token answers 400/404 with a Matrix error.
+     * Other 4xx (a proxy's 408 or HTML 404 while restarting) say nothing about the token, and
+     * dropping it would skip the messages sent in between.
+     */
     private static boolean isRejectedSince(MatrixClient.MatrixException e, String since) {
+        // M_UNRECOGNIZED (endpoint not served, e.g. by a worker during a restart) and rate limits
+        // describe the request, not the token.
         return since != null && !since.isBlank()
-                && e.statusCode >= 400 && e.statusCode < 500 && e.statusCode != 429;
+                && (e.statusCode == 400 || e.statusCode == 404) && !e.errcode.isBlank()
+                && !"M_UNRECOGNIZED".equals(e.errcode) && !"M_LIMIT_EXCEEDED".equals(e.errcode);
+    }
+
+    /**
+     * The same filter written differently for each fresh sync. Synapse answers a request identical
+     * to a recent one (the raw filter string is part of the key) with that cached response, whose
+     * next_batch is older: after switching rooms and back, the following syncs would replay what
+     * was sent in between. Whitespace changes the string, not the filter.
+     */
+    static String uncachedFilter(String filterJson) {
+        long nonce = java.util.concurrent.ThreadLocalRandom.current().nextLong();
+        StringBuilder padding = new StringBuilder(64);
+        for (int bit = 0; bit < 64; bit++) {
+            padding.append((nonce >>> bit & 1) == 0 ? ' ' : '\t');
+        }
+        return "{" + padding + filterJson.substring(1);
     }
 
     private String initialCatchup(String filterJson) {
         long backoffMs = 1_000;
         while (running.get()) {
             try {
-                MatrixClient.SyncResult result = matrixClient.syncOnce("", 0, filterJson);
-                if (result.nextBatch != null && !result.nextBatch.isBlank()) {
-                    sinceStore.saveSince(result.nextBatch);
-                    LOGGER.info("MatrixBridge initial sync complete; starting from next_batch.");
-                    return result.nextBatch;
-                }
-                return "";
+                // syncOnce rejects a response without next_batch, which is retried below.
+                MatrixClient.SyncResult result = matrixClient.syncOnce("", 0, uncachedFilter(filterJson));
+                sinceStore.saveSince(result.nextBatch);
+                LOGGER.info("MatrixBridge initial sync complete; starting from next_batch.");
+                return result.nextBatch;
             } catch (MatrixClient.MatrixException e) {
                 if (e.statusCode == 401 || e.statusCode == 403) {
                     logAuthErrorOnce("Matrix initial sync failed (HTTP " + e.statusCode + "). Check access token / permissions.");
@@ -609,95 +865,224 @@ public final class BridgeService {
         return "";
     }
 
-    private void forwardMatrixMessages(MatrixClient.SyncResult result) {
+    /**
+     * Forwards the room's timeline from one sync response, first filling a gap the homeserver
+     * left by cutting the timeline ({@code limited}). Returns false when stopped part-way.
+     */
+    private boolean forwardMatrixMessages(MatrixClient.SyncResult result, String previousSince)
+            throws IOException, InterruptedException, MatrixClient.MatrixException {
         if (!settings.enableMatrixToMc) {
-            return;
+            return true;
         }
         if (selfUserId == null || selfUserId.isBlank()) {
-            return;
+            return true;
         }
 
         String roomId = resolvedRoomId;
         if (roomId == null || roomId.isBlank()) {
-            return;
+            return true;
         }
 
         JsonElement roomEntry = result.joinedRooms.get(roomId);
         if (roomEntry == null || !roomEntry.isJsonObject()) {
             // Normal: /sync only includes rooms that have updates in that specific response.
-            return;
+            return true;
         }
         JsonObject roomObj = roomEntry.getAsJsonObject();
         JsonObject timeline = getObject(roomObj, "timeline");
         if (timeline == null) {
-            return;
+            return true;
         }
-        JsonArray events = getArray(timeline, "events");
-        if (events == null || events.isEmpty()) {
-            return;
+        List<JsonElement> events = new ArrayList<>();
+        JsonElement limited = timeline.get("limited");
+        String prevBatch = getString(timeline, "prev_batch");
+        if (limited != null && limited.isJsonPrimitive() && limited.getAsBoolean()
+                && !prevBatch.isBlank() && previousSince != null && !previousSince.isBlank()) {
+            events.addAll(backfill(roomId, prevBatch, previousSince));
+        }
+        JsonArray timelineEvents = getArray(timeline, "events");
+        if (timelineEvents != null) {
+            timelineEvents.forEach(events::add);
         }
 
         for (JsonElement el : events) {
             if (!running.get()) {
-                return;
+                return false;
             }
-            if (el == null || !el.isJsonObject()) {
-                continue;
+            if (el != null && el.isJsonObject()) {
+                forwardMatrixEvent(roomId, el.getAsJsonObject());
             }
-            JsonObject evt = el.getAsJsonObject();
+        }
+        return true;
+    }
 
-            String type = getString(evt, "type");
-            if (!"m.room.message".equals(type)) {
-                continue;
+    /**
+     * Fetches the messages between the previous sync token and the start of a cut timeline,
+     * oldest first. Duplicates of timeline events are dropped later by event ID.
+     */
+    private List<JsonElement> backfill(String roomId, String prevBatch, String previousSince)
+            throws IOException, InterruptedException, MatrixClient.MatrixException {
+        String filter = MESSAGE_FILTER;
+        List<JsonElement> newestFirst = new ArrayList<>();
+        String from = prevBatch;
+        for (int request = 0; request < MAX_BACKFILL_REQUESTS && newestFirst.size() < MAX_BACKFILL_EVENTS; request++) {
+            MatrixClient.MessagesPage result;
+            try {
+                int limit = Math.min(BACKFILL_PAGE_SIZE, MAX_BACKFILL_EVENTS - newestFirst.size());
+                result = fetchBackfillPage(roomId, from, previousSince, limit, filter);
+            } catch (MatrixClient.MatrixException e) {
+                if (!isRetryable(e)) {
+                    // The room or token is refused: forward what the sync returned rather than stall on the gap.
+                    LOGGER.warning("MatrixBridge could not fetch messages missed during a sync gap (" + e.getMessage() + ").");
+                    break;
+                }
+                throw e;
             }
-            String eventId = getString(evt, "event_id");
-            if (dedup.seenOrAdd(eventId)) {
-                continue;
-            }
-
-            String sender = getString(evt, "sender");
-            if (sender.isBlank() || sender.equals(selfUserId)) {
-                continue;
-            }
-
-            JsonObject content = getObject(evt, "content");
-            if (content == null) {
-                continue;
-            }
-            String msgType = getString(content, "msgtype");
-            if (!"m.text".equals(msgType)) {
-                continue;
-            }
-            String body = sanitizeForMinecraft(getString(content, "body"));
-            if (body.isBlank()) {
-                continue;
-            }
-
-            if (maybeHandleMatrixBotCommand(sender, body)) {
-                continue;
-            }
-
-            String displaySender = sender;
-            MatrixClient client = matrixClient;
-            if (client != null) {
-                try {
-                    String dn = sanitizeForMinecraft(client.getRoomMemberDisplayName(roomId, sender));
-                    if (!dn.isBlank()) {
-                        displaySender = dn;
-                    }
-                } catch (Exception ignored) {
+            for (JsonElement event : result.chunk) {
+                if (newestFirst.size() < MAX_BACKFILL_EVENTS) {
+                    newestFirst.add(event);
                 }
             }
-
-            String line = settings.matrixToMcPrefix + "<" + sanitizeForMinecraft(displaySender) + "> " + body;
-            McCallbacks cb = callbacks;
-            if (cb != null) {
-                cb.broadcast(line);
+            // An empty page does not end pagination: only a missing or repeated end token does.
+            if (result.end.isBlank() || result.end.equals(from)) {
+                Collections.reverse(newestFirst);
+                return newestFirst;
             }
+            from = result.end;
+        }
+        LOGGER.warning("MatrixBridge forwarded " + newestFirst.size() + " messages missed during a sync gap;"
+                + " older ones were not forwarded.");
+        Collections.reverse(newestFirst);
+        return newestFirst;
+    }
+
+    /** One page, retried briefly on timeouts, rate limits and server errors. */
+    private MatrixClient.MessagesPage fetchBackfillPage(String roomId, String from, String to, int limit, String filter)
+            throws IOException, InterruptedException, MatrixClient.MatrixException {
+        long backoffMs = 1_000;
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return matrixClient.roomMessagesBackwards(roomId, from, to, limit, filter);
+            } catch (MatrixClient.MatrixException e) {
+                if (!isRetryable(e) || attempt >= BACKFILL_PAGE_ATTEMPTS || !running.get()) {
+                    throw e;
+                }
+                sleepMs(e.statusCode == 429 && e.retryAfterMs > 0 ? e.retryAfterMs : jitter(backoffMs));
+            } catch (IOException e) {
+                if (attempt >= BACKFILL_PAGE_ATTEMPTS || !running.get()) {
+                    throw e;
+                }
+                sleepMs(jitter(backoffMs));
+            }
+            backoffMs = nextBackoff(backoffMs);
         }
     }
 
-    private boolean maybeHandleMatrixBotCommand(String senderMxid, String body) {
+    /** Errors about this request, not about the room or token: the same request can succeed later. */
+    private static boolean isRetryable(MatrixClient.MatrixException e) {
+        return e.statusCode == 408 || e.statusCode == 429 || e.statusCode >= 500
+                || "M_UNRECOGNIZED".equals(e.errcode);
+    }
+
+    private void forwardMatrixEvent(String roomId, JsonObject evt) {
+        String type = getString(evt, "type");
+        if (!"m.room.message".equals(type)) {
+            return;
+        }
+        String eventId = getString(evt, "event_id");
+        if (dedup.seenOrAdd(eventId)) {
+            return;
+        }
+
+        String sender = getString(evt, "sender");
+        if (sender.isBlank() || sender.equals(selfUserId)) {
+            return;
+        }
+
+        JsonObject content = getObject(evt, "content");
+        if (content == null) {
+            return;
+        }
+        JsonObject relatesTo = getObject(content, "m.relates_to");
+        boolean edit = relatesTo != null && "m.replace".equals(getString(relatesTo, "rel_type"));
+        if (edit) {
+            // An edit's body is "* new text"; the replacement lives in m.new_content.
+            content = getObject(content, "m.new_content");
+            if (content == null) {
+                return;
+            }
+        }
+        String msgType = getString(content, "msgtype");
+        if (!"m.text".equals(msgType)) {
+            return;
+        }
+        String rawBody = getString(content, "body");
+        if (!edit && relatesTo != null && getObject(relatesTo, "m.in_reply_to") != null) {
+            rawBody = stripReplyFallback(rawBody);
+        }
+        String body = sanitizeForMinecraft(rawBody);
+        if (body.isBlank()) {
+            return;
+        }
+
+        if (edit) {
+            // Editing a message into a command must not run it (again).
+            if (isBotCommand(body)) {
+                return;
+            }
+        } else if (maybeHandleMatrixBotCommand(sender, body)) {
+            return;
+        }
+        body = EventSerializationUtil.truncate(body, MAX_MATRIX_TO_MC_CHARS);
+        if (edit) {
+            body = body + " (edited)";
+        }
+
+        String displaySender = sender;
+        MatrixClient client = matrixClient;
+        if (client != null) {
+            try {
+                String dn = sanitizeForMinecraft(client.getRoomMemberDisplayName(roomId, sender));
+                if (!dn.isBlank()) {
+                    displaySender = dn;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+
+        String line = settings.matrixToMcPrefix + "<" + sanitizeForMinecraft(displaySender) + "> " + body;
+        McCallbacks cb = callbacks;
+        if (cb != null) {
+            cb.broadcast(line);
+        }
+    }
+
+    /**
+     * Drops the quoted fallback ("> <@user> original" lines and the blank line after them)
+     * that clients put in front of a reply's text.
+     */
+    static String stripReplyFallback(String body) {
+        if (body == null) {
+            return null;
+        }
+        // The fallback opens with the quoted sender's full user ID and ends with a blank line;
+        // anything else is text the user typed.
+        String text = body.replace("\r\n", "\n");
+        if (!REPLY_FALLBACK_START.matcher(text).lookingAt()) {
+            return body;
+        }
+        String[] lines = text.split("\n", -1);
+        int i = 0;
+        while (i < lines.length && lines[i].startsWith(">")) {
+            i++;
+        }
+        if (i >= lines.length || !lines[i].isEmpty()) {
+            return body;
+        }
+        return String.join("\n", java.util.Arrays.copyOfRange(lines, i + 1, lines.length));
+    }
+
+    private boolean isBotCommand(String body) {
         if (body == null) {
             return false;
         }
@@ -706,19 +1091,18 @@ public final class BridgeService {
             return false;
         }
         String trimmed = body.trim();
-
         if (!trimmed.regionMatches(true, 0, prefix, 0, prefix.length())) {
             return false;
         }
-        if (trimmed.length() != prefix.length()) {
-            if (trimmed.length() < prefix.length() + 1) {
-                return false;
-            }
-            char next = trimmed.charAt(prefix.length());
-            if (!Character.isWhitespace(next)) {
-                return false;
-            }
+        return trimmed.length() == prefix.length() || Character.isWhitespace(trimmed.charAt(prefix.length()));
+    }
+
+    private boolean maybeHandleMatrixBotCommand(String senderMxid, String body) {
+        if (!isBotCommand(body)) {
+            return false;
         }
+        String prefix = settings.matrixBotPrefix;
+        String trimmed = body.trim();
 
         String rest = trimmed.substring(prefix.length()).trim();
         String[] parts = tokenizeCommand(rest).toArray(new String[0]);
@@ -786,7 +1170,9 @@ public final class BridgeService {
             String reply = fut.get(5, TimeUnit.SECONDS);
             sendMatrixBotReply(reply != null ? reply : "No response from event handler.");
         } catch (java.util.concurrent.TimeoutException e) {
-            sendMatrixBotReply("Event command timed out.");
+            // The task is already queued on the server thread and may still run.
+            sendMatrixBotReply("The server did not answer within 5 seconds; the command may still take effect. "
+                    + "Check \"" + settings.matrixBotPrefix + " event list\" before retrying.");
         } catch (Exception e) {
             LOGGER.warning("Event command failed: " + e);
             sendMatrixBotReply("Event command failed: " + e.getMessage());
@@ -818,10 +1204,34 @@ public final class BridgeService {
         }
     }
 
+    /** Queues a bot reply for the reply thread; the sync thread never waits on Matrix sends. */
     private void sendMatrixBotReply(String text) {
-        if (text == null || text.isBlank()) {
+        BlockingQueue<String> q = replyQueue;
+        if (text == null || text.isBlank() || q == null) {
             return;
         }
+        if (!q.offer(text)) {
+            LOGGER.warning("MatrixBridge bot reply queue is full; dropping a reply.");
+        }
+    }
+
+    private void replyLoop() {
+        while (running.get()) {
+            BlockingQueue<String> q = replyQueue;
+            if (q == null) {
+                return;
+            }
+            String text;
+            try {
+                text = q.take();
+            } catch (InterruptedException e) {
+                continue;
+            }
+            deliverBotReply(text);
+        }
+    }
+
+    private void deliverBotReply(String text) {
         MatrixClient client = matrixClient;
         if (client == null) {
             return;
@@ -833,22 +1243,24 @@ public final class BridgeService {
 
         long backoffMs = 1_000;
         String transactionId = UUID.randomUUID().toString();
-        for (int attempt = 0; running.get() && attempt < 3; attempt++) {
+        for (int attempt = 1; running.get(); attempt++) {
+            boolean last = attempt >= BOT_REPLY_ATTEMPTS;
             try {
                 client.sendText(roomId, text, transactionId);
                 return;
             } catch (MatrixClient.MatrixException e) {
-                if (e.statusCode == 429) {
-                    long sleepMs = e.retryAfterMs > 0 ? e.retryAfterMs : jitter(backoffMs);
-                    sleepMs(sleepMs);
-                    backoffMs = nextBackoff(backoffMs);
-                    continue;
+                if (!isRetryable(e) || last) {
+                    LOGGER.warning("Matrix bot reply failed (" + e.getMessage() + "); dropping.");
+                    return;
                 }
-                LOGGER.warning("Matrix bot reply failed (" + e.getMessage() + "); dropping.");
-                return;
+                sleepMs(e.statusCode == 429 && e.retryAfterMs > 0 ? e.retryAfterMs : jitter(backoffMs));
+                backoffMs = nextBackoff(backoffMs);
             } catch (IOException e) {
-                long sleepMs = jitter(backoffMs);
-                sleepMs(sleepMs);
+                if (last) {
+                    LOGGER.warning("Matrix bot reply failed (" + e + "); dropping.");
+                    return;
+                }
+                sleepMs(jitter(backoffMs));
                 backoffMs = nextBackoff(backoffMs);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -930,7 +1342,8 @@ public final class BridgeService {
 
     /**
      * Makes Matrix text safe for Minecraft chat: drops section-sign formatting codes
-     * (so remote users cannot obfuscate or recolour messages) and turns control
+     * (so remote users cannot obfuscate or recolour messages) and invisible format
+     * characters (bidi overrides such as U+202E, zero-width spaces), and turns control
      * characters, including newlines, into spaces.
      */
     static String sanitizeForMinecraft(String text) {
@@ -946,6 +1359,9 @@ public final class BridgeService {
                 if (i < text.length()) {
                     i += Character.charCount(text.codePointAt(i));
                 }
+                continue;
+            }
+            if (Character.getType(cp) == Character.FORMAT) {
                 continue;
             }
             if (Character.isISOControl(cp)) {

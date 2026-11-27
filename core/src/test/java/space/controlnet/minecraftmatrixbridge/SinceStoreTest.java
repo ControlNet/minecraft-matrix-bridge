@@ -51,6 +51,29 @@ public class SinceStoreTest {
     }
 
     @Test
+    void bindOwnerDiscardsSinceFromAnotherRoom() {
+        // The token marks a point in the account's timeline; in a new room it would replay that room's history.
+        SinceStore store = new SinceStore(worldRoot);
+        store.bindOwner("https://hs.example|@bot:hs.example|!a:hs.example");
+        store.saveSince("s_room_a");
+
+        assertFalse(store.bindOwner("https://hs.example|@bot:hs.example|!b:hs.example"));
+        assertEquals("", store.loadSince());
+    }
+
+    @Test
+    void bindOwnerKeepsSinceWrittenBeforeTheRoomWasPartOfTheOwner() {
+        // v0.1.6 stored "homeserver|account" only.
+        SinceStore store = new SinceStore(worldRoot);
+        store.bindOwner("https://hs.example|@bot:hs.example");
+        store.saveSince("s_v016");
+
+        assertTrue(store.bindOwner("https://hs.example|@bot:hs.example|!a:hs.example"));
+        assertEquals("s_v016", store.loadSince());
+        assertFalse(store.bindOwner("https://hs.example|@bot:hs.example|!b:hs.example"));
+    }
+
+    @Test
     void bindOwnerAdoptsLegacyStateWithoutAnOwner() {
         // State written by earlier versions has a since token but no owner.
         SinceStore store = new SinceStore(worldRoot);

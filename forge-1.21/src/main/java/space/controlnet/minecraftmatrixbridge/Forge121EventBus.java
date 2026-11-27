@@ -37,7 +37,8 @@ final class Forge121EventBus extends ForgeEventBus {
         subscribe(ServerStoppingEvent.class, hooks::onServerStopping);
         subscribe(ServerStoppedEvent.class, hooks::onServerStopped);
         subscribe(RegisterCommandsEvent.class, hooks::onRegisterCommands);
-        subscribe(ServerChatEvent.class, hooks::onServerChat);
+        // After every other listener: the chat as formatting mods left it, unless one cancelled it.
+        bus.monitor(ServerChatEvent.class, event -> hooks.onServerChat((ServerChatEvent) event));
         subscribe(PlayerEvent.PlayerLoggedInEvent.class, hooks::onPlayerLoggedIn);
         subscribe(PlayerEvent.PlayerLoggedOutEvent.class, hooks::onPlayerLoggedOut);
         try {

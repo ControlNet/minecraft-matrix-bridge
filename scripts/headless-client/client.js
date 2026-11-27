@@ -145,8 +145,10 @@ function main () {
       }
     }
     client.on('systemChat', (packet) => onText(plainText(packet.formattedMessage)))
-    client.on('playerChat', (packet) => onText(
-      packet.formattedMessage ? plainText(packet.formattedMessage) : `<${plainText(packet.senderName)}> ${packet.plainMessage}`))
+    // What the player sees: a server that rewrote the message sends it as unsignedContent.
+    client.on('playerChat', (packet) => onText(packet.formattedMessage
+      ? plainText(packet.formattedMessage)
+      : `<${plainText(packet.senderName)}> ${packet.unsignedContent ? plainText(packet.unsignedContent) : packet.plainMessage}`))
 
     client.on('kick_disconnect', (packet) => finish(2, 'kicked', { reason: plainText(packet.reason) }))
     client.on('disconnect', (packet) => finish(2, 'kicked', { reason: plainText(packet.reason) }))

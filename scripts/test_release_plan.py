@@ -55,6 +55,17 @@ class PlanTests(unittest.TestCase):
         result = rp.plan("0.1.6", ["v0.1.5", "v0.1.6"], HEAD, HEAD, MASTER)
         self.assertEqual((result["should_release"], result["resume"]), ("true", "true"))
 
+    def test_resuming_an_older_release_does_not_take_latest_back(self):
+        # Rerunning v0.1.6's workflow after v0.1.7 shipped may still finish its uploads.
+        result = rp.plan("0.1.6", ["v0.1.6", "v0.1.7", "v0.1.8-beta.1"], HEAD, HEAD, MASTER)
+        self.assertEqual((result["should_release"], result["resume"], result["make_latest"]),
+                         ("true", "true", "false"))
+
+    def test_resuming_the_newest_release_keeps_it_latest(self):
+        # A newer prerelease never becomes GitHub's Latest, so it does not count.
+        result = rp.plan("0.1.7", ["v0.1.6", "v0.1.7", "v0.1.8-beta.1"], HEAD, HEAD, MASTER)
+        self.assertEqual(result["make_latest"], "true")
+
     def test_existing_tag_elsewhere_is_not_republished(self):
         result = rp.plan("0.1.6", ["v0.1.6"], HEAD, OTHER, MASTER)
         self.assertEqual((result["should_release"], result["build"]), ("false", "false"))

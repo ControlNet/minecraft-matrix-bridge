@@ -2,6 +2,7 @@ package space.controlnet.minecraftmatrixbridge;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Consumer;
@@ -18,10 +19,15 @@ final class ModernEventBus {
             return new ModernEventBus(
                     Class.forName("net.minecraftforge.eventbus.internal.Event", true, loader),
                     Class.forName("net.minecraftforge.eventbus.api.bus.EventBus", true, loader),
-                    Class.forName("net.minecraftforge.eventbus.api.listener.Priority", true, loader).getField("NORMAL").getByte(null));
+                    priority(loader, "NORMAL"));
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("Unsupported Forge EventBus 7 API", e);
         }
+    }
+
+    /** Reads a constant of EventBus 7's {@code Priority}, e.g. "LOWEST". */
+    static byte priority(ClassLoader loader, String name) throws ReflectiveOperationException {
+        return Class.forName("net.minecraftforge.eventbus.api.listener.Priority", true, loader).getField(name).getByte(null);
     }
 
     ModernEventBus(Class<?> eventType, Class<?> busType, byte normalPriority) {
@@ -68,6 +74,10 @@ final class ModernEventBus {
     }
 
     void listen(Class<?> type, Consumer<Object> listener) {
+        listen(type, listener, normalPriority);
+    }
+
+    void listen(Class<?> type, Consumer<Object> listener, byte priority) {
         if (!isEventClass(type)) {
             throw new IllegalArgumentException("Not a Forge event: " + type.getName());
         }
@@ -77,10 +87,52 @@ final class ModernEventBus {
             for (Object bus : buses) {
                 // Normal consumers neither cancel events nor observe already-cancelled ones.
                 // EventBus 7's boolean overload means alwaysCancelling, not receiveCancelled.
-                addListener.invoke(bus, normalPriority, listener);
+                addListener.invoke(bus, priority, listener);
             }
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("Could not register Forge event: " + type.getName(), e);
+        }
+    }
+
+    /**
+     * Registers a read-only listener that runs after every other listener (MONITOR), so it sees an
+     * event as the other mods left it, and only when none of them cancelled it.
+     */
+    void monitor(Class<?> type, Consumer<Object> listener) {
+        if (!isEventClass(type)) {
+            throw new IllegalArgumentException("Not a Forge event: " + type.getName());
+        }
+        List<Object> buses = new ArrayList<>();
+        collectBuses(type, buses);
+        try {
+            ClassLoader loader = busType.getClassLoader();
+            Class<?> cancellableBus = Class.forName("net.minecraftforge.eventbus.api.bus.CancellableEventBus", true, loader);
+            Class<?> monitorType = Class.forName("net.minecraftforge.eventbus.api.listener.ObjBooleanBiConsumer", true, loader);
+            Method addMonitor = cancellableBus.getMethod("addListener", monitorType);
+            Object monitor = Proxy.newProxyInstance(monitorType.getClassLoader(), new Class<?>[] {monitorType},
+                    (proxy, method, args) -> switch (method.getName()) {
+                        case "equals" -> proxy == args[0];
+                        case "hashCode" -> System.identityHashCode(proxy);
+                        case "toString" -> "MatrixBridge monitor for " + type.getName();
+                        default -> {
+                            // accept(event, wasCancelled)
+                            if (!(Boolean) args[1]) {
+                                listener.accept(args[0]);
+                            }
+                            yield null;
+                        }
+                    });
+            Consumer<Object> keepPosting = ignored -> { };
+            for (Object bus : buses) {
+                if (!cancellableBus.isInstance(bus)) {
+                    throw new IllegalStateException("Not a cancellable event: " + type.getName());
+                }
+                addMonitor.invoke(bus, monitor);
+                // EventBus 7 skips posting (monitors included) while no ordinary listener exists.
+                addListener.invoke(bus, normalPriority, keepPosting);
+            }
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Could not monitor Forge event: " + type.getName(), e);
         }
     }
 

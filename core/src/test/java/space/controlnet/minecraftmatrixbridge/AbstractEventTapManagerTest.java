@@ -43,6 +43,8 @@ class AbstractEventTapManagerTest {
         final TestBus bus;
         final Map<Class<?>, Consumer<Object>> listeners;
         final java.util.List<String> forwarded = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+        /** False models a full outgoing queue: the tap output is rejected. */
+        volatile boolean queueAccepts = true;
 
         TestManager() {
             this(new TestBus(), CompletableFuture.completedFuture(EventIndex.empty()));
@@ -61,7 +63,11 @@ class AbstractEventTapManagerTest {
             bus.registrations++;
             bus.listeners.put(type, listener);
         }
-        @Override void forward(String message) { forwarded.add(message); }
+        @Override boolean forward(String message) {
+            if (!queueAccepts) return false;
+            forwarded.add(message);
+            return true;
+        }
 
         void subscribe(Class<?> type) {
             assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
@@ -258,6 +264,21 @@ class AbstractEventTapManagerTest {
     }
 
     @Test
+    void onceTapSurvivesARejectedForward() {
+        var manager = new TestManager();
+        manager.subscribe(ParentEvent.class);
+        Consumer<Object> listener = manager.listeners.get(ParentEvent.class);
+        manager.queueAccepts = false;
+        listener.accept(new ParentEvent());
+        assertTrue(manager.handleCommand(new String[]{"list"}).contains("ParentEvent"),
+                "a one-shot tap whose output was dropped must stay active");
+        manager.queueAccepts = true;
+        listener.accept(new ParentEvent());
+        assertEquals(1, manager.forwarded.size());
+        assertFalse(manager.handleCommand(new String[]{"list"}).contains("ParentEvent"));
+    }
+
+    @Test
     void concurrentEnableCommandsRespectTheTapLimit() throws InterruptedException {
         var manager = new TestManager();
         waitForIndex(manager);
@@ -302,5 +323,84 @@ class AbstractEventTapManagerTest {
         String name = CountingTickEvent.class.getName();
         assertTrue(manager.handleCommand(new String[]{"on", name, "", "2d"}).contains("24h"));
         assertTrue(manager.handleCommand(new String[]{"on", name, "", "24h"}).startsWith("Enabled tap"));
+    }
+
+    /** A frequent event without "Tick" in its name, like NeighborNotifyEvent; counts serializations. */
+    public static class CountingBlockEvent extends ParentEvent {
+        static final java.util.concurrent.atomic.AtomicInteger SERIALIZED = new java.util.concurrent.atomic.AtomicInteger();
+        final String block;
+
+        CountingBlockEvent(String block) {
+            this.block = block;
+        }
+
+        @Override
+        public String toString() {
+            SERIALIZED.incrementAndGet();
+            return block;
+        }
+    }
+
+    @Test
+    void filteredTapsOnFrequentEventsStayWithinAnEvaluationBudget() {
+        var manager = new TestManager();
+        waitForIndex(manager);
+        assertTrue(manager.handleCommand(new String[]{"on", CountingBlockEvent.class.getName(), "diamond", "permanent"})
+                .startsWith("Enabled tap"));
+        CountingBlockEvent.SERIALIZED.set(0);
+        Consumer<Object> listener = manager.listeners.get(CountingBlockEvent.class);
+        for (int i = 0; i < 10_000; i++) listener.accept(new CountingBlockEvent("stone"));
+        // At most two budget windows can be crossed while the loop runs.
+        assertTrue(CountingBlockEvent.SERIALIZED.get() <= 2 * AbstractEventTapManager.MAX_EVALUATIONS_PER_SECOND,
+                "serialized " + CountingBlockEvent.SERIALIZED.get() + " of 10000 events");
+        assertTrue(manager.forwarded.isEmpty());
+    }
+
+    @Test
+    void infrequentEventsAreAllEvaluatedAgainstTheFilter() {
+        var manager = new TestManager();
+        waitForIndex(manager);
+        assertTrue(manager.handleCommand(new String[]{"on", CountingBlockEvent.class.getName(), "diamond", "permanent"})
+                .startsWith("Enabled tap"));
+        Consumer<Object> listener = manager.listeners.get(CountingBlockEvent.class);
+        for (int i = 0; i < 5; i++) listener.accept(new CountingBlockEvent("stone"));
+        listener.accept(new CountingBlockEvent("diamond_ore"));
+        assertEquals(1, manager.forwarded.size(), "a match after a few misses must still be forwarded");
+    }
+
+    /** Models NeoForge's abstract event families such as BlockEvent and ServerTickEvent. */
+    public abstract static class AbstractFamilyEvent {
+        public static class Concrete extends AbstractFamilyEvent {
+        }
+    }
+
+    @Test
+    void abstractEventsAreRejectedWithConcreteSuggestionsWhenTheLoaderCannotListenToThem() {
+        String outer = AbstractFamilyEvent.class.getName();
+        String concrete = AbstractFamilyEvent.Concrete.class.getName();
+        EventIndex index = EventIndex.fromMaps(Map.of("Concrete", java.util.List.of(concrete)), Map.of(), "test");
+        var strict = new TestManager(new TestBus(), CompletableFuture.completedFuture(index)) {
+            @Override protected boolean supportsAbstractEventListeners() { return false; }
+        };
+        waitForIndex(strict);
+
+        String reply = strict.handleCommand(new String[]{"on", outer});
+
+        assertTrue(reply.contains("abstract"), reply);
+        assertTrue(reply.contains("AbstractFamilyEvent.Concrete"), reply);
+        assertTrue(strict.listeners.isEmpty(), "no listener may be registered for an abstract event");
+
+        var permissive = new TestManager();
+        waitForIndex(permissive);
+        assertTrue(permissive.handleCommand(new String[]{"on", outer}).startsWith("Enabled tap"),
+                "Forge buses accept listeners for abstract events");
+    }
+
+    @Test
+    void tickDetectionMatchesTickEventsButNotWordsContainingTick() {
+        assertTrue(AbstractEventTapManager.isTickEventName("net.neoforged.neoforge.event.tick.ServerTickEvent$Post"));
+        assertTrue(AbstractEventTapManager.isTickEventName("net.minecraftforge.event.TickEvent$ServerTickEvent"));
+        assertFalse(AbstractEventTapManager.isTickEventName("com.example.input.JoystickEvent"));
+        assertFalse(AbstractEventTapManager.isTickEventName("com.example.StickyPistonEvent"));
     }
 }

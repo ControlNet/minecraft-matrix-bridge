@@ -17,6 +17,105 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class MatrixClientTest {
     @Test
+    void theRequestTimeoutAlsoCoversAStalledBody() throws Exception {
+        // Headers and the first body bytes arrive, then the server (or a proxy) stalls.
+        com.sun.net.httpserver.HttpServer server =
+                com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        server.createContext("/", exchange -> {
+            exchange.sendResponseHeaders(200, 0);
+            exchange.getResponseBody().write("{\"user_id\":".getBytes(StandardCharsets.UTF_8));
+            exchange.getResponseBody().flush();
+            try {
+                release.await(10, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            exchange.close();
+        });
+        server.start();
+        try {
+            MatrixClient client = new MatrixClient("http://127.0.0.1:" + server.getAddress().getPort(), "token",
+                    java.time.Duration.ofMillis(400));
+            long start = System.nanoTime();
+            org.junit.jupiter.api.Assertions.assertThrows(java.net.http.HttpTimeoutException.class, client::whoami);
+            long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+            assertTrue(elapsedMs < 3_000, "timed out after " + elapsedMs + " ms");
+        } finally {
+            release.countDown();
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void discoveryTellsAMissingDelegationFromAnUnreadableAnswer() throws Exception {
+        com.sun.net.httpserver.HttpServer server =
+                com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        java.util.concurrent.atomic.AtomicReference<String> body = new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicInteger status = new java.util.concurrent.atomic.AtomicInteger(200);
+        server.createContext("/", exchange -> {
+            byte[] bytes = body.get().getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(status.get(), bytes.length == 0 ? -1 : bytes.length);
+            exchange.getResponseBody().write(bytes);
+            exchange.close();
+        });
+        server.start();
+        try {
+            MatrixClient client = new MatrixClient("http://127.0.0.1:" + server.getAddress().getPort(), "token");
+            for (String unreadable : new String[] {"", "Unavailable", "<html>Down</html>", "[]",
+                    "{status:'unavailable'}", "{} trailing", "{\"maintenance\":True}", "{}",
+                    "{\"m.homeserver\":{\"base_url\":\"matrix.example.com\"}}",
+                    "{\"m.homeserver\":{\"base_url\":\"http://:8008\"}}",
+                    "{\"m.homeserver\":{\"base_url\":\"https://bad host\"}}"}) {
+                body.set(unreadable);
+                org.junit.jupiter.api.Assertions.assertThrows(java.io.IOException.class, client::discoverClientBaseUrl,
+                        "body: " + unreadable);
+            }
+            body.set("{\"m.homeserver\":{\"base_url\":\"https://matrix.example.com/\"}}");
+            assertEquals("https://matrix.example.com", client.discoverClientBaseUrl());
+            // Only a missing document means there is no delegation.
+            status.set(404);
+            body.set("");
+            assertEquals("", client.discoverClientBaseUrl());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void aDelegationNeverDowngradesHttpsWhateverTheSchemeCase() {
+        assertTrue(MatrixClient.usableDelegation("https://example.com", "https://matrix.example.com"));
+        assertTrue(MatrixClient.usableDelegation("https://example.com", "HTTPS://matrix.example.com"));
+        assertTrue(MatrixClient.usableDelegation("http://example.com", "http://matrix.example.com:8008"));
+        org.junit.jupiter.api.Assertions.assertFalse(
+                MatrixClient.usableDelegation("HTTPS://example.com", "http://matrix.example.com"));
+        org.junit.jupiter.api.Assertions.assertFalse(
+                MatrixClient.usableDelegation("https://example.com", "Http://matrix.example.com"));
+        org.junit.jupiter.api.Assertions.assertFalse(
+                MatrixClient.usableDelegation("http://example.com", "ftp://matrix.example.com"));
+        org.junit.jupiter.api.Assertions.assertFalse(MatrixClient.usableDelegation("http://example.com", "http://:8008"));
+    }
+
+    @Test
+    void aSyncResponseWithoutAStringNextBatchIsAnError() throws Exception {
+        try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
+            MatrixClient client = new MatrixClient(server.homeserverUrl(), "token");
+            JsonObject noToken = new JsonObject();
+            server.enqueueSync(noToken);
+            JsonObject booleanToken = new JsonObject();
+            booleanToken.addProperty("next_batch", false);
+            server.enqueueSync(booleanToken);
+            JsonObject blankToken = new JsonObject();
+            blankToken.addProperty("next_batch", " ");
+            server.enqueueSync(blankToken);
+            for (int i = 0; i < 3; i++) {
+                org.junit.jupiter.api.Assertions.assertThrows(java.io.IOException.class,
+                        () -> client.syncOnce("s0", 0, "{}"));
+            }
+        }
+    }
+
+    @Test
     void explicitTransactionIdIsRetainedAcrossRetries() throws Exception {
         try (MockMatrixServer server = new MockMatrixServer("token", "@bot:example.com")) {
             server.setSendRateLimit(1, 1);

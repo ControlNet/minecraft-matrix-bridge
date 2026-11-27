@@ -11,9 +11,14 @@ import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.HashSet;
@@ -53,6 +58,106 @@ public final class MatrixClient {
         return HttpRequest.newBuilder().timeout(requestTimeout);
     }
 
+    /**
+     * Sends {@code request} and reads the whole body within its timeout. HttpClient applies the
+     * request timeout only until the response headers arrive, so a body that stalls part-way
+     * (e.g. behind a proxy) would otherwise block the caller indefinitely.
+     */
+    private static HttpResponse<String> send(HttpClient client, HttpRequest request)
+            throws IOException, InterruptedException {
+        CompletableFuture<HttpResponse<String>> future =
+                client.sendAsync(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        long timeoutMs = request.timeout().orElse(Duration.ofSeconds(30)).toMillis();
+        try {
+            return future.get(timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            future.cancel(true);
+            throw new HttpTimeoutException("Matrix request timed out after " + timeoutMs + " ms");
+        } catch (InterruptedException e) {
+            future.cancel(true);
+            throw e;
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof IOException io) {
+                throw io;
+            }
+            if (cause instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            throw new IOException(cause);
+        }
+    }
+
+    String baseUrl() {
+        return homeserver;
+    }
+
+    /**
+     * Reads {@code m.homeserver.base_url} from {@code /.well-known/matrix/client} on the
+     * configured URL, for setups where the configured URL is the server name rather than the
+     * client API. Returns an empty string when there is no document (404). Any other answer
+     * without a usable {@code m.homeserver.base_url} throws, since it says nothing about whether
+     * the delegation still exists.
+     */
+    public String discoverClientBaseUrl() throws IOException, InterruptedException {
+        HttpRequest request = newRequest()
+                .uri(URI.create(homeserver + "/.well-known/matrix/client"))
+                .GET()
+                .build();
+        // Unauthenticated, so following redirects (e.g. apex -> www) cannot leak the token;
+        // NORMAL never follows https -> http.
+        HttpClient discovery = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .followRedirects(HttpClient.Redirect.NORMAL)
+                .build();
+        HttpResponse<String> response = send(discovery, request);
+        if (response.statusCode() == 404) {
+            return "";
+        }
+        if (response.statusCode() / 100 != 2) {
+            // Says nothing about whether a delegation exists.
+            throw new IOException("HTTP " + response.statusCode());
+        }
+        // JsonParser is lenient ("", bare words, unquoted names); a .well-known document is a
+        // strict JSON object and anything else says nothing about the delegation.
+        JsonElement parsed;
+        try {
+            com.google.gson.stream.JsonReader reader = new com.google.gson.stream.JsonReader(
+                    new java.io.StringReader(response.body()));
+            parsed = new com.google.gson.Gson().getAdapter(JsonElement.class).read(reader);
+            if (reader.peek() != com.google.gson.stream.JsonToken.END_DOCUMENT) {
+                throw new IOException("trailing data");
+            }
+        } catch (RuntimeException e) {
+            throw new IOException("unreadable response", e);
+        }
+        if (parsed == null || !parsed.isJsonObject()) {
+            throw new IOException("response is not a JSON object");
+        }
+        String baseUrl = stripTrailingSlash(getString(getObject(parsed.getAsJsonObject(), "m.homeserver"), "base_url"));
+        if (!usableDelegation(homeserver, baseUrl)) {
+            throw new IOException("no usable m.homeserver.base_url");
+        }
+        return baseUrl;
+    }
+
+    /** An http(s) URL with a host, and https when the configured URL is (schemes are case-insensitive). */
+    static boolean usableDelegation(String configured, String baseUrl) {
+        try {
+            URI target = URI.create(baseUrl);
+            String scheme = target.getScheme() == null ? "" : target.getScheme().toLowerCase(java.util.Locale.ROOT);
+            String configuredScheme = URI.create(configured).getScheme();
+            boolean httpsRequired = "https".equalsIgnoreCase(configuredScheme);
+            boolean schemeOk = httpsRequired ? scheme.equals("https") : scheme.equals("https") || scheme.equals("http");
+            return schemeOk && target.getHost() != null && !target.getHost().isBlank();
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
+    }
+
     Duration syncRequestTimeout(int timeoutMs) {
         return requestTimeout.plusMillis(Math.max(0, timeoutMs));
     }
@@ -64,7 +169,7 @@ public final class MatrixClient {
                 .GET()
                 .build();
 
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response = send(http, request);
         if (response.statusCode() / 100 != 2) {
             throw toException("whoami", response);
         }
@@ -86,7 +191,7 @@ public final class MatrixClient {
                 .GET()
                 .build();
 
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response = send(http, request);
         if (response.statusCode() / 100 != 2) {
             throw toException("resolveRoomAlias", response);
         }
@@ -106,7 +211,7 @@ public final class MatrixClient {
                 .GET()
                 .build();
 
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response = send(http, request);
         if (response.statusCode() / 100 != 2) {
             throw toException("joined_rooms", response);
         }
@@ -146,7 +251,7 @@ public final class MatrixClient {
                 .POST(HttpRequest.BodyPublishers.noBody())
                 .build();
 
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response = send(http, request);
         if (response.statusCode() / 100 != 2) {
             throw toException("joinRoom", response);
         }
@@ -181,7 +286,7 @@ public final class MatrixClient {
                 .GET()
                 .build();
 
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response = send(http, request);
         int status = response.statusCode();
         if (status != 404 && status / 100 != 2) {
             throw toException("power_levels", response);
@@ -305,7 +410,7 @@ public final class MatrixClient {
                 .header("Authorization", "Bearer " + accessToken)
                 .GET()
                 .build();
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response = send(http, request);
         if (response.statusCode() / 100 != 2) {
             throw toException(op, response);
         }
@@ -351,7 +456,7 @@ public final class MatrixClient {
                 .GET()
                 .build();
 
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response = send(http, request);
         int status = response.statusCode();
         if (status == 404) {
             cacheDisplayName(key, "", now);
@@ -401,7 +506,7 @@ public final class MatrixClient {
                 .PUT(HttpRequest.BodyPublishers.ofString(body.toString(), StandardCharsets.UTF_8))
                 .build();
 
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response = send(http, request);
         if (response.statusCode() / 100 != 2) {
             throw toException("sendText", response);
         }
@@ -427,13 +532,19 @@ public final class MatrixClient {
                 .GET()
                 .build();
 
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response = send(http, request);
         if (response.statusCode() / 100 != 2) {
             throw toException("sync", response);
         }
 
         JsonObject root = JsonParser.parseString(response.body()).getAsJsonObject();
-        String nextBatch = getString(root, "next_batch");
+        JsonElement token = root.get("next_batch");
+        // Without a position the response cannot be resumed from; treat it like a failed request.
+        if (token == null || !token.isJsonPrimitive() || !token.getAsJsonPrimitive().isString()
+                || token.getAsString().isBlank()) {
+            throw new IOException("sync response without next_batch");
+        }
+        String nextBatch = token.getAsString();
         JsonObject joinedRooms = new JsonObject();
         JsonObject rooms = getObject(root, "rooms");
         if (rooms != null) {
@@ -485,7 +596,7 @@ public final class MatrixClient {
         }
         String error = parseMatrixError(response.body());
         String msg = op + ": HTTP " + status + (error.isBlank() ? "" : (" (" + error + ")"));
-        return new MatrixException(msg, status, retryAfterMs);
+        return new MatrixException(msg, status, retryAfterMs, parseErrcode(response.body()));
     }
 
     private static long parseRetryAfterHeaderMs(HttpResponse<?> response) {
@@ -523,6 +634,15 @@ public final class MatrixClient {
         }
     }
 
+    private static String parseErrcode(String body) {
+        try {
+            JsonElement parsed = JsonParser.parseString(body == null ? "" : body);
+            return parsed.isJsonObject() ? getString(parsed.getAsJsonObject(), "errcode") : "";
+        } catch (RuntimeException ignored) {
+            return "";
+        }
+    }
+
     private static long parseRetryAfterMs(String body) {
         if (body == null || body.isBlank()) {
             return 0;
@@ -542,6 +662,34 @@ public final class MatrixClient {
         return 0;
     }
 
+    /**
+     * One page of {@code GET /rooms/{roomId}/messages} walking backwards from {@code from}
+     * and stopping at {@code to} (a sync token, as the spec allows). Events are newest first.
+     */
+    public MessagesPage roomMessagesBackwards(String roomId, String from, String to, int limit, String filterJson)
+            throws IOException, InterruptedException, MatrixException {
+        String uri = roomPath(roomId) + "/messages?dir=b"
+                + "&from=" + urlEncodeQuery(from)
+                + "&to=" + urlEncodeQuery(to)
+                + "&limit=" + limit
+                + "&filter=" + urlEncodeQuery(filterJson);
+        JsonObject response = getJson(uri, "messages");
+        JsonElement chunk = response.get("chunk");
+        return new MessagesPage(chunk != null && chunk.isJsonArray() ? chunk.getAsJsonArray() : new JsonArray(),
+                getString(response, "end"));
+    }
+
+    public static final class MessagesPage {
+        public final JsonArray chunk;
+        /** Token for the next (older) page; empty when there is none. */
+        public final String end;
+
+        MessagesPage(JsonArray chunk, String end) {
+            this.chunk = chunk;
+            this.end = end == null ? "" : end;
+        }
+    }
+
     public static final class SyncResult {
         public final String nextBatch;
         public final JsonObject joinedRooms;
@@ -555,11 +703,18 @@ public final class MatrixClient {
     public static final class MatrixException extends Exception {
         public final int statusCode;
         public final long retryAfterMs;
+        /** Matrix {@code errcode} of the error body; empty when the body was not a Matrix error. */
+        public final String errcode;
 
         public MatrixException(String message, int statusCode, long retryAfterMs) {
+            this(message, statusCode, retryAfterMs, "");
+        }
+
+        public MatrixException(String message, int statusCode, long retryAfterMs, String errcode) {
             super(message);
             this.statusCode = statusCode;
             this.retryAfterMs = retryAfterMs;
+            this.errcode = errcode == null ? "" : errcode;
         }
     }
 

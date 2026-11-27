@@ -17,7 +17,7 @@ import java.lang.reflect.Modifier;
  * <p>The module compiles against 1.19.2, but 1.19.0 predates two APIs that the
  * shared code links directly: {@code PlayerList.broadcastSystemMessage(Component, boolean)}
  * (added in 1.19.1) and {@code ServerChatEvent.getMessage()} returning a Component
- * (Forge 41 returns the raw String). This adapter is only selected on 1.19.0, where
+ * (Forge 41 returns the raw String and broadcasts {@code getComponent()}). This adapter is only selected on 1.19.0, where
  * the runtime uses SRG names, so the members are resolved by their SRG names.</p>
  */
 final class Forge1190MinecraftCompat extends ForgeMinecraftCompat {
@@ -28,6 +28,13 @@ final class Forge1190MinecraftCompat extends ForgeMinecraftCompat {
 
     private final Method broadcast;
     private final Object systemChatType;
+    /**
+     * Decorates the message argument of /say, /me, /msg and /teammsg on 1.19.0. Its code (lambdas
+     * included) is on the stack whenever Forge 41 fires ServerChatEvent for a command, on whichever
+     * task that happens; chat typed into the chat box is decorated by ServerGamePacketListenerImpl.
+     */
+    static final String COMMAND_MESSAGE_CLASS = "net.minecraft.commands.arguments.MessageArgument$ChatMessage";
+
     private final Method chatMessage;
 
     Forge1190MinecraftCompat() {
@@ -45,7 +52,9 @@ final class Forge1190MinecraftCompat extends ForgeMinecraftCompat {
                 throw new IllegalStateException("Unexpected Minecraft 1.19 chat type field: " + field);
             }
             systemChatType = field.get(null);
-            chatMessage = chatEvent.getMethod("getMessage");
+            // getMessage() is the text as typed; getComponent() is what Forge broadcasts after
+            // other mods filtered or cleared it, so relay that.
+            chatMessage = chatEvent.getMethod("getComponent");
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("Missing Minecraft 1.19 / Forge 41 API", e);
         }
@@ -62,10 +71,21 @@ final class Forge1190MinecraftCompat extends ForgeMinecraftCompat {
 
     @Override
     String chatMessage(ServerChatEvent event) {
+        // Forge 41 also fires ServerChatEvent for the text of /say, /me, /msg and /teammsg, before
+        // the command picks its recipients (and with no player for the console). Only chat typed
+        // into the chat box is relayed, so private messages stay private.
+        if (event.getPlayer() == null || calledFrom(COMMAND_MESSAGE_CLASS)) {
+            return "";
+        }
         return chatText(invoke(chatMessage, event));
     }
 
-    /** Forge 41 returns a String; later builds return a Component. */
+    static boolean calledFrom(String className) {
+        return StackWalker.getInstance().walk(frames ->
+                frames.anyMatch(frame -> frame.getClassName().equals(className)));
+    }
+
+    /** Text of the broadcast chat component; empty when a mod removed the message. */
     static String chatText(Object message) {
         if (message instanceof String text) {
             return text;

@@ -46,6 +46,23 @@ public class EventIndexTest {
     }
 
     @Test
+    void nestedEventsListsDirectChildrenOfAnEventFamily() {
+        EventIndex index = EventIndex.fromMaps(Map.of(
+                "BreakEvent", List.of("net.neoforged.neoforge.event.level.BlockEvent$BreakEvent"),
+                "EntityPlaceEvent", List.of("net.neoforged.neoforge.event.level.BlockEvent$EntityPlaceEvent"),
+                "Inner", List.of("net.neoforged.neoforge.event.level.BlockEvent$EntityPlaceEvent$Inner"),
+                "ServerChatEvent", List.of("net.neoforged.neoforge.event.ServerChatEvent")
+        ), Map.of(), "neoforge");
+
+        assertEquals(List.of(
+                        "net.neoforged.neoforge.event.level.BlockEvent$BreakEvent",
+                        "net.neoforged.neoforge.event.level.BlockEvent$EntityPlaceEvent"),
+                index.nestedEvents("net.neoforged.neoforge.event.level.BlockEvent", 10));
+        assertEquals(1, index.nestedEvents("net.neoforged.neoforge.event.level.BlockEvent", 1).size());
+        assertTrue(index.nestedEvents("net.neoforged.neoforge.event.ServerChatEvent", 10).isEmpty());
+    }
+
+    @Test
     void emptyIndexIsEmpty() {
         EventIndex empty = EventIndex.empty();
         assertTrue(empty.isEmpty());

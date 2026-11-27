@@ -8,6 +8,7 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.storage.LevelResource;
+import net.neoforged.bus.api.EventPriority;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.event.RegisterCommandsEvent;
 import net.neoforged.neoforge.event.ServerChatEvent;
@@ -36,11 +37,11 @@ public final class NeoForgeHooks {
     private static final int MAX_WAIT_TICKS = 100;
     private static final int DEFAULT_VIEW_DISTANCE = 2;
 
-    private BridgeService bridgeService;
-    private McCallbacks callbacks;
-    private EventTapManager eventTapManager;
+    // Written on the server thread, read by bridge and command threads.
+    private volatile BridgeService bridgeService;
+    private volatile McCallbacks callbacks;
+    private volatile EventTapManager eventTapManager;
     private volatile MinecraftServer runningServer;
-    private volatile String connectedRoomIdOrAlias = "";
     private final ConcurrentHashMap<UUID, Integer> pendingConnectedNoticeTicks = new ConcurrentHashMap<>();
 
     private void closeEventTapManager() {
@@ -78,8 +79,6 @@ public final class NeoForgeHooks {
                 if (s == null) {
                     return;
                 }
-                String room = (roomIdOrAlias == null || roomIdOrAlias.isBlank()) ? "<unknown>" : roomIdOrAlias;
-                connectedRoomIdOrAlias = room;
                 s.execute(() -> {
                     for (ServerPlayer p : s.getPlayerList().getPlayers()) {
                         scheduleConnectedNotice(p);
@@ -143,10 +142,7 @@ public final class NeoForgeHooks {
             );
         }
 
-        if (MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get() && MatrixBridgeConfig.ENABLE_SERVER_LIFECYCLE_TO_MATRIX.get()) {
-            String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "* Server started.";
-            bridgeService.enqueueMcMessage(formatted);
-        }
+        bridgeService.enqueueServerLifecycle(true);
     }
 
     @SubscribeEvent
@@ -163,13 +159,9 @@ public final class NeoForgeHooks {
         bridgeService = null;
         closeEventTapManager();
         runningServer = null;
-        connectedRoomIdOrAlias = "";
         pendingConnectedNoticeTicks.clear();
         if (service != null) {
-            if (announceStopping && MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get()
-                    && MatrixBridgeConfig.ENABLE_SERVER_LIFECYCLE_TO_MATRIX.get()) {
-                String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "* Server stopping.";
-                service.enqueueMcMessage(formatted);
+            if (announceStopping && service.enqueueServerLifecycle(false)) {
                 Thread t = new Thread(() -> {
                     try {
                         Thread.sleep(750);
@@ -192,49 +184,33 @@ public final class NeoForgeHooks {
         shutdownBridge(false);
     }
 
-    @SubscribeEvent
+    // Last, so chat cancelled by mute/filter mods at any other priority is not relayed.
+    @SubscribeEvent(priority = EventPriority.LOWEST)
     public void onServerChat(ServerChatEvent event) {
         if (bridgeService == null || !bridgeService.isRunning()) {
             return;
         }
-        if (!MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get()) {
-            return;
-        }
-
         String msg = event.getMessage().getString();
         if (msg == null || msg.isBlank()) {
             return;
         }
 
         String playerName = event.getPlayer().getName().getString();
-        String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "<" + playerName + "> " + msg;
-        bridgeService.enqueueMcMessage(formatted);
+        bridgeService.enqueuePlayerChat(playerName, msg);
     }
 
     @SubscribeEvent
     public void onPlayerLoggedIn(PlayerEvent.PlayerLoggedInEvent event) {
         BridgeService service = bridgeService;
 
-        if (service != null && service.isRunning()
-                && MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get()
-                && MatrixBridgeConfig.ENABLE_JOIN_LEAVE_TO_MATRIX.get()) {
-            String playerName = event.getEntity().getName().getString();
-            String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "* " + playerName + " joined the game";
-            service.enqueueMcMessage(formatted);
+        if (service != null) {
+            service.enqueuePlayerJoinLeave(event.getEntity().getName().getString(), true);
         }
 
-        if (service == null || !service.isReady()) {
+        String room = service == null ? null : service.connectedNoticeRoom();
+        if (room == null) {
             return;
         }
-        if (!MatrixBridgeConfig.ANNOUNCE_CONNECTED.get()) {
-            return;
-        }
-        String configured = MatrixBridgeConfig.ROOM_ID.get();
-        String roomId = (configured != null && configured.startsWith("#"))
-                ? configured
-                : service.getResolvedRoomId();
-        String room = (roomId == null || roomId.isBlank()) ? "<unknown>" : roomId;
-        connectedRoomIdOrAlias = room;
         scheduleConnectedNotice(event.getEntity());
     }
 
@@ -248,9 +224,13 @@ public final class NeoForgeHooks {
             return;
         }
 
-        String room = connectedRoomIdOrAlias;
-        if (room == null || room.isBlank()) {
-            room = "<unknown>";
+        // Asked at send time: while the bridge is not receiving (e.g. replacing a rejected sync
+        // token) queued notices are dropped, and it announces again to everyone once it is.
+        BridgeService service = bridgeService;
+        String room = service == null ? null : service.connectedNoticeRoom();
+        if (room == null) {
+            pendingConnectedNoticeTicks.clear();
+            return;
         }
 
         for (Map.Entry<UUID, Integer> e : pendingConnectedNoticeTicks.entrySet()) {
@@ -318,16 +298,7 @@ public final class NeoForgeHooks {
         if (service == null || !service.isRunning()) {
             return;
         }
-        if (!MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get()) {
-            return;
-        }
-        if (!MatrixBridgeConfig.ENABLE_JOIN_LEAVE_TO_MATRIX.get()) {
-            return;
-        }
-
-        String playerName = event.getEntity().getName().getString();
-        String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "* " + playerName + " left the game";
-        service.enqueueMcMessage(formatted);
+        service.enqueuePlayerJoinLeave(event.getEntity().getName().getString(), false);
     }
 
     @SubscribeEvent
@@ -371,8 +342,6 @@ public final class NeoForgeHooks {
                             if (s == null) {
                                 return;
                             }
-                            String room = (roomIdOrAlias == null || roomIdOrAlias.isBlank()) ? "<unknown>" : roomIdOrAlias;
-                            connectedRoomIdOrAlias = room;
                             s.execute(() -> {
                                 for (ServerPlayer p : s.getPlayerList().getPlayers()) {
                                     scheduleConnectedNotice(p);
@@ -423,9 +392,9 @@ public final class NeoForgeHooks {
                             return fut;
                         }
                     };
-                    bridgeService.start(loadSettings(), worldRoot, callbacks);
-
                     BridgeSettings settings = loadSettings();
+                    bridgeService.start(settings, worldRoot, callbacks);
+
                     if (settings.enableEventTaps) {
                         eventTapManager = new EventTapManager(
                                 bridgeService,
@@ -443,12 +412,11 @@ public final class NeoForgeHooks {
                         ctx.getSource().sendFailure(Component.literal("MatrixBridge is not running."));
                         return 0;
                     }
-                    if (!MatrixBridgeConfig.ENABLE_MC_TO_MATRIX.get()) {
+                    if (bridgeService.isMcToMatrixDisabledByConfig()) {
                         ctx.getSource().sendFailure(Component.literal("MC → Matrix is disabled (enableMcToMatrix=false)."));
                         return 0;
                     }
-                    String formatted = MatrixBridgeConfig.MC_TO_MATRIX_PREFIX.get() + "[TEST] " + Instant.now();
-                    boolean queued = bridgeService.enqueueMcMessage(formatted);
+                    boolean queued = bridgeService.enqueuePlayerTestMessage(Instant.now().toString());
                     if (queued) {
                         ctx.getSource().sendSuccess(() -> Component.literal("Queued test message."), false);
                         return 1;
@@ -505,7 +473,9 @@ public final class NeoForgeHooks {
                 MatrixBridgeConfig.ENABLE_EVENT_TAPS.get(),
                 MatrixBridgeConfig.MAX_ACTIVE_EVENT_TAPS.get(),
                 MatrixBridgeConfig.DEFAULT_EVENT_THROTTLE_MS.get(),
-                MatrixBridgeConfig.EVENT_COMMAND_MIN_POWER_LEVEL.get()
+                MatrixBridgeConfig.EVENT_COMMAND_MIN_POWER_LEVEL.get(),
+                MatrixBridgeConfig.ENABLE_JOIN_LEAVE_TO_MATRIX.get(),
+                MatrixBridgeConfig.ENABLE_SERVER_LIFECYCLE_TO_MATRIX.get()
         );
     }
 

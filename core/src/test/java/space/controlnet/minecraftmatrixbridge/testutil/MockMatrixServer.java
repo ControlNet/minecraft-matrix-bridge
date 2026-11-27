@@ -36,6 +36,9 @@ public final class MockMatrixServer implements AutoCloseable {
     private final List<RecordedRequest> joinedRoomsRequests = Collections.synchronizedList(new ArrayList<>());
     private final List<RecordedRequest> joinRequests = Collections.synchronizedList(new ArrayList<>());
     private final List<RecordedRequest> syncRequests = Collections.synchronizedList(new ArrayList<>());
+    private final List<RecordedRequest> messagesRequests = Collections.synchronizedList(new ArrayList<>());
+    /** /rooms/{id}/messages pages keyed by their {@code from} token. */
+    private final Map<String, JsonObject> messagesPages = new ConcurrentHashMap<>();
     private final Map<String, JsonObject> stateContents = new ConcurrentHashMap<>();
     private final Map<String, Integer> stateErrors = new ConcurrentHashMap<>();
     private final Map<String, JsonObject> roomEvents = new ConcurrentHashMap<>();
@@ -59,11 +62,16 @@ public final class MockMatrixServer implements AutoCloseable {
     private volatile int syncErrorRemaining = 0;
     private volatile int syncErrorStatus = 0;
     private volatile String syncErrorCode = "";
+    private volatile boolean whoamiNotFound = false;
+    private volatile String wellKnownBaseUrl = "";
+    private volatile String wellKnownRedirect = "";
+    private final AtomicInteger wellKnownCalls = new AtomicInteger();
 
     private volatile String roomAlias = "";
     private volatile String roomIdForAlias = "";
     private final Set<String> joinedRooms = ConcurrentHashMap.newKeySet();
     private final Set<String> invitedRooms = ConcurrentHashMap.newKeySet();
+    private final Map<String, String> joinableAliases = new ConcurrentHashMap<>();
     private final Map<String, String> memberDisplayNames = new ConcurrentHashMap<>();
 
     public MockMatrixServer(String expectedToken, String selfUserId) throws IOException {
@@ -77,6 +85,7 @@ public final class MockMatrixServer implements AutoCloseable {
         server.createContext("/_matrix/client/v3/join", this::handleJoin);
         server.createContext("/_matrix/client/v3/sync", this::handleSync);
         server.createContext("/_matrix/client/v3/rooms", this::handleRooms);
+        server.createContext("/.well-known/matrix/client", this::handleWellKnown);
         server.start();
     }
 
@@ -89,8 +98,17 @@ public final class MockMatrixServer implements AutoCloseable {
     }
 
     public void enqueueSyncResponse(String roomId, String nextBatch, JsonArray events) {
+        enqueueSyncResponse(roomId, nextBatch, events, false, "");
+    }
+
+    /** A sync whose timeline was cut to the newest events ({@code limited}), with its gap token. */
+    public void enqueueSyncResponse(String roomId, String nextBatch, JsonArray events, boolean limited, String prevBatch) {
         JsonObject timeline = new JsonObject();
         timeline.add("events", events == null ? new JsonArray() : events);
+        if (limited) {
+            timeline.addProperty("limited", true);
+            timeline.addProperty("prev_batch", prevBatch);
+        }
 
         JsonObject roomObj = new JsonObject();
         roomObj.add("timeline", timeline);
@@ -133,11 +151,128 @@ public final class MockMatrixServer implements AutoCloseable {
         syncRetryAfterMs = Math.max(0, retryAfterMs);
     }
 
+    /** Makes whoami answer 404, like a server-name URL that does not host the client API. */
+    public void setWhoamiNotFound(boolean notFound) {
+        whoamiNotFound = notFound;
+    }
+
+    private volatile int whoamiErrorStatus;
+
+    /** Answer every whoami with {@code status} (0 turns it off), like a retired endpoint. */
+    public void setWhoamiError(int status) {
+        whoamiErrorStatus = status;
+    }
+
+    /** Serves {@code /.well-known/matrix/client} pointing at {@code baseUrl}; blank means 404. */
+    public void setWellKnownBaseUrl(String baseUrl) {
+        wellKnownBaseUrl = baseUrl == null ? "" : baseUrl;
+    }
+
+    private volatile int wellKnownErrorStatus;
+
+    /** Answer {@code /.well-known/matrix/client} with {@code status} (0 turns it off). */
+    public void setWellKnownError(int status) {
+        wellKnownErrorStatus = status;
+    }
+
+    private volatile String whoamiBody = "";
+
+    /** Answer whoami with HTTP 200 and this non-JSON body (blank turns it off), like a maintenance page. */
+    public void setWhoamiHtml(String body) {
+        whoamiBody = body == null ? "" : body;
+    }
+
+    /** Answers {@code /.well-known/matrix/client} with a 302 to {@code location} (e.g. apex -> www). */
+    public void setWellKnownRedirect(String location) {
+        wellKnownRedirect = location == null ? "" : location;
+    }
+
+    public int wellKnownCallCount() {
+        return wellKnownCalls.get();
+    }
+
     /** Fail the next {@code times} sync requests with {@code status} and Matrix {@code errcode}. */
     public void setSyncError(int times, int status, String errcode) {
         syncErrorStatus = status;
         syncErrorCode = errcode == null ? "" : errcode;
         syncErrorRemaining = Math.max(0, times);
+    }
+
+    /** Serves one backwards page of {@code /messages} for {@code from}: newest first, {@code end} blank for the last page. */
+    public void setMessagesPage(String from, JsonArray newestFirst, String end) {
+        JsonObject page = new JsonObject();
+        page.add("chunk", newestFirst);
+        page.addProperty("start", from);
+        if (end != null && !end.isBlank()) {
+            page.addProperty("end", end);
+        }
+        messagesPages.put(from, page);
+    }
+
+    private volatile int messagesErrorRemaining;
+    private volatile int messagesErrorStatus;
+    private volatile String messagesErrorCode = "";
+    private volatile int sendErrorRemaining;
+    private volatile int sendErrorStatus;
+
+    /** Fail the next {@code times} {@code /messages} requests with {@code status} and no Matrix errcode. */
+    public void setMessagesError(int times, int status) {
+        setMessagesError(times, status, "");
+    }
+
+    /** Fail the next {@code times} {@code /messages} requests with {@code status} and Matrix {@code errcode}. */
+    public void setMessagesError(int times, int status, String errcode) {
+        messagesErrorStatus = status;
+        messagesErrorCode = errcode == null ? "" : errcode;
+        messagesErrorRemaining = Math.max(0, times);
+    }
+
+    /** Fail the next {@code times} message sends with {@code status} and no Matrix errcode. */
+    public void setSendError(int times, int status) {
+        sendErrorStatus = status;
+        sendErrorRemaining = Math.max(0, times);
+    }
+
+    private volatile int directoryErrorRemaining;
+    private volatile int directoryErrorStatus;
+    private volatile String directoryErrorCode = "";
+    private volatile int joinErrorRemaining;
+    private volatile int joinErrorStatus;
+    private volatile String joinErrorCode = "";
+
+    /** Fail the next {@code times} alias lookups with {@code status} and Matrix {@code errcode} (blank: none). */
+    public void setDirectoryError(int times, int status, String errcode) {
+        directoryErrorStatus = status;
+        directoryErrorCode = errcode == null ? "" : errcode;
+        directoryErrorRemaining = Math.max(0, times);
+    }
+
+    /** Fail the next {@code times} joins with {@code status} and Matrix {@code errcode} (blank: none). */
+    public void setJoinError(int times, int status, String errcode) {
+        joinErrorStatus = status;
+        joinErrorCode = errcode == null ? "" : errcode;
+        joinErrorRemaining = Math.max(0, times);
+    }
+
+    private void respondInjectedError(HttpExchange exchange, int status, String errcode) throws IOException {
+        if (errcode.isBlank()) {
+            respondPlain(exchange, status, "");
+            return;
+        }
+        JsonObject body = new JsonObject();
+        body.addProperty("errcode", errcode);
+        body.addProperty("error", "mock error");
+        respondJson(exchange, status, body);
+    }
+
+    public int pendingSyncErrors() {
+        return syncErrorRemaining;
+    }
+
+    public List<RecordedRequest> getMessagesRequests() {
+        synchronized (messagesRequests) {
+            return List.copyOf(messagesRequests);
+        }
     }
 
     public List<RecordedRequest> getSyncRequests() {
@@ -200,6 +335,11 @@ public final class MockMatrixServer implements AutoCloseable {
         }
     }
 
+    /** A public room that can be joined by {@code alias} (the server finds a route) but not by its bare ID. */
+    public void setJoinableAlias(String alias, String roomId) {
+        joinableAliases.put(alias, roomId);
+    }
+
     public void setInvitedRooms(List<String> roomIds) {
         invitedRooms.clear();
         if (roomIds != null) {
@@ -253,6 +393,19 @@ public final class MockMatrixServer implements AutoCloseable {
             return;
         }
 
+        if (whoamiNotFound) {
+            respondPlain(exchange, 404, "<html>Not Found</html>");
+            return;
+        }
+        if (whoamiErrorStatus > 0) {
+            respondPlain(exchange, whoamiErrorStatus, "");
+            return;
+        }
+        if (!whoamiBody.isBlank()) {
+            respondPlain(exchange, 200, whoamiBody);
+            return;
+        }
+
         if (whoami429Remaining > 0) {
             whoami429Remaining--;
             JsonObject body = new JsonObject();
@@ -269,6 +422,31 @@ public final class MockMatrixServer implements AutoCloseable {
 
         JsonObject body = new JsonObject();
         body.addProperty("user_id", selfUserId);
+        respondJson(exchange, 200, body);
+    }
+
+    private void handleWellKnown(HttpExchange exchange) throws IOException {
+        wellKnownCalls.incrementAndGet();
+        if (wellKnownErrorStatus > 0) {
+            respondPlain(exchange, wellKnownErrorStatus, "");
+            return;
+        }
+        String redirect = wellKnownRedirect;
+        if (!redirect.isBlank()) {
+            exchange.getResponseHeaders().set("Location", redirect);
+            exchange.sendResponseHeaders(302, -1);
+            exchange.close();
+            return;
+        }
+        String baseUrl = wellKnownBaseUrl;
+        if (baseUrl.isBlank()) {
+            respondPlain(exchange, 404, "");
+            return;
+        }
+        JsonObject homeserver = new JsonObject();
+        homeserver.addProperty("base_url", baseUrl);
+        JsonObject body = new JsonObject();
+        body.add("m.homeserver", homeserver);
         respondJson(exchange, 200, body);
     }
 
@@ -333,6 +511,11 @@ public final class MockMatrixServer implements AutoCloseable {
                 ""
         ));
 
+        if (joinErrorRemaining > 0) {
+            joinErrorRemaining--;
+            respondInjectedError(exchange, joinErrorStatus, joinErrorCode);
+            return;
+        }
         if (join429Remaining > 0) {
             join429Remaining--;
             JsonObject body = new JsonObject();
@@ -355,6 +538,14 @@ public final class MockMatrixServer implements AutoCloseable {
         String rawRoom = path.substring(prefix.length());
         String room = URLDecoder.decode(rawRoom, StandardCharsets.UTF_8);
 
+        String aliasTarget = joinableAliases.get(room);
+        if (aliasTarget != null) {
+            joinedRooms.add(aliasTarget);
+            JsonObject ok = new JsonObject();
+            ok.addProperty("room_id", aliasTarget);
+            respondJson(exchange, 200, ok);
+            return;
+        }
         if (invitedRooms.contains(room)) {
             invitedRooms.remove(room);
             joinedRooms.add(room);
@@ -393,6 +584,12 @@ public final class MockMatrixServer implements AutoCloseable {
                 exchange.getRequestHeaders().getFirst("Content-Type"),
                 ""
         ));
+
+        if (directoryErrorRemaining > 0) {
+            directoryErrorRemaining--;
+            respondInjectedError(exchange, directoryErrorStatus, directoryErrorCode);
+            return;
+        }
 
         String prefix = "/_matrix/client/v3/directory/room/";
         if (path == null || !path.startsWith(prefix)) {
@@ -470,6 +667,10 @@ public final class MockMatrixServer implements AutoCloseable {
         }
 
         String path = exchange.getRequestURI().getRawPath();
+        if ("GET".equalsIgnoreCase(exchange.getRequestMethod()) && path != null && path.endsWith("/messages")) {
+            handleMessages(exchange);
+            return;
+        }
         if ("GET".equalsIgnoreCase(exchange.getRequestMethod())) {
             handleRoomMemberState(exchange, path);
             return;
@@ -494,6 +695,11 @@ public final class MockMatrixServer implements AutoCloseable {
                 bodyStr
         ));
 
+        if (sendErrorRemaining > 0) {
+            sendErrorRemaining--;
+            respondPlain(exchange, sendErrorStatus, "");
+            return;
+        }
         if (send429Remaining > 0) {
             send429Remaining--;
             JsonObject body = new JsonObject();
@@ -511,6 +717,36 @@ public final class MockMatrixServer implements AutoCloseable {
         JsonObject ok = new JsonObject();
         ok.addProperty("event_id", "$mock");
         respondJson(exchange, 200, ok);
+    }
+
+    private void handleMessages(HttpExchange exchange) throws IOException {
+        String query = exchange.getRequestURI().getRawQuery();
+        messagesRequests.add(new RecordedRequest("GET", exchange.getRequestURI().getRawPath(), query, null, ""));
+        if (messagesErrorRemaining > 0) {
+            messagesErrorRemaining--;
+            if (messagesErrorCode.isEmpty()) {
+                respondPlain(exchange, messagesErrorStatus, "");
+            } else {
+                JsonObject body = new JsonObject();
+                body.addProperty("errcode", messagesErrorCode);
+                body.addProperty("error", "mock messages error");
+                respondJson(exchange, messagesErrorStatus, body);
+            }
+            return;
+        }
+        String from = "";
+        for (String part : (query == null ? "" : query).split("&")) {
+            if (part.startsWith("from=")) {
+                from = java.net.URLDecoder.decode(part.substring(5), StandardCharsets.UTF_8);
+            }
+        }
+        JsonObject page = messagesPages.get(from);
+        if (page == null) {
+            page = new JsonObject();
+            page.add("chunk", new JsonArray());
+            page.addProperty("start", from);
+        }
+        respondJson(exchange, 200, page);
     }
 
     private void handleRoomMemberState(HttpExchange exchange, String path) throws IOException {

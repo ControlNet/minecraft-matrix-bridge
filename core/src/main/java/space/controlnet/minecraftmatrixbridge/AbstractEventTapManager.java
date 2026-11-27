@@ -1,5 +1,6 @@
 package space.controlnet.minecraftmatrixbridge;
 
+import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -10,6 +11,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
@@ -42,6 +44,13 @@ public abstract class AbstractEventTapManager<E> {
             return isTickEventName(type.getName());
         }
     };
+
+    /**
+     * Other events are evaluated (serialized and filtered) at most this often per tap, so a
+     * filter on a frequent event such as a block update cannot serialize every occurrence.
+     */
+    static final int MAX_EVALUATIONS_PER_SECOND = 50;
+    private static final long EVALUATION_WINDOW_MS = 1000;
 
     private final Object admissionLock = new Object();
 
@@ -117,6 +126,11 @@ public abstract class AbstractEventTapManager<E> {
 
     protected boolean isEventClass(Class<?> eventClass) {
         return getEventBaseClass().isAssignableFrom(eventClass);
+    }
+
+    /** NeoForge's bus rejects listeners for abstract events such as BlockEvent or PlayerEvent. */
+    protected boolean supportsAbstractEventListeners() {
+        return true;
     }
 
     protected abstract void registerEventListener(Class<E> eventClass, Consumer<E> listener);
@@ -206,6 +220,11 @@ public abstract class AbstractEventTapManager<E> {
             return "Class is not an Event subtype: " + fqcn;
         }
 
+        if (!supportsAbstractEventListeners() && !eventClass.isInterface()
+                && Modifier.isAbstract(eventClass.getModifiers())) {
+            return abstractEventMessage(fqcn);
+        }
+
         if (bridgeService.isMcToMatrixDisabledByConfig()) {
             // Tap output is sent through the MC -> Matrix queue, which is not running.
             return "Event taps cannot deliver anything while MC -> Matrix is disabled (bridge.enableMcToMatrix=false).";
@@ -262,6 +281,24 @@ public abstract class AbstractEventTapManager<E> {
         String durationDisplay = duration.toDisplayString();
         String filterDisplay = normalizedFilter == null ? "(none)" : "'" + filter + "'";
         return "Enabled tap on " + eventClass.getSimpleName() + " (filter=" + filterDisplay + ", duration=" + durationDisplay + ", throttle=" + throttleMs + "ms)";
+    }
+
+    private String abstractEventMessage(String fqcn) {
+        String name = displayName(fqcn);
+        EventIndex index = getEventIndex();
+        List<String> subtypes = new ArrayList<>();
+        for (String nested : index == null ? List.<String>of() : index.nestedEvents(fqcn, 8)) {
+            subtypes.add(displayName(nested));
+        }
+        String hint = subtypes.isEmpty()
+                ? "Find one with: event search " + name
+                : "For example: " + String.join(", ", subtypes);
+        return name + " is abstract, and this loader cannot listen to abstract events. Tap one of its subtypes instead. " + hint;
+    }
+
+    /** {@code a.b.Outer$Inner} -> {@code Outer.Inner}, the alias accepted by {@code event on}. */
+    private static String displayName(String fqcn) {
+        return fqcn.substring(fqcn.lastIndexOf('.') + 1).replace('$', '.');
     }
 
     private String handleOff(String[] args) {
@@ -451,9 +488,12 @@ public abstract class AbstractEventTapManager<E> {
             if (!sub.shouldForward(nowMs)) {
                 continue;
             }
-            // Sample tick events before serializing, so a filter that never matches
-            // does not serialize every tick.
-            if (tickEvent && !sub.tryClaimEvaluation(nowMs, TICK_EVALUATION_INTERVAL_MS)) {
+            // Sample before serializing, so a filter that never matches does not serialize
+            // every tick (or every occurrence of any other frequent event).
+            boolean evaluate = tickEvent
+                    ? sub.tryClaimEvaluation(nowMs, TICK_EVALUATION_INTERVAL_MS)
+                    : sub.tryClaimEvaluationBudget(nowMs, EVALUATION_WINDOW_MS, MAX_EVALUATIONS_PER_SECOND);
+            if (!evaluate) {
                 continue;
             }
 
@@ -470,19 +510,21 @@ public abstract class AbstractEventTapManager<E> {
             if (!sub.tryClaimForward(nowMs)) {
                 continue;
             }
-            forward(EventSerializationUtil.formatForMatrix(event, serialized, MAX_MESSAGE_LEN));
+            boolean queued = forward(EventSerializationUtil.formatForMatrix(event, serialized, MAX_MESSAGE_LEN));
+            sub.completeForward(queued, nowMs);
         }
 
         bucket.cleanupExpired(nowMs);
     }
 
+    /** Tick events are named in CamelCase ("ServerTickEvent"); "Joystick" or "Sticky" are not. */
     static boolean isTickEventName(String fqcn) {
-        return fqcn.toLowerCase(Locale.ROOT).contains("tick");
+        return fqcn.contains("Tick");
     }
 
-    /** Sends one tap message; overridden in tests. */
-    void forward(String message) {
-        bridgeService.enqueueMcMessage(message);
+    /** Queues one tap message; false when the queue refused it. Overridden in tests. */
+    boolean forward(String message) {
+        return bridgeService.enqueueTapMessage(message);
     }
 
     private Class<?> tryLoadClass(String fqcn) {
@@ -603,7 +645,11 @@ public abstract class AbstractEventTapManager<E> {
         final AtomicLong matchCount = new AtomicLong(0);
         final AtomicLong lastForwardedAtMs = new AtomicLong(0);
         final AtomicLong lastEvaluatedAtMs = new AtomicLong(Long.MIN_VALUE);
+        final AtomicLong evaluationWindowStartMs = new AtomicLong(Long.MIN_VALUE);
+        final AtomicInteger evaluationsInWindow = new AtomicInteger();
         final AtomicBoolean enabled = new AtomicBoolean(true);
+        /** A one-shot tap's single forward is in flight or done; it is disabled once queued. */
+        final AtomicBoolean onceClaimed = new AtomicBoolean(false);
 
         Subscription(UUID id, String fqcn, String filterLower, DurationSpec.Mode mode, long expiresAtMs, long minIntervalMs) {
             this.id = id;
@@ -633,6 +679,16 @@ public abstract class AbstractEventTapManager<E> {
             return lastEvaluatedAtMs.compareAndSet(last, nowMs);
         }
 
+        /** Claims one of {@code max} evaluations allowed per {@code windowMs}. */
+        boolean tryClaimEvaluationBudget(long nowMs, long windowMs, int max) {
+            long start = evaluationWindowStartMs.get();
+            if ((start == Long.MIN_VALUE || nowMs - start >= windowMs)
+                    && evaluationWindowStartMs.compareAndSet(start, nowMs)) {
+                evaluationsInWindow.set(0);
+            }
+            return evaluationsInWindow.incrementAndGet() <= max;
+        }
+
         /** Atomically claims the throttle window and, for one-shot taps, the single forward. */
         boolean tryClaimForward(long nowMs) {
             while (true) {
@@ -647,11 +703,28 @@ public abstract class AbstractEventTapManager<E> {
                     break;
                 }
             }
-            if (mode == DurationSpec.Mode.ONCE && !enabled.compareAndSet(true, false)) {
+            if (mode == DurationSpec.Mode.ONCE && !onceClaimed.compareAndSet(false, true)) {
                 return false;
             }
             matchCount.incrementAndGet();
             return true;
+        }
+
+        /**
+         * Settles a claim from {@link #tryClaimForward}. A one-shot tap is used up only when its
+         * output was queued; when the queue refused it, the claim is undone so a later event can
+         * still be captured.
+         */
+        void completeForward(boolean queued, long claimedAtMs) {
+            if (queued) {
+                if (mode == DurationSpec.Mode.ONCE) {
+                    enabled.set(false);
+                }
+                return;
+            }
+            matchCount.decrementAndGet();
+            lastForwardedAtMs.compareAndSet(claimedAtMs, 0);
+            onceClaimed.set(false);
         }
     }
 }

@@ -227,11 +227,16 @@ public final class EventSerializationUtil {
         int suffixLen = TRUNCATION_SUFFIX.length();
         if (maxLength <= suffixLen) {
             // Very short maxLength - just return what we can
-            return input.substring(0, maxLength);
+            return input.substring(0, keepSurrogatePair(input, maxLength));
         }
 
-        int cutoff = maxLength - suffixLen;
+        int cutoff = keepSurrogatePair(input, maxLength - suffixLen);
         return input.substring(0, cutoff) + TRUNCATION_SUFFIX;
+    }
+
+    /** Moves a cut that would split a surrogate pair (e.g. an emoji) to before the pair. */
+    private static int keepSurrogatePair(String input, int cutoff) {
+        return cutoff > 0 && Character.isHighSurrogate(input.charAt(cutoff - 1)) ? cutoff - 1 : cutoff;
     }
 
     /**

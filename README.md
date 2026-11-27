@@ -16,10 +16,11 @@
 Bridges chat between a Minecraft server and **one Matrix room** (unencrypted only).
 
 ## Features
-- **MC → Matrix**: forwards player chat into a Matrix room.
-- **Matrix → MC**: forwards Matrix `m.text` room messages into Minecraft server chat.
+- **MC → Matrix**: forwards player chat into a Matrix room as it appears in game. Chat that mods such as chat filters rewrite or cancel is relayed rewritten or not at all. On Forge with EventBus 7 (later 1.21.x patches and 26.x) the bridge reads chat after every other listener; on other loaders it reads chat at the lowest priority, together with any other mod listening there.
+- **Matrix → MC**: forwards Matrix `m.text` room messages into Minecraft server chat. Edits are shown as the new text with ` (edited)`, replies without the quoted original, and messages longer than 512 characters are cut off. After a disconnect, messages the homeserver left out of a sync are fetched and shown in order (up to 1000).
+- Sync state stored in the **world save** (prevents replay spam on restart). The position is saved after its messages reach Minecraft, so a restart replays the batch the bridge was handling. Old room history is skipped on the very first start.
+- The "Matrix room connected: …" notice appears once the bridge has caught up with the room; messages sent after it reach Minecraft.
 - **Server-only**: vanilla clients can join without installing anything (no client mod).
-- Sync state stored in the **world save** (prevents replay spam on restart).
 - The "Matrix room connected: …" notice is localized server-side based on each player's reported client language (currently includes `en_us` and `zh_cn`).
 - If the bot is **invited** to the configured room but not joined yet, it will **auto-accept the invite** and join on startup.
 - **Event Taps**: dynamically subscribe to Forge/NeoForge events and forward them to Matrix for debugging/monitoring.
@@ -64,8 +65,8 @@ The 26.x projects use the dedicated Gradle 9 wrapper and are conditionally inclu
 - `dist/SHA256SUMS.txt`
 
 ## Configuration
-Edit `config/minecraftmatrixbridge.toml`:
-- `matrix.homeserver` (required) e.g. `https://matrix.example.com`
+Edit `config/minecraftmatrixbridge.toml`. Changes made while the server is running take effect after `/matrix reload` or a restart.
+- `matrix.homeserver` (required) the client API base URL, e.g. `https://matrix.example.com`. If it returns 404 (for example when you entered the server name `https://example.com`), the bridge looks up `/.well-known/matrix/client` once (following redirects) and uses the delegated URL. If that also fails, it logs an error and retries until the homeserver answers.
 - `matrix.roomId` (required) room ID `!abcdef:example.com` or room alias `#myroom:example.com` (the room **should not be encrypted**)
 - `matrix.accessToken` (required, or use env variable `MATRIX_ACCESS_TOKEN`)
 
@@ -80,14 +81,25 @@ Edit `config/minecraftmatrixbridge.toml`:
 - `bridge.matrixBotPrefix` (default `!mc`) - Matrix bot command prefix; messages starting with this prefix are treated as bot commands and are not forwarded to Minecraft chat
 - `bridge.syncTimeoutMs` (default `30000`) - Matrix sync timeout in milliseconds
 - `bridge.timelineLimit` (default `20`) - Maximum timeline events per sync
-- `bridge.maxQueueSize` (default `1000`) - Maximum outgoing message queue size
+- `bridge.maxQueueSize` (default `1000`) - Maximum outgoing message queue size. Event tap output can fill at most half of it, which leaves the rest for player chat.
 - `bridge.dedupSize` (default `512`) - Event deduplication cache size
 
 ### Event Tap Options
 - `bridge.enableEventTaps` (default `true`) - Enable or disable event taps feature entirely. When disabled, no event indexing occurs at startup.
 - `bridge.maxActiveEventTaps` (default `10`) - Maximum concurrent event subscriptions
 - `bridge.defaultEventThrottleMs` (default `1000`) - Minimum interval between forwarded events (prevents spam)
-- `bridge.eventCommandMinPowerLevel` (default `50`) - Minimum Matrix power level required to use event commands from Matrix (0=default user, 50=moderator, 100=admin)
+- `bridge.eventCommandMinPowerLevel` (default `100`) - Minimum Matrix power level required to use event commands from Matrix (0=default user, 50=moderator, 100=admin). The default is room admins because tap output can include player names and coordinates. Existing config files keep their saved value (older versions defaulted to `50`).
+
+### Matrix rate limits
+The bridge sends everything through one Matrix account. Lines that pile up while a message is being sent (a chat burst, event tap output) go out together as one Matrix message of up to 20 lines. Homeservers still rate-limit the account: Synapse's default `rc_message` allows about one message every 5 seconds with a burst of 10, which a busy server or an event tap can exceed. Exempt the bridge account from rate limits, for example with the Synapse admin API (needs a server admin's access token):
+
+```bash
+curl -X POST -H "Authorization: Bearer $SYNAPSE_ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"messages_per_second": 0, "burst_count": 0}' \
+  "https://matrix.example.com/_synapse/admin/v1/users/@minecraft-bot:example.com/override_ratelimit"
+```
+
+Load `SYNAPSE_ADMIN_TOKEN` from an untracked file such as `.env.local`.
 
 ## World-save state
 Sync state is stored at:
@@ -129,7 +141,7 @@ Same commands available via Matrix (requires `bridge.enableMatrixToMc=true` and 
 - `!mc event search <query>`
 - `!mc event help`
 
-Matrix event commands require the sender to have a power level >= `bridge.eventCommandMinPowerLevel` (default 50). In room version 12 and later, room creators always qualify.
+Matrix event commands require the sender to have a power level >= `bridge.eventCommandMinPowerLevel` (default 100). In room version 12 and later, room creators always qualify.
 
 Arguments may be quoted in both places: `"two words"` is one filter and `""` means no filter. Event taps also need `bridge.enableMcToMatrix=true`, because their output is sent to the Matrix room.
 
@@ -138,8 +150,12 @@ Arguments may be quoted in both places: `"two words"` is one filter and `""` mea
 - Maximum 10 concurrent event taps (configurable)
 - Default 1-second throttle between forwarded events
 - Tick events automatically enforce minimum 1-second throttle
+- Each tap inspects at most 50 events per second (tick events: one per second); further events in that second are skipped, including ones that match the filter
+- Tap output may fill at most half of the outgoing queue
 - Event output truncated to 2048 characters
 - Client-only events are rejected on dedicated servers
+
+On NeoForge, parent events such as `BlockEvent`, `PlayerEvent` and `LivingEvent` are abstract and cannot be listened to; tap a subtype such as `BlockEvent.BreakEvent` instead. The bridge lists some subtypes when you try. Forge allows tapping these parents, but they also fire for many unrelated subtypes.
 
 ### Examples
 
@@ -151,7 +167,7 @@ Arguments may be quoted in both places: `"two words"` is one filter and `""` mea
 /matrix event on PlayerLoggedInEvent "" 10m
 
 # Monitor block breaks with "diamond" in the event data, permanently
-/matrix event on BlockEvent diamond permanent
+/matrix event on BlockEvent.BreakEvent diamond permanent
 
 # From Matrix
 !mc event on ServerChatEvent

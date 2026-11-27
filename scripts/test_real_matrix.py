@@ -66,6 +66,19 @@ class RealMatrixHelpersTest(TestCase):
             "matrixdotorg/synapse:v1.160.0@sha256:" + "a" * 64
         )
 
+    def test_loader_coordinate_cannot_point_outside_the_run_directory(self):
+        for bad in ("../../outside", "/tmp/x", "1.21/../../x", ""):
+            with self.subTest(bad=bad), patch.object(real_matrix_test.shutil, "rmtree") as rmtree:
+                with self.assertRaises(ValueError):
+                    real_matrix_test.run_one(
+                        module="forge-1.20",
+                        loader_coordinate=bad,
+                        artifact_dir=Path("dist"),
+                        timeout_s=1,
+                        synapse_image=real_matrix_test.DEFAULT_SYNAPSE_IMAGE,
+                    )
+                rmtree.assert_not_called()
+
     def test_cli_forwards_the_verified_artifact_without_building(self):
         with patch(
             "sys.argv",

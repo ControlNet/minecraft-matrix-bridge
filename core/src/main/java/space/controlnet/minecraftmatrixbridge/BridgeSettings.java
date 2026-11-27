@@ -24,6 +24,57 @@ public final class BridgeSettings {
     public final int eventCommandMinPowerLevel;
     public final boolean enableEventTaps;
 
+    public final boolean enableJoinLeaveToMatrix;
+    public final boolean enableServerLifecycleToMatrix;
+
+    public BridgeSettings(
+            String homeserver,
+            String roomId,
+            String accessToken,
+            boolean enableMcToMatrix,
+            boolean enableMatrixToMc,
+            boolean announceConnected,
+            String mcToMatrixPrefix,
+            String matrixToMcPrefix,
+            String matrixBotPrefix,
+            int syncTimeoutMs,
+            int timelineLimit,
+            int maxQueueSize,
+            int dedupSize,
+            boolean enableEventTaps,
+            int maxActiveEventTaps,
+            int defaultEventThrottleMs,
+            int eventCommandMinPowerLevel,
+            boolean enableJoinLeaveToMatrix,
+            boolean enableServerLifecycleToMatrix
+    ) {
+        this.homeserver = normalizeHomeserver(homeserver);
+        this.roomId = trimToEmpty(roomId);
+        this.accessToken = trimToEmpty(accessToken);
+
+        this.enableMcToMatrix = enableMcToMatrix;
+        this.enableMatrixToMc = enableMatrixToMc;
+        this.announceConnected = announceConnected;
+        // An empty prefix is a valid choice: chat then reaches Matrix as "<player> text".
+        this.mcToMatrixPrefix = mcToMatrixPrefix == null ? "[MC] " : mcToMatrixPrefix;
+        this.matrixToMcPrefix = defaultIfBlankPreserveWhitespace(matrixToMcPrefix, "[Matrix] ");
+        this.matrixBotPrefix = normalizeMatrixBotPrefix(matrixBotPrefix);
+
+        this.syncTimeoutMs = syncTimeoutMs;
+        this.timelineLimit = timelineLimit;
+        this.maxQueueSize = maxQueueSize;
+        this.dedupSize = dedupSize;
+
+        this.enableEventTaps = enableEventTaps;
+        this.maxActiveEventTaps = maxActiveEventTaps > 0 ? maxActiveEventTaps : 10;
+        this.defaultEventThrottleMs = defaultEventThrottleMs > 0 ? defaultEventThrottleMs : 1000;
+        // Room admins only by default: tap output can include player positions.
+        this.eventCommandMinPowerLevel = eventCommandMinPowerLevel >= 0 ? eventCommandMinPowerLevel : 100;
+
+        this.enableJoinLeaveToMatrix = enableJoinLeaveToMatrix;
+        this.enableServerLifecycleToMatrix = enableServerLifecycleToMatrix;
+    }
+
     public BridgeSettings(
             String homeserver,
             String roomId,
@@ -43,26 +94,10 @@ public final class BridgeSettings {
             int defaultEventThrottleMs,
             int eventCommandMinPowerLevel
     ) {
-        this.homeserver = normalizeHomeserver(homeserver);
-        this.roomId = trimToEmpty(roomId);
-        this.accessToken = trimToEmpty(accessToken);
-
-        this.enableMcToMatrix = enableMcToMatrix;
-        this.enableMatrixToMc = enableMatrixToMc;
-        this.announceConnected = announceConnected;
-        this.mcToMatrixPrefix = defaultIfBlankPreserveWhitespace(mcToMatrixPrefix, "[MC] ");
-        this.matrixToMcPrefix = defaultIfBlankPreserveWhitespace(matrixToMcPrefix, "[Matrix] ");
-        this.matrixBotPrefix = normalizeMatrixBotPrefix(matrixBotPrefix);
-
-        this.syncTimeoutMs = syncTimeoutMs;
-        this.timelineLimit = timelineLimit;
-        this.maxQueueSize = maxQueueSize;
-        this.dedupSize = dedupSize;
-
-        this.enableEventTaps = enableEventTaps;
-        this.maxActiveEventTaps = maxActiveEventTaps > 0 ? maxActiveEventTaps : 10;
-        this.defaultEventThrottleMs = defaultEventThrottleMs > 0 ? defaultEventThrottleMs : 1000;
-        this.eventCommandMinPowerLevel = eventCommandMinPowerLevel >= 0 ? eventCommandMinPowerLevel : 50;
+        this(homeserver, roomId, accessToken, enableMcToMatrix, enableMatrixToMc, announceConnected,
+                mcToMatrixPrefix, matrixToMcPrefix, matrixBotPrefix, syncTimeoutMs, timelineLimit,
+                maxQueueSize, dedupSize, enableEventTaps, maxActiveEventTaps, defaultEventThrottleMs,
+                eventCommandMinPowerLevel, false, false);
     }
 
     public BridgeSettings(
@@ -82,7 +117,7 @@ public final class BridgeSettings {
     ) {
         this(homeserver, roomId, accessToken, enableMcToMatrix, enableMatrixToMc, announceConnected,
                 mcToMatrixPrefix, matrixToMcPrefix, matrixBotPrefix, syncTimeoutMs, timelineLimit,
-                maxQueueSize, dedupSize, true, 10, 1000, 50);
+                maxQueueSize, dedupSize, true, 10, 1000, 100);
     }
 
     public boolean isBridgeEnabled() {
@@ -116,6 +151,8 @@ public final class BridgeSettings {
                 ", maxActiveEventTaps=" + maxActiveEventTaps +
                 ", defaultEventThrottleMs=" + defaultEventThrottleMs +
                 ", eventCommandMinPowerLevel=" + eventCommandMinPowerLevel +
+                ", enableJoinLeaveToMatrix=" + enableJoinLeaveToMatrix +
+                ", enableServerLifecycleToMatrix=" + enableServerLifecycleToMatrix +
                 '}';
     }
 
